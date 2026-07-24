@@ -40,8 +40,12 @@ struct D3D12 {
                 ResetEvent(cmd.fence_event);
             }
 
+            if (cmd.fence_event != nullptr) {
+                CloseHandle(cmd.fence_event);
+            }
+
             cmd.fence_value = 0;
-            cmd.fence_event = 0;
+            cmd.fence_event = nullptr;
             cmd.allocator.Reset();
             cmd.list.Reset();
             cmd.fence.Reset();

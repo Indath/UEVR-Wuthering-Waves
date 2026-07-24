@@ -174,23 +174,87 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
             return;
         }
 
-        // Also the same for right, even though it's not a double wide texture
+        const auto dst_eye_width = m_backbuffer_size[0] / 2;
+        const auto dst_eye_height = m_backbuffer_size[1];
+
+        // The left (game) texture is expected to match the backbuffer dimensions.
         D3D12_BOX left_src_box{
             .left = 0,
             .top = 0,
             .front = 0,
-            .right = m_backbuffer_size[0] / 2,
-            .bottom = m_backbuffer_size[1],
+            .right = dst_eye_width,
+            .bottom = dst_eye_height,
             .back = 1
         };
 
-        commands.copy_region_stereo(
-            m_game_tex.texture.Get(), m_scene_capture_tex.texture.Get(), render_target,
-            &left_src_box, &left_src_box,
-            0, 0, 0, m_backbuffer_size[0] / 2, 0, 0,
+        // Copy the left eye using a raw region copy, since the game texture always matches the
+        // destination eye dimensions.
+        commands.copy_region(
+            m_game_tex.texture.Get(), render_target, &left_src_box,
+            0, 0, 0,
             D3D12_RESOURCE_STATE_RENDER_TARGET,
             D3D12_RESOURCE_STATE_RENDER_TARGET
         );
+
+        // The scene capture texture (right eye, native stereo fix) can be reallocated to the
+        // HMD's native per-eye resolution independently of the game's backbuffer resolution, so
+        // its actual dimensions can differ significantly from the destination eye region. A raw
+        // CopyTextureRegion cannot scale between mismatched resolutions, it can only crop, which
+        // produces a corrupted/black-looking right eye. When the sizes differ, use a shader blit
+        // (render_srv_to_rtv) instead so the scene capture is scaled into the destination region.
+        if (m_scene_capture_tex.texture != nullptr && m_scene_capture_tex.srv_heap != nullptr) {
+            const auto scene_capture_desc = m_scene_capture_tex.texture->GetDesc();
+
+            const auto sizes_match = scene_capture_desc.Width == dst_eye_width && scene_capture_desc.Height == dst_eye_height;
+
+            SPDLOG_INFO_EVERY_N_SEC(2, "[VR] right eye composite: scene_capture={}x{} dst_eye={}x{} mode={} game_tex={}",
+                scene_capture_desc.Width, scene_capture_desc.Height,
+                dst_eye_width, dst_eye_height,
+                sizes_match ? "copy" : "blit",
+                (void*)m_game_tex.texture.Get());
+
+            if (sizes_match) {
+                D3D12_BOX right_src_box{
+                    .left = 0, .top = 0, .front = 0,
+                    .right = dst_eye_width, .bottom = dst_eye_height, .back = 1
+                };
+
+                commands.copy_region(
+                    m_scene_capture_tex.texture.Get(), render_target, &right_src_box,
+                    dst_eye_width, 0, 0,
+                    D3D12_RESOURCE_STATE_RENDER_TARGET,
+                    D3D12_RESOURCE_STATE_RENDER_TARGET
+                );
+            } else {
+                // Wrap the destination render target so render_srv_to_rtv can target it directly.
+                if (m_stereo_dst_tex.texture.Get() != render_target) {
+                    if (!m_stereo_dst_tex.setup(device, render_target, std::nullopt, std::nullopt, L"Stereo Dest Texture")) {
+                        spdlog::error("[VR] Failed to setup stereo destination texture for right eye blit.");
+                        m_stereo_dst_tex.reset();
+                    }
+                }
+
+                if (m_stereo_dst_tex.texture.Get() != nullptr && m_stereo_dst_tex.rtv_heap != nullptr) {
+                    const RECT dest_rect{
+                        (LONG)dst_eye_width, 0,
+                        (LONG)m_backbuffer_size[0], (LONG)dst_eye_height
+                    };
+
+                    d3d12::render_srv_to_rtv(
+                        m_game_batch.get(),
+                        commands.cmd_list.Get(),
+                        m_scene_capture_tex,
+                        m_stereo_dst_tex,
+                        std::nullopt,
+                        dest_rect,
+                        D3D12_RESOURCE_STATE_RENDER_TARGET,
+                        D3D12_RESOURCE_STATE_RENDER_TARGET
+                    );
+                }
+            }
+        } else {
+            SPDLOG_INFO_EVERY_N_SEC(2, "[VR] right eye composite: scene capture texture is NULL, right eye will not be copied this frame");
+        }
     };
 
     // For copying the real backbuffer if we need to

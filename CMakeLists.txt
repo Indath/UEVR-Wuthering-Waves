@@ -424,6 +424,52 @@ target_link_libraries(example_plugin PUBLIC
 unset(CMKR_TARGET)
 unset(CMKR_SOURCES)
 
+# Target gamepad_cursor_plugin
+set(CMKR_TARGET gamepad_cursor_plugin)
+set(gamepad_cursor_plugin_SOURCES "")
+
+list(APPEND gamepad_cursor_plugin_SOURCES
+	"examples/gamepad_cursor_plugin/Plugin.cpp"
+	"dependencies/interception/include/interception.c"
+)
+
+list(APPEND gamepad_cursor_plugin_SOURCES
+	cmake.toml
+)
+
+set(CMKR_SOURCES ${gamepad_cursor_plugin_SOURCES})
+add_library(gamepad_cursor_plugin SHARED)
+
+if(gamepad_cursor_plugin_SOURCES)
+	target_sources(gamepad_cursor_plugin PRIVATE ${gamepad_cursor_plugin_SOURCES})
+endif()
+
+source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR} FILES ${gamepad_cursor_plugin_SOURCES})
+
+target_compile_features(gamepad_cursor_plugin PUBLIC
+	cxx_std_23
+)
+
+target_include_directories(gamepad_cursor_plugin PUBLIC
+	"include/"
+	"examples/renderlib"
+)
+
+target_link_libraries(gamepad_cursor_plugin PUBLIC
+	plugin_renderlib
+)
+
+target_compile_definitions(gamepad_cursor_plugin PUBLIC
+	INTERCEPTION_STATIC
+)
+
+target_include_directories(gamepad_cursor_plugin PUBLIC
+	"dependencies/interception/include"
+)
+
+unset(CMKR_TARGET)
+unset(CMKR_SOURCES)
+
 # Target sdk-test
 set(CMKR_TARGET sdk-test)
 set(sdk-test_SOURCES "")

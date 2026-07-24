@@ -62,6 +62,11 @@ private:
 
     d3d12::TextureContext m_backbuffer_copy{};
 
+    // RTV-only wrapper around the OpenXR double-wide swapchain render target, used so the
+    // native-stereo-fix right eye (whose resolution can differ from the destination eye region)
+    // can be scaled into place via a shader blit instead of a raw CopyTextureRegion.
+    d3d12::TextureContext m_stereo_dst_tex{};
+
     d3d12::TextureContext m_game_ui_tex{};
     d3d12::TextureContext m_game_tex{};
     d3d12::TextureContext m_scene_capture_tex{};

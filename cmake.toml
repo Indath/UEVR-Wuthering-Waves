@@ -156,6 +156,13 @@ type = "plugin"
 sources = ["examples/example_plugin/**.cpp", "examples/example_plugin/**.c"]
 headers = ["examples/example_plugin/**.hpp", "examples/example_plugin/**.h"]
 
+[target.gamepad_cursor_plugin]
+type = "plugin"
+sources = ["examples/gamepad_cursor_plugin/**.cpp", "examples/gamepad_cursor_plugin/**.c", "dependencies/interception/include/interception.c"]
+headers = ["examples/gamepad_cursor_plugin/**.hpp", "examples/gamepad_cursor_plugin/**.h"]
+include-directories = ["dependencies/interception/include"]
+compile-definitions = ["INTERCEPTION_STATIC"]
+
 [target.sdk-test]
 type = "shared"
 sources = ["side-projects/sdk-test/**.cpp", "side-projects/sdk-test/**.c"]

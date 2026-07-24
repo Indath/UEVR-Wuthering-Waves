@@ -101,7 +101,7 @@ void OverlayComponent::update_input_mouse_emulation() {
 
         const auto x = m_framework_intersect_state.swapchain_intersection_point.x;
         const auto y = m_framework_intersect_state.swapchain_intersection_point.y;
-        
+
         const auto window_size = g_framework->get_last_window_size();
         const auto window_pos = g_framework->get_last_window_pos();
 
@@ -166,7 +166,7 @@ void OverlayComponent::update_input_mouse_emulation() {
             }
 
             const auto right_stick_axis = vr->get_right_stick_axis();
-            
+
             // Mousewheel
             if (right_stick_axis.y > 0.5f) {
                 io.MouseWheel += right_stick_axis.y * delta_f * 10.0f;
@@ -759,7 +759,7 @@ void OverlayComponent::update_overlay_openvr() {
             const auto start = right_controller_pos;
             auto fwd = (right_controller_rot * glm::vec3{0.0f, 0.0f, -1.0f});
             const auto end = right_controller_pos + (fwd * 1000.0f);
-            
+
             const auto plane_pos = glm::vec3{glm_matrix[3]};
 
             float intersection_distance = 0.0f;

@@ -559,19 +559,34 @@ VRRuntime::Error OpenXR::update_matrices(float nearz, float farz) {
         // deriving the texture bounds when modifying projections requires left and right raw projections so get them all before we start:
         std::unique_lock __{this->eyes_mtx};
         const auto& left_fov = this->views[0].fov;
-        this->raw_projections[0][0] = tan(left_fov.angleLeft);
-        this->raw_projections[0][1] = tan(left_fov.angleRight);
-        this->raw_projections[0][2] = tan(left_fov.angleUp);
-        this->raw_projections[0][3] = tan(left_fov.angleDown);
         const auto& right_fov = this->views[1].fov;
-        this->raw_projections[1][0] = tan(right_fov.angleLeft);
-        this->raw_projections[1][1] = tan(right_fov.angleRight);
-        this->raw_projections[1][2] = tan(right_fov.angleUp);
-        this->raw_projections[1][3] = tan(right_fov.angleDown);
-        this->projections[0] = get_mat(0);
-        this->projections[1] = get_mat(1);
-        this->should_recalculate_eye_projections = false;
-        this->last_eye_matrix_nearz = nearz;
+
+        // On the very first frame(s), the runtime can report a completely degenerate FOV
+        // (all angles 0) before real head/eye tracking data is available. If we accept
+        // this, tan_half_fov ends up as 0 and the view_bounds/texture_bounds division
+        // produces NaN, which then gets latched permanently (since should_recalculate_eye_projections
+        // is cleared below), breaking the frame loop for the rest of the session.
+        // Skip deriving projections this frame and try again next frame instead.
+        const auto is_degenerate_fov = [](const XrFovf& fov) {
+            return fov.angleLeft == 0.0f && fov.angleRight == 0.0f && fov.angleUp == 0.0f && fov.angleDown == 0.0f;
+        };
+
+        if (is_degenerate_fov(left_fov) || is_degenerate_fov(right_fov)) {
+            SPDLOG_WARN("[VR] Skipping eye projection derivation this frame due to degenerate (zero) FOV");
+        } else {
+            this->raw_projections[0][0] = tan(left_fov.angleLeft);
+            this->raw_projections[0][1] = tan(left_fov.angleRight);
+            this->raw_projections[0][2] = tan(left_fov.angleUp);
+            this->raw_projections[0][3] = tan(left_fov.angleDown);
+            this->raw_projections[1][0] = tan(right_fov.angleLeft);
+            this->raw_projections[1][1] = tan(right_fov.angleRight);
+            this->raw_projections[1][2] = tan(right_fov.angleUp);
+            this->raw_projections[1][3] = tan(right_fov.angleDown);
+            this->projections[0] = get_mat(0);
+            this->projections[1] = get_mat(1);
+            this->should_recalculate_eye_projections = false;
+            this->last_eye_matrix_nearz = nearz;
+        }
     }
     // don't allow the eye matrices to be derived again until after the next frame sync
     this->should_update_eye_matrices = false;

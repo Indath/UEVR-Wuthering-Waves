@@ -63,18 +63,28 @@ void CommandContext::wait(uint32_t ms) {
     std::scoped_lock _{this->mtx};
 
 	if (this->fence_event && this->waiting_for_fence) {
-        WaitForSingleObject(this->fence_event, ms);
-        ResetEvent(this->fence_event);
-        this->waiting_for_fence = false;
-        if (FAILED(this->cmd_allocator->Reset())) {
-            spdlog::error("[VR] Failed to reset command allocator for {}", utility::narrow(this->internal_name));
-        }
+		const auto wait_result = WaitForSingleObject(this->fence_event, ms);
 
-        if (FAILED(this->cmd_list->Reset(this->cmd_allocator.Get(), nullptr))) {
-            spdlog::error("[VR] Failed to reset command list for {}", utility::narrow(this->internal_name));
-        }
-        this->has_commands = false;
-    }
+		if (wait_result != WAIT_OBJECT_0) {
+			// GPU has not actually finished with this command allocator/list yet (timeout or wait failure).
+			// Resetting them now would be undefined behavior while the GPU may still be executing commands
+			// from them, which can corrupt driver state / leak GPU memory and produce garbage output.
+			// Leave waiting_for_fence set so we retry safely on the next call instead.
+			spdlog::error("[VR] Timed out (or failed) waiting for fence for {} (result={}), deferring reset", utility::narrow(this->internal_name), (uint32_t)wait_result);
+			return;
+		}
+
+		ResetEvent(this->fence_event);
+		this->waiting_for_fence = false;
+		if (FAILED(this->cmd_allocator->Reset())) {
+			spdlog::error("[VR] Failed to reset command allocator for {}", utility::narrow(this->internal_name));
+		}
+
+		if (FAILED(this->cmd_list->Reset(this->cmd_allocator.Get(), nullptr))) {
+			spdlog::error("[VR] Failed to reset command list for {}", utility::narrow(this->internal_name));
+		}
+		this->has_commands = false;
+	}
 }
 
 void CommandContext::copy(ID3D12Resource* src, ID3D12Resource* dst, D3D12_RESOURCE_STATES src_state, D3D12_RESOURCE_STATES dst_state) {
@@ -251,10 +261,33 @@ void CommandContext::copy_region_stereo(ID3D12Resource* srcleft, ID3D12Resource*
     D3D12_RESOURCE_STATES src_state,
     D3D12_RESOURCE_STATES dst_state)
 {
+    std::scoped_lock _{this->mtx};
+
     if (srcleft == nullptr || srcright == nullptr || dst == nullptr) {
         spdlog::error("[VR] nullptr passed to copy_region_stereo");
         return;
     }
+
+#ifdef UEVR_TRACE_STEREO_COPY
+    {
+        // Throttled per-frame trace to confirm the right-eye source/dest are being copied with sane values
+        // without flooding the log every frame.
+        static uint64_t s_call_count = 0;
+        if ((s_call_count++ % 300) == 0) {
+            spdlog::debug("[VR] copy_region_stereo trace #{}: srcleft={} srcright={} dst={} "
+                          "left_box=({},{},{})-({},{},{}) right_box=({},{},{})-({},{},{}) "
+                          "dstleft=({},{},{}) dstright=({},{},{}) src_state={} dst_state={}",
+                s_call_count, (void*)srcleft, (void*)srcright, (void*)dst,
+                srcleft_box->left, srcleft_box->top, srcleft_box->front,
+                srcleft_box->right, srcleft_box->bottom, srcleft_box->back,
+                srcright_box->left, srcright_box->top, srcright_box->front,
+                srcright_box->right, srcright_box->bottom, srcright_box->back,
+                dstleft_x, dstleft_y, dstleft_z,
+                dstright_x, dstright_y, dstright_z,
+                (int)src_state, (int)dst_state);
+        }
+    }
+#endif
 
     // Transition states to copy source / dest.
     D3D12_RESOURCE_BARRIER barriers[3]

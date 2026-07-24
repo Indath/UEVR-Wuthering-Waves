@@ -3018,8 +3018,14 @@ sdk::FSceneView* FFakeStereoRenderingHook::sceneview_constructor(sdk::FSceneView
 
     std::optional<uint32_t> views_original_count{};
 
+    SPDLOG_INFO_EVERY_N_SEC(2, "[VR] sceneview_constructor: same_pass_enabled={} init_options_stereo_pass={} scene_capture_rt={}",
+        vr->is_native_stereo_fix_same_pass_enabled(), (int32_t)init_options_stereo_pass,
+        (void*)g_hook->get_render_target_manager()->get_scene_capture_render_target());
+
     if (vr->is_native_stereo_fix_enabled() && vr->is_native_stereo_fix_same_pass_enabled() && init_options_stereo_pass > EStereoscopicPass::eSSP_PRIMARY) {
         if (g_hook->get_render_target_manager()->get_scene_capture_render_target() != nullptr) {
+            SPDLOG_INFO_EVERY_N_SEC(2, "[VR] sceneview_constructor: entering same-pass branch, forcing stereo pass to PRIMARY for secondary view");
+
             init_options->set_stereo_pass(EStereoscopicPass::eSSP_PRIMARY);
 
             auto view_family = init_options->get_view_family();
@@ -3032,6 +3038,8 @@ sdk::FSceneView* FFakeStereoRenderingHook::sceneview_constructor(sdk::FSceneView
                 views_original_count = views->count;
                 views->count = 0;
             }
+        } else {
+            SPDLOG_INFO_EVERY_N_SEC(2, "[VR] sceneview_constructor: same-pass branch would trigger but scene_capture_render_target is NULL");
         }
     }
 
@@ -3232,6 +3240,9 @@ void FFakeStereoRenderingHook::begin_render_viewfamily_real(void* render_module,
     }
 
     bool wants_swap = false;
+
+    SPDLOG_INFO_EVERY_N_SEC(2, "[VR] begin_render_viewfamily_real: views.count={} prev_count={} rt_valid={}", views.count, prev_count, rtfrt != nullptr);
+
     if (views.count > 1) {
         views.count = 1;
         wants_swap = true;
