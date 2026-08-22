@@ -3970,6 +3970,7 @@ bool FFakeStereoRenderingHook::setup_view_extensions() try {
     SPDLOG_INFO("Current ext ptr: {:x}", (uintptr_t)view_extensions.extensions.data);
     SPDLOG_INFO("Current ext count: {}", view_extensions.extensions.count);
     SPDLOG_INFO("Current ext capacity: {}", view_extensions.extensions.capacity);
+    SPDLOG_INFO("Current ext capacity: {}", view_extensions.extensions.capacity);
 
     // Verifications on the current memory of the FSceneViewExtensions, because pre-4.10 (?) the view extensions array did not actually exist
     if (m_rendertarget_manager_embedded_in_stereo_device) {
@@ -4097,9 +4098,6 @@ bool FFakeStereoRenderingHook::setup_view_extensions() try {
 
             ZeroMemory(new_exts, sizeof(TWeakPtr<ISceneViewExtension>) * new_capacity);
             memcpy(new_exts, exts.data, sizeof(TWeakPtr<ISceneViewExtension>) * old_capacity);
-
-            // dont delete it cuz its owned by the games allocator... for now
-            //delete[] exts.data;
 
             exts.data = new_exts;
             exts.capacity = new_capacity;
