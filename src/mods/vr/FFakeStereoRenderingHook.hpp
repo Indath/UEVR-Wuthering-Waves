@@ -2,6 +2,7 @@
 
 #include <memory>
 #include <array>
+#include <atomic>
 
 #include <SafetyHook.hpp>
 
@@ -56,6 +57,18 @@ public:
     bool need_reallocate_view_target(const sdk::FViewport& Viewport);
     bool need_reallocate_depth_texture(const void* DepthTarget);
 
+    // True while need_reallocate_view_target() is still debouncing a candidate size change
+    // (i.e. has seen a new size but hasn't observed it stable for enough consecutive checks yet).
+    // Callers that are deciding whether it's safe to (re)create the scene capture texture must
+    // treat this the same as "loading" and defer, otherwise they can create a scene capture sized
+    // for the OLD resolution just before the reallocation lands, leaving the compositor with a
+    // scene-capture texture and destination eye texture of mismatched size for one or more frames.
+    // That mismatch has been observed to fail SRV descriptor heap creation and take down the D3D12
+    // device entirely (DXGI_ERROR_DEVICE_REMOVED).
+    bool is_view_target_reallocation_pending() const {
+        return m_pending_size_stable_count > 0;
+    }
+
 public:
     FRHITexture2D*& get_ui_target() { return ui_target; }
     FRHITexture2D* get_render_target() {
@@ -74,8 +87,29 @@ public:
     bool create_scene_capture();
     void destroy_scene_capture();
 
+    // True if a scene capture exists but its owning UWorld is no longer the engine's current
+    // world (a full level transition happened, e.g. character-select -> game world) or that
+    // world is currently tearing down. Used to proactively destroy_scene_capture() ourselves the
+    // instant this is detected, instead of relying on GC (previously "fixed" by rooting the actor,
+    // which defeated the engine's own world-teardown handshake and stalled the loading screen).
+    bool is_scene_capture_world_stale() const;
+
     sdk::UTexture* get_scene_capture_utexture();
-    
+
+    // True until a short grace period has elapsed since the scene capture render target became
+    // usable. Callers doing heavier per-frame work (e.g. the native-stereo-fix "same pass"
+    // secondary-view/depth rendering) should treat this as still-loading and fall back to the
+    // cheaper single-view path, since committing to that work right as streaming finishes can
+    // starve the render thread of the cycles it needs to actually finish loading.
+    bool is_scene_capture_in_grace_period() const {
+        if (scene_capture_ready_time.time_since_epoch().count() == 0) {
+            return true;
+        }
+
+        static constexpr auto grace_period = std::chrono::milliseconds(1500);
+        return (std::chrono::steady_clock::now() - scene_capture_ready_time) < grace_period;
+    }
+
     sdk::FViewport* get_viewport() const {
         return last_viewport;
     }
@@ -155,6 +189,13 @@ protected:
     uint32_t last_width{0};
     uint32_t last_height{0};
 
+    // Debounce state for need_reallocate_view_target() - tracks a candidate new size until it has
+    // been observed stable for several consecutive checks, to avoid reacting to transient/noisy
+    // resolution fluctuations (e.g. during loading screens) with an expensive swapchain recreate.
+    uint32_t m_pending_width{0};
+    uint32_t m_pending_height{0};
+    uint32_t m_pending_size_stable_count{0};
+
     std::vector<uint8_t> texture_create_insn_bytes{};
     std::vector<uint8_t> texture_create_insn_bytes2{};
 
@@ -167,6 +208,31 @@ protected:
     sdk::UObjectReference<sdk::UTexture> scene_capture_target_rhi_thread{nullptr}; // For custom compatibility rendering
     sdk::UTexture* in_flight_target{nullptr}; // Not a reference because this is basically a barrier against creating a new scene capture target
     sdk::FViewport* last_viewport{nullptr};
+
+    // Throttle for create_scene_capture(). During a level transition the engine tick can flicker
+    // (resume for a frame or two, then stall again), which was previously enough to let the loading
+    // guards open briefly and re-trigger a full actor-spawn + FRenderTarget rehook cascade. That
+    // cascade itself eats enough game-thread time to cause the next stall, creating a self-sustaining
+    // loop that starves level streaming of the cycles it needs to finish. Enforce a minimum interval
+    // between actual (re)creations here so bursts of flickering ticks can't retrigger it repeatedly.
+    std::chrono::steady_clock::time_point last_scene_capture_create_time{};
+
+    // Timestamp of when the scene capture render target most recently became fully usable
+    // (i.e. scene_capture_target was assigned on the game thread). The secondary-view/depth
+    // "same pass" rendering path is heavier than a simple eye-copy, and turning it on the instant
+    // the target becomes valid can still land inside the tail end of level streaming, starving the
+    // render thread of the cycles streaming needs to finish (observed as a hard stall on the loading
+    // screen). A short grace period after readiness lets streaming settle before we commit to the
+    // full stereo/depth path. Reset to epoch whenever the scene capture is destroyed/invalidated.
+    std::chrono::steady_clock::time_point scene_capture_ready_time{};
+
+    // The UWorld our scene_capture_actor was spawned into. Used to proactively detect a full
+    // level transition (as opposed to sub-level streaming within the same persistent world) so we
+    // can tear down the scene capture ourselves the instant the world changes/tears down, instead
+    // of relying on Unreal's own GC pass or (previously) rooting the actor - rooting defeats the
+    // engine's teardown handshake for the old world and stalls the loading screen. nullptr means
+    // no scene capture actor currently exists.
+    void* scene_capture_world{nullptr};
 };
 
 struct VRRenderTargetManager : IStereoRenderTargetManager, VRRenderTargetManager_Base {
@@ -308,6 +374,34 @@ public:
     void set_should_recreate_textures(bool recreate) {
         m_wants_texture_recreation = recreate;
         m_skip_next_adjust_view_rect = true;
+    }
+
+    // The engine's own AdjustViewRect call decides, independently of D3D12Component/D3D11Component's
+    // frame-parity-based is_left_eye_frame classification, which physical x-offset half of the
+    // double-wide backbuffer each eye's scene gets rendered into. These two "which eye is this"
+    // trackers are computed from unrelated state and can fall out of phase, silently causing the
+    // compositor to crop the wrong half of the backbuffer for a given eye. Expose the last-known
+    // x-offset actually assigned to each eye by AdjustViewRect so the compositor can crop from the
+    // real location instead of assuming a fixed left=0/right=half layout.
+    uint32_t get_last_left_eye_x_offset() const {
+        return m_last_left_eye_x_offset;
+    }
+
+    uint32_t get_last_right_eye_x_offset() const {
+        return m_last_right_eye_x_offset;
+    }
+
+    // See m_left_eye_x_offset_update_count / m_right_eye_x_offset_update_count above.
+    uint64_t get_left_eye_x_offset_update_count() const {
+        return m_left_eye_x_offset_update_count;
+    }
+
+    uint64_t get_right_eye_x_offset_update_count() const {
+        return m_right_eye_x_offset_update_count;
+    }
+
+    bool has_seen_eye_x_offsets() const {
+        return m_has_seen_eye_x_offsets;
     }
 
     void on_device_reset() override {
@@ -544,6 +638,20 @@ private:
     bool m_inside_slate_draw_window{false};
     int32_t m_skip_next_adjust_view_rect_count{1};
     uint32_t m_slate_draw_window_thread_id{0};
+
+    // Last-known x-offset assigned by AdjustViewRect to each eye. See get_last_left_eye_x_offset().
+    std::atomic<uint32_t> m_last_left_eye_x_offset{0};
+    std::atomic<uint32_t> m_last_right_eye_x_offset{0};
+    std::atomic<bool> m_has_seen_eye_x_offsets{false};
+
+    // Monotonically-increasing counter bumped every time AdjustViewRect records a new offset for
+    // the given eye (see adjust_view_rect()). The compositor (D3D12Component::composite_afr_eye)
+    // uses this to detect when the engine's own eye-index state machine has skewed toward one eye
+    // for several consecutive frames (observed in the wild: the engine's true_index resolving to
+    // "right" far more often than "left" in some AFR games), so it can avoid re-copying a stale/
+    // never-updated half of the backbuffer over a good previous frame.
+    std::atomic<uint64_t> m_left_eye_x_offset_update_count{0};
+    std::atomic<uint64_t> m_right_eye_x_offset_update_count{0};
 
     // Synchronized AFR
     float m_ignored_engine_delta{0.0f};

@@ -17,11 +17,227 @@
 #include "d3d12/DirectXTK.hpp"
 
 #include "D3D12Component.hpp"
+#include <uevr/API.hpp>
 
 //#define AFR_DEPTH_TEMP_DISABLED
 
 constexpr auto ENGINE_SRC_DEPTH = D3D12_RESOURCE_STATE_DEPTH_READ | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
 constexpr auto ENGINE_SRC_COLOR = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+
+namespace {
+// DIAG: synchronous GPU->CPU pixel readback used to definitively determine whether a given
+// D3D12 texture actually contains non-black pixel data at the moment it's sampled. This is
+// intentionally heavyweight (stalls the GPU via a fence wait) so it must only be invoked from
+// throttled call sites. It is used to bisect the SS black-screen path: if the *source* backbuffer
+// sampled here is non-black but the *destination* OpenXR swapchain texture sampled right after
+// the copy is black, the bug is in our copy/compositor path. If the source itself is already
+// black, the bug is upstream in UE's own scene rendering (before it ever reaches our hook).
+struct DiagPixelSample {
+    bool succeeded{false};
+    double avg_luminance{0.0};
+    uint32_t corner_pixel{0}; // top-left pixel, packed as read (assumed BGRA8-ish layout)
+    uint32_t center_pixel{0};
+    uint32_t sampled_pixels{0};
+    uint32_t nonzero_pixels{0};
+};
+
+// DIAG: sample_x_offset/sample_y_offset let callers pick WHERE in the texture the 32x32 sample
+// window is taken from, instead of always the top-left corner. This matters because a fixed
+// top-left-corner sample of the full double-wide backbuffer only ever lands inside the left eye's
+// half - it can never prove anything about the right eye's content, and if the sampled corner
+// happens to be a black letterbox/border pixel even within the left eye's own content, it would
+// misleadingly look like "the whole eye is black" when only that specific corner is. Sampling from
+// the center of each eye's actual region gives a much stronger, less ambiguous signal.
+static DiagPixelSample diag_sample_texture(ID3D12Device* device, ID3D12CommandQueue* command_queue, ID3D12Resource* src, D3D12_RESOURCE_STATES src_state, uint32_t sample_x_offset = 0, uint32_t sample_y_offset = 0) {
+    DiagPixelSample result{};
+
+    if (device == nullptr || command_queue == nullptr || src == nullptr) {
+        return result;
+    }
+
+    const auto desc = src->GetDesc();
+
+    if (desc.Width == 0 || desc.Height == 0 || desc.Format == DXGI_FORMAT_UNKNOWN) {
+        return result;
+    }
+
+    // Only sample a small region so this stays cheap even though it's synchronous.
+    constexpr uint32_t sample_dim = 32;
+    sample_x_offset = (std::min)(sample_x_offset, desc.Width > sample_dim ? (uint32_t)desc.Width - sample_dim : 0);
+    sample_y_offset = (std::min)(sample_y_offset, desc.Height > sample_dim ? (uint32_t)desc.Height - sample_dim : 0);
+    const uint32_t sample_w = (std::min)((uint32_t)desc.Width, sample_dim);
+    const uint32_t sample_h = (std::min)((uint32_t)desc.Height, sample_dim);
+
+    D3D12_RESOURCE_DESC staging_desc{};
+    staging_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    staging_desc.Width = sample_w;
+    staging_desc.Height = sample_h;
+    staging_desc.DepthOrArraySize = 1;
+    staging_desc.MipLevels = 1;
+    staging_desc.Format = desc.Format;
+    staging_desc.SampleDesc.Count = 1;
+    staging_desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    staging_desc.Flags = D3D12_RESOURCE_FLAG_NONE;
+
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
+    UINT num_rows{};
+    UINT64 row_size{};
+    UINT64 total_bytes{};
+    device->GetCopyableFootprints(&staging_desc, 0, 1, 0, &footprint, &num_rows, &row_size, &total_bytes);
+
+    if (total_bytes == 0) {
+        return result;
+    }
+
+    Microsoft::WRL::ComPtr<ID3D12Resource> readback_buffer{};
+
+    D3D12_HEAP_PROPERTIES heap_props{};
+    heap_props.Type = D3D12_HEAP_TYPE_READBACK;
+
+    D3D12_RESOURCE_DESC buffer_desc{};
+    buffer_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    buffer_desc.Width = total_bytes;
+    buffer_desc.Height = 1;
+    buffer_desc.DepthOrArraySize = 1;
+    buffer_desc.MipLevels = 1;
+    buffer_desc.Format = DXGI_FORMAT_UNKNOWN;
+    buffer_desc.SampleDesc.Count = 1;
+    buffer_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    buffer_desc.Flags = D3D12_RESOURCE_FLAG_NONE;
+
+    if (FAILED(device->CreateCommittedResource(&heap_props, D3D12_HEAP_FLAG_NONE, &buffer_desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&readback_buffer)))) {
+        spdlog::error("[DIAG] Pixel sample: failed to create readback buffer.");
+        return result;
+    }
+
+    Microsoft::WRL::ComPtr<ID3D12CommandAllocator> cmd_allocator{};
+    Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> cmd_list{};
+    Microsoft::WRL::ComPtr<ID3D12Fence> fence{};
+
+    if (FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&cmd_allocator))) ||
+        FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, cmd_allocator.Get(), nullptr, IID_PPV_ARGS(&cmd_list))) ||
+        FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)))) {
+        spdlog::error("[DIAG] Pixel sample: failed to create throwaway command objects.");
+        return result;
+    }
+
+    D3D12_RESOURCE_BARRIER src_barrier{};
+    src_barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    src_barrier.Transition.pResource = src;
+    src_barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    src_barrier.Transition.StateBefore = src_state;
+    src_barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+
+    const bool needs_transition = src_state != D3D12_RESOURCE_STATE_COPY_SOURCE;
+
+    if (needs_transition) {
+        cmd_list->ResourceBarrier(1, &src_barrier);
+    }
+
+    D3D12_TEXTURE_COPY_LOCATION dst_loc{};
+    dst_loc.pResource = readback_buffer.Get();
+    dst_loc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    dst_loc.PlacedFootprint = footprint;
+
+    D3D12_TEXTURE_COPY_LOCATION src_loc{};
+    src_loc.pResource = src;
+    src_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    src_loc.SubresourceIndex = 0;
+
+    D3D12_BOX src_box{};
+    src_box.left = sample_x_offset;
+    src_box.top = sample_y_offset;
+    src_box.front = 0;
+    src_box.right = sample_x_offset + sample_w;
+    src_box.bottom = sample_y_offset + sample_h;
+    src_box.back = 1;
+
+    cmd_list->CopyTextureRegion(&dst_loc, 0, 0, 0, &src_loc, &src_box);
+
+    if (needs_transition) {
+        src_barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        src_barrier.Transition.StateAfter = src_state;
+        cmd_list->ResourceBarrier(1, &src_barrier);
+    }
+
+    if (FAILED(cmd_list->Close())) {
+        spdlog::error("[DIAG] Pixel sample: failed to close command list.");
+        return result;
+    }
+
+    ID3D12CommandList* const cmd_lists[] = {cmd_list.Get()};
+    command_queue->ExecuteCommandLists(1, cmd_lists);
+
+    HANDLE fence_event = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+
+    if (fence_event == nullptr) {
+        spdlog::error("[DIAG] Pixel sample: failed to create fence event.");
+        return result;
+    }
+
+    command_queue->Signal(fence.Get(), 1);
+    fence->SetEventOnCompletion(1, fence_event);
+    const auto wait_result = WaitForSingleObject(fence_event, 2000);
+    CloseHandle(fence_event);
+
+    if (wait_result != WAIT_OBJECT_0) {
+        spdlog::error("[DIAG] Pixel sample: timed out waiting for GPU readback fence.");
+        return result;
+    }
+
+    void* mapped{nullptr};
+    D3D12_RANGE read_range{0, (SIZE_T)total_bytes};
+
+    if (FAILED(readback_buffer->Map(0, &read_range, &mapped))) {
+        spdlog::error("[DIAG] Pixel sample: failed to map readback buffer.");
+        return result;
+    }
+
+    const auto* bytes = (const uint8_t*)mapped;
+    // Assume 4 bytes-per-pixel formats (true for all backbuffer/swapchain formats used here, e.g. BGRA8/RGBA8).
+    const uint32_t bytes_per_pixel = 4;
+    uint64_t luminance_sum = 0;
+    uint32_t sampled = 0;
+    uint32_t nonzero = 0;
+
+    for (uint32_t y = 0; y < sample_h; ++y) {
+        const auto* row = bytes + (size_t)footprint.Footprint.RowPitch * y;
+
+        for (uint32_t x = 0; x < sample_w; ++x) {
+            const auto* pixel = row + (size_t)x * bytes_per_pixel;
+            const uint32_t b = pixel[0];
+            const uint32_t g = pixel[1];
+            const uint32_t r = pixel[2];
+
+            luminance_sum += (r + g + b);
+            ++sampled;
+
+            if (r != 0 || g != 0 || b != 0) {
+                ++nonzero;
+            }
+        }
+    }
+
+    if (sample_w > 0 && sample_h > 0) {
+        const auto* corner_row = bytes;
+        result.corner_pixel = *(const uint32_t*)corner_row;
+
+        const auto center_x = sample_w / 2;
+        const auto center_y = sample_h / 2;
+        const auto* center_row = bytes + (size_t)footprint.Footprint.RowPitch * center_y;
+        result.center_pixel = *(const uint32_t*)(center_row + (size_t)center_x * bytes_per_pixel);
+    }
+
+    readback_buffer->Unmap(0, nullptr);
+
+    result.succeeded = true;
+    result.avg_luminance = sampled > 0 ? (double)luminance_sum / (sampled * 3.0) : 0.0;
+    result.sampled_pixels = sampled;
+    result.nonzero_pixels = nonzero;
+
+    return result;
+}
+} // namespace
 
 namespace vrmod {
 vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
@@ -83,6 +299,129 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
     const auto is_afr = !is_same_frame && vr->is_using_afr();
     const auto is_left_eye_frame = is_afr && vr->m_render_frame_count % 2 == vr->m_left_eye_interval;
     const auto is_right_eye_frame = !is_afr || vr->m_render_frame_count % 2 == vr->m_right_eye_interval;
+
+    // DIAG: unbiased visibility into the AFR/Synchronized-Sequential eye-selection state.
+    // NOTE: this used to sample every 300th call ("++diag_afr_count % 300 == 1"). Since
+    // diag_afr_count and vr->m_render_frame_count both increment by 1 every frame, a fixed
+    // stride of 300 (an even number) always lands on the exact same frame-count parity, which
+    // made it LOOK like is_left_eye_frame was permanently false when in fact only every other
+    // frame's diagnostic was ever printed. We now log every frame for a short warm-up window
+    // (so both parities are actually observed), and thereafter log every frame whenever the
+    // eye selection doesn't alternate as expected (a real symptom of one eye going black),
+    // plus a low-frequency heartbeat the rest of the time.
+    {
+        static uint32_t diag_afr_count = 0;
+        static bool diag_last_was_left = false;
+        static bool diag_have_seen_left = false;
+        static bool diag_have_seen_right = false;
+        ++diag_afr_count;
+
+        if (is_left_eye_frame) {
+            diag_have_seen_left = true;
+        }
+        if (is_right_eye_frame) {
+            diag_have_seen_right = true;
+        }
+
+        const bool warm_up = diag_afr_count <= 60;
+        const bool stuck_on_one_eye = diag_afr_count > 120 && (!diag_have_seen_left || !diag_have_seen_right);
+
+        if (warm_up || stuck_on_one_eye || diag_afr_count % 301 == 1) {
+            SPDLOG_INFO("[DIAG] AFR eye state (#{}): is_actually_afr={} is_afr={} is_same_frame={} is_left_eye_frame={} is_right_eye_frame={} frame_count={} left_interval={} right_interval={} seen_left={} seen_right={}",
+                diag_afr_count, is_actually_afr, is_afr, is_same_frame, is_left_eye_frame, is_right_eye_frame,
+                vr->m_render_frame_count, vr->m_left_eye_interval, vr->m_right_eye_interval, diag_have_seen_left, diag_have_seen_right);
+        }
+
+        diag_last_was_left = is_left_eye_frame;
+    }
+
+    // DIAG: identity/binding check for the resource the engine actually handed us this frame.
+    // If the engine is rendering the left eye into a DIFFERENT resource than what we're tracking
+    // as "backbuffer" (e.g. a stale/alternate render target after an AFR transition or resize),
+    // this would explain a permanently-black left eye that has nothing to do with our x-offset
+    // cropping logic: we'd simply be sampling/copying the wrong (never-written-to) resource.
+    // Also logs the ue4_texture wrapper pointer and whether backbuffer == real_backbuffer, since
+    // a change in either between left-eye frames (while staying stable for right-eye frames)
+    // would point directly at the engine's render-target binding as the root cause.
+    {
+        static uint32_t diag_rt_identity_count = 0;
+        static void* diag_last_left_backbuffer = nullptr;
+        static void* diag_last_right_backbuffer = nullptr;
+        ++diag_rt_identity_count;
+
+        void* const current_backbuffer_ptr = backbuffer.Get();
+        void* const current_real_backbuffer_ptr = real_backbuffer.Get();
+        void* const current_ue4_texture_ptr = (void*)ue4_texture;
+
+        bool changed_for_this_eye = false;
+
+        if (is_left_eye_frame) {
+            changed_for_this_eye = diag_last_left_backbuffer != nullptr && diag_last_left_backbuffer != current_backbuffer_ptr;
+            diag_last_left_backbuffer = current_backbuffer_ptr;
+        } else if (is_right_eye_frame) {
+            changed_for_this_eye = diag_last_right_backbuffer != nullptr && diag_last_right_backbuffer != current_backbuffer_ptr;
+            diag_last_right_backbuffer = current_backbuffer_ptr;
+        }
+
+        if (diag_rt_identity_count <= 60 || changed_for_this_eye || diag_rt_identity_count % 301 == 1) {
+            SPDLOG_INFO("[DIAG] RT identity (#{}): backbuffer={:p} real_backbuffer={:p} ue4_texture={:p} same_as_real={} is_left_eye_frame={} is_right_eye_frame={} changed_since_last_same_eye_frame={}",
+                diag_rt_identity_count, current_backbuffer_ptr, current_real_backbuffer_ptr, current_ue4_texture_ptr,
+                current_backbuffer_ptr == current_real_backbuffer_ptr, is_left_eye_frame, is_right_eye_frame, changed_for_this_eye);
+        }
+    }
+
+    // DIAG: source-side pixel readback. Samples the actual backbuffer resource we're about to
+    // copy from, BEFORE any of our copy/compositor logic runs. If this consistently reports
+    // nonzero_pixels=0 (fully black), the black screen originates upstream in UE's own scene
+    // render (or the wrong render target is being handed to us) and is NOT a bug in our AFR
+    // copy/OpenXR submission path. If this reports real pixel data but the destination swapchain
+    // sample (further below) is black, the break is in our copy/submission path instead.
+    // Throttled hard because this stalls the GPU synchronously.
+    {
+        static uint32_t diag_src_sample_count = 0;
+        ++diag_src_sample_count;
+
+        // NOTE: throttle stride must be ODD. diag_src_sample_count increments once per on_frame call
+        // (i.e. once per eye), so a fixed EVEN stride always lands on the same eye-parity frame,
+        // making the throttled samples look permanently biased toward one eye when in fact both are
+        // being processed - this previously caused the tail of a log to show only is_left_eye_frame=true
+        // even though right-eye frames were also occurring in between (just never sampled).
+        if (diag_src_sample_count <= 5 || diag_src_sample_count % 301 == 1) {
+            const auto bb_desc = backbuffer.Get() != nullptr ? backbuffer->GetDesc() : D3D12_RESOURCE_DESC{};
+            const auto bb_width = (uint32_t)bb_desc.Width;
+            const auto bb_height = (uint32_t)bb_desc.Height;
+
+            // Sample from the CENTER of each eye's half of the backbuffer (not the fixed top-left
+            // corner), so we get a representative signal from inside actual rendered content rather
+            // than a possibly-black letterbox/border pixel. Also sample BOTH halves every time,
+            // independent of is_left_eye_frame/is_right_eye_frame, so we can directly see whether the
+            // left half of the shared backbuffer ever contains real geometry regardless of which
+            // eye's "turn" this frame nominally is.
+            const auto half_w = bb_width / 2;
+            const auto left_center_x = half_w > 32 ? half_w / 2 - 16 : 0;
+            const auto right_center_x = half_w > 32 ? half_w + half_w / 2 - 16 : half_w;
+            const auto center_y = bb_height > 32 ? bb_height / 2 - 16 : 0;
+
+            const auto left_sample = diag_sample_texture(device, command_queue, backbuffer.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, left_center_x, center_y);
+            const auto right_sample = diag_sample_texture(device, command_queue, backbuffer.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, right_center_x, center_y);
+
+            if (left_sample.succeeded) {
+                SPDLOG_INFO("[DIAG] SOURCE backbuffer LEFT-HALF-CENTER pixel sample (#{}): bb={}x{} sample_xy=({},{}) avg_luminance={:.2f} nonzero={}/{} corner=0x{:08X} center=0x{:08X} is_left_eye_frame={} is_right_eye_frame={}",
+                    diag_src_sample_count, bb_width, bb_height, left_center_x, center_y, left_sample.avg_luminance, left_sample.nonzero_pixels, left_sample.sampled_pixels,
+                    left_sample.corner_pixel, left_sample.center_pixel, is_left_eye_frame, is_right_eye_frame);
+            } else {
+                SPDLOG_INFO("[DIAG] SOURCE backbuffer LEFT-HALF-CENTER pixel sample (#{}): FAILED to sample.", diag_src_sample_count);
+            }
+
+            if (right_sample.succeeded) {
+                SPDLOG_INFO("[DIAG] SOURCE backbuffer RIGHT-HALF-CENTER pixel sample (#{}): bb={}x{} sample_xy=({},{}) avg_luminance={:.2f} nonzero={}/{} corner=0x{:08X} center=0x{:08X} is_left_eye_frame={} is_right_eye_frame={}",
+                    diag_src_sample_count, bb_width, bb_height, right_center_x, center_y, right_sample.avg_luminance, right_sample.nonzero_pixels, right_sample.sampled_pixels,
+                    right_sample.corner_pixel, right_sample.center_pixel, is_left_eye_frame, is_right_eye_frame);
+            } else {
+                SPDLOG_INFO("[DIAG] SOURCE backbuffer RIGHT-HALF-CENTER pixel sample (#{}): FAILED to sample.", diag_src_sample_count);
+            }
+        }
+    }
 
     // Sometimes this can happen if pipeline execution does not go exactly as planned
     // so we need to resynchronized or begin the frame again.
@@ -146,14 +485,25 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
         }
     }
 
-    if (vr->is_native_stereo_fix_enabled()) {
+    // Check if local player exists via UEVR API
+    bool is_world_loading = false;
+
+    if (uevr::API::get() != nullptr) {
+        // If the local player controller doesn't exist yet, the level is still streaming
+        if (uevr::API::get()->get_player_controller(0) == nullptr) {
+            is_world_loading = true;
+        }
+    }
+
+    if (vr->is_native_stereo_fix_enabled() && !is_world_loading) {
         const auto scene_capture = ffsr->get_render_target_manager()->get_scene_capture_render_target();
         const auto scene_capture_rt = scene_capture != nullptr ? (ID3D12Resource*)scene_capture->get_native_resource() : nullptr;
 
         if (scene_capture_rt != nullptr && m_scene_capture_tex.texture.Get() != scene_capture_rt) {
             spdlog::info("[VR] Setting up scene capture texture as reference to original");
 
-            if (!m_scene_capture_tex.setup(device, scene_capture_rt, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM, L"Scene Capture Texture")) {
+            if (!m_scene_capture_tex.setup(
+                    device, scene_capture_rt, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM, L"Scene Capture Texture")) {
                 spdlog::error("[VR] Failed to fully setup scene capture texture.");
                 m_scene_capture_tex.reset();
             }
@@ -161,7 +511,6 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
 
         if (scene_capture_rt == nullptr && m_scene_capture_tex.texture.Get() != nullptr) {
             spdlog::info("[VR] Resetting scene capture texture");
-
             m_scene_capture_tex.reset();
         }
     } else {
@@ -177,24 +526,85 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
         const auto dst_eye_width = m_backbuffer_size[0] / 2;
         const auto dst_eye_height = m_backbuffer_size[1];
 
-        // The left (game) texture is expected to match the backbuffer dimensions.
-        D3D12_BOX left_src_box{
-            .left = 0,
-            .top = 0,
-            .front = 0,
-            .right = dst_eye_width,
-            .bottom = dst_eye_height,
-            .back = 1
-        };
+        // The left (game) texture was historically guaranteed to match the destination eye
+        // dimensions, but the game's dynamic resolution/scene-capture resizing (introduced by a
+        // performance update) means the game texture's actual size can now differ from the VR
+        // per-eye render target size. A raw CopyTextureRegion can only crop, not scale, so when
+        // the sizes mismatch it produces an out-of-bounds/black-looking left eye. When the sizes
+        // differ, fall back to a shader blit (render_srv_to_rtv) so the game texture is scaled
+        // into the destination region, mirroring the right eye's scene capture handling below.
+        if (m_game_tex.texture != nullptr && m_game_tex.srv_heap != nullptr) {
+            const auto game_tex_desc = m_game_tex.texture->GetDesc();
 
-        // Copy the left eye using a raw region copy, since the game texture always matches the
-        // destination eye dimensions.
-        commands.copy_region(
-            m_game_tex.texture.Get(), render_target, &left_src_box,
-            0, 0, 0,
-            D3D12_RESOURCE_STATE_RENDER_TARGET,
-            D3D12_RESOURCE_STATE_RENDER_TARGET
-        );
+            // The game texture is crop-compatible (fast CopyTextureRegion, no scaling needed) whenever
+            // its height matches the destination eye height and its width is at least the destination
+            // eye width. This covers both the "single-eye-sized" texture case (Width == dst_eye_width)
+            // and the "full double-wide backbuffer" case (Width == 2 * dst_eye_width), where the left
+            // eye is simply the left-most dst_eye_width x dst_eye_height region. Only fall back to the
+            // shader blit path when the game texture is genuinely smaller than the destination (true
+            // upscaling required), since the blit path allocates a new SRV/RTV heap that can fail and
+            // has been observed to crash the D3D12 device (DXGI_ERROR_DEVICE_REMOVED) when misused.
+            const auto left_sizes_match = game_tex_desc.Width >= dst_eye_width && game_tex_desc.Height == dst_eye_height;
+
+            // Diagnostic: correlates the composited frame/backbuffer identity with the copy mode so we
+            // can determine whether a partial-eye flicker lines up with backbuffer index reuse, AFR
+            // state, or same-frame duplication rather than a scale mismatch.
+            SPDLOG_INFO_EVERY_N_SEC(2, "[VR] left eye composite: game_tex={}x{} dst_eye={}x{} mode={} frame={} bb_idx={} is_afr={} is_same_frame={} native_stereo_fix={}",
+                game_tex_desc.Width, game_tex_desc.Height,
+                dst_eye_width, dst_eye_height,
+                left_sizes_match ? "copy" : "blit",
+                vr->m_render_frame_count,
+                swapchain->GetCurrentBackBufferIndex(),
+                is_afr,
+                is_same_frame,
+                vr->is_native_stereo_fix_enabled());
+
+            if (left_sizes_match) {
+                D3D12_BOX left_src_box{
+                    .left = 0,
+                    .top = 0,
+                    .front = 0,
+                    .right = dst_eye_width,
+                    .bottom = dst_eye_height,
+                    .back = 1
+                };
+
+                commands.copy_region(
+                    m_game_tex.texture.Get(), render_target, &left_src_box,
+                    0, 0, 0,
+                    D3D12_RESOURCE_STATE_RENDER_TARGET,
+                    D3D12_RESOURCE_STATE_RENDER_TARGET
+                );
+            } else {
+                // Wrap the destination render target so render_srv_to_rtv can target it directly.
+                if (m_stereo_dst_tex.texture.Get() != render_target) {
+                    if (!m_stereo_dst_tex.setup(device, render_target, std::nullopt, std::nullopt, L"Stereo Dest Texture")) {
+                        spdlog::error("[VR] Failed to setup stereo destination texture for left eye blit.");
+                        m_stereo_dst_tex.reset();
+                    }
+                }
+
+                if (m_stereo_dst_tex.texture.Get() != nullptr && m_stereo_dst_tex.rtv_heap != nullptr) {
+                    const RECT left_dest_rect{
+                        0, 0,
+                        (LONG)dst_eye_width, (LONG)dst_eye_height
+                    };
+
+                    d3d12::render_srv_to_rtv(
+                        m_game_batch.get(),
+                        commands.cmd_list.Get(),
+                        m_game_tex,
+                        m_stereo_dst_tex,
+                        std::nullopt,
+                        left_dest_rect,
+                        D3D12_RESOURCE_STATE_RENDER_TARGET,
+                        D3D12_RESOURCE_STATE_RENDER_TARGET
+                    );
+                }
+            }
+        } else {
+            SPDLOG_INFO_EVERY_N_SEC(2, "[VR] left eye composite: game texture is NULL, left eye will not be copied this frame");
+        }
 
         // The scene capture texture (right eye, native stereo fix) can be reallocated to the
         // HMD's native per-eye resolution independently of the game's backbuffer resolution, so
@@ -402,6 +812,33 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
                         ENGINE_SRC_COLOR
                     );
                 }
+            } else {
+                // BUGFIX: previously the right 2D-mode screen (m_2d_screen_tex[1]) was only ever
+                // cleared to black and never drawn to when is_afr is true, leaving it permanently
+                // black in 2D mode for AFR games (which is the common case). In AFR, m_game_tex is
+                // the shared double-wide backbuffer containing BOTH eyes side-by-side (this is the
+                // same texture/layout composite_afr_eye crops from for the actual VR eyes above), so
+                // crop its right half here too instead of skipping this screen entirely.
+                d3d12::render_srv_to_rtv(
+                    m_game_batch.get(),
+                    commands.cmd_list.Get(),
+                    m_game_tex,
+                    m_2d_screen_tex[1],
+                    RECT{(LONG)((float)m_backbuffer_size[0] / 2.0f), 0, (LONG)((float)m_backbuffer_size[0]), (LONG)m_backbuffer_size[1]},
+                    ENGINE_SRC_COLOR,
+                    ENGINE_SRC_COLOR
+                );
+
+                if (m_game_ui_tex.texture.Get() != nullptr && m_game_ui_tex.srv_heap != nullptr) {
+                    d3d12::render_srv_to_rtv(
+                        m_game_batch.get(),
+                        commands.cmd_list.Get(),
+                        m_game_ui_tex,
+                        m_2d_screen_tex[1],
+                        ENGINE_SRC_COLOR,
+                        ENGINE_SRC_COLOR
+                    );
+                }
             }
 
             // Clear the RT so the entire background is black when submitting to the compositor
@@ -498,26 +935,163 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
     #endif
     }
 
+    // The AFR left/right eye swapchains are created once at setup time, sized to the OpenXR
+    // runtime's fixed per-eye resolution (get_hmd_width()/get_hmd_height()), which is completely
+    // independent of the game's own backbuffer resolution. When the game uses dynamic resolution
+    // scaling, m_backbuffer_size can change frame-to-frame while the destination swapchain stays
+    // fixed. A raw CopyTextureRegion (used below) can only crop, never scale, so whenever these
+    // sizes diverge the copy silently produces a corrupted/black-looking eye instead of erroring -
+    // this is the same class of bug already identified and fixed for the Native Stereo Fix path
+    // (see the "left_sizes_match"/"sizes_match" handling in the pre_render lambda above). Fall back
+    // to a shader blit (render_srv_to_rtv) via m_stereo_dst_tex whenever the destination swapchain's
+    // actual size doesn't match the half of the game texture we intend to crop out for this eye.
+    auto composite_afr_eye = [&](d3d12::CommandContext& commands, ID3D12Resource* render_target, bool right_half, const char* debug_label) {
+        if (render_target == nullptr) {
+            return;
+        }
+
+        if (m_game_tex.texture.Get() == nullptr || m_game_tex.srv_heap == nullptr) {
+            SPDLOG_INFO_EVERY_N_SEC(2, "[VR] {} composite (AFR): game texture is NULL, eye will not be copied this frame", debug_label);
+            return;
+        }
+
+        const auto game_tex_desc = m_game_tex.texture->GetDesc();
+        const auto dst_desc = render_target->GetDesc();
+
+        const auto dst_eye_width = (uint32_t)dst_desc.Width;
+        const auto dst_eye_height = (uint32_t)dst_desc.Height;
+
+        const auto extreme_compat = vr->is_extreme_compatibility_mode_enabled();
+        const auto half_width = extreme_compat ? (uint32_t)game_tex_desc.Width : (uint32_t)game_tex_desc.Width / 2;
+
+        // The engine's own AdjustViewRect call independently decides which physical x-offset half
+        // of the double-wide backbuffer each eye's scene actually gets rendered into. That decision
+        // is driven by AdjustViewRect's own local index/index_starts_from_one state, which is NOT
+        // guaranteed to stay in phase with is_left_eye_frame/right_half here (derived from a separate
+        // frame-parity counter, vr->m_render_frame_count). If the two fall out of phase, cropping a
+        // hardcoded half (x=0 for left, x=half_width for right) silently grabs the WRONG eye's content,
+        // producing a permanently-black eye despite the engine rendering both eyes correctly. Prefer
+        // the real, engine-reported x-offset for this eye whenever it's available and sane.
+        const auto& ffsr = VR::get()->m_fake_stereo_hook;
+        auto src_x_offset = (right_half && !extreme_compat) ? (uint32_t)game_tex_desc.Width - half_width : 0;
+
+        if (!extreme_compat && ffsr != nullptr && ffsr->has_seen_eye_x_offsets()) {
+            const auto reported_x_offset = right_half ? ffsr->get_last_right_eye_x_offset() : ffsr->get_last_left_eye_x_offset();
+
+            // Only trust the reported offset if it actually lands within the game texture bounds for
+            // a half-width crop (guards against stale/uninitialized values or a mode where AdjustViewRect
+            // isn't driving eye layout at all, e.g. Native Stereo Fix).
+            if (reported_x_offset + half_width <= (uint32_t)game_tex_desc.Width) {
+                if (reported_x_offset != src_x_offset) {
+                    SPDLOG_INFO_EVERY_N_SEC(2, "[VR] {} composite (AFR): using engine-reported x_offset={} instead of assumed={}",
+                        debug_label, reported_x_offset, src_x_offset);
+                }
+
+                src_x_offset = reported_x_offset;
+            }
+        }
+
+        // The engine's true eye-index state machine (driven by AdjustViewRect) can become skewed
+        // for several consecutive frames toward one eye (observed: right_calls climbing while
+        // left_calls stalls), independent of our own frame-parity-based left/right classification.
+        // When that happens, blindly copying here for an eye whose AdjustViewRect offset hasn't
+        // actually been refreshed since our last copy just re-stamps a stale/black crop of the
+        // shared backbuffer over the last good frame for that eye. Skip the copy in that case and
+        // leave the destination swapchain image as-is (last known good frame) instead.
+        if (!extreme_compat && ffsr != nullptr && ffsr->has_seen_eye_x_offsets()) {
+            static uint64_t s_last_left_update_count = 0;
+            static uint64_t s_last_right_update_count = 0;
+
+            const auto current_update_count = right_half ? ffsr->get_right_eye_x_offset_update_count() : ffsr->get_left_eye_x_offset_update_count();
+            auto& last_update_count = right_half ? s_last_right_update_count : s_last_left_update_count;
+
+            if (current_update_count == last_update_count) {
+                SPDLOG_INFO_EVERY_N_SEC(2, "[VR] {} composite (AFR): skipping copy, engine has not refreshed this eye's view rect since last copy (update_count={})",
+                    debug_label, current_update_count);
+                return;
+            }
+
+            last_update_count = current_update_count;
+        }
+
+        const auto sizes_match = half_width == dst_eye_width && (uint32_t)game_tex_desc.Height == dst_eye_height;
+
+        SPDLOG_INFO_EVERY_N_SEC(2, "[VR] {} composite (AFR): game_tex={}x{} half={}x{} dst_eye={}x{} mode={} extreme_compat={}",
+            debug_label, (uint32_t)game_tex_desc.Width, (uint32_t)game_tex_desc.Height, half_width, (uint32_t)game_tex_desc.Height,
+            dst_eye_width, dst_eye_height, sizes_match ? "copy" : "blit", extreme_compat);
+
+        if (sizes_match) {
+            D3D12_BOX box{};
+            box.left = src_x_offset;
+            box.top = 0;
+            box.front = 0;
+            box.right = src_x_offset + half_width;
+            box.bottom = (uint32_t)game_tex_desc.Height;
+            box.back = 1;
+
+            commands.copy_region(
+                m_game_tex.texture.Get(), render_target, &box,
+                0, 0, 0,
+                D3D12_RESOURCE_STATE_RENDER_TARGET,
+                D3D12_RESOURCE_STATE_RENDER_TARGET
+            );
+        } else {
+            // Wrap the destination render target so render_srv_to_rtv can target it directly.
+            if (m_stereo_dst_tex.texture.Get() != render_target) {
+                if (!m_stereo_dst_tex.setup(device, render_target, std::nullopt, std::nullopt, L"Stereo Dest Texture (AFR)")) {
+                    spdlog::error("[VR] Failed to setup stereo destination texture for AFR eye blit.");
+                    m_stereo_dst_tex.reset();
+                }
+            }
+
+            if (m_stereo_dst_tex.texture.Get() != nullptr && m_stereo_dst_tex.rtv_heap != nullptr) {
+                const RECT src_rect{
+                    (LONG)src_x_offset, 0,
+                    (LONG)(src_x_offset + half_width), (LONG)game_tex_desc.Height
+                };
+
+                const RECT dest_rect{
+                    0, 0,
+                    (LONG)dst_eye_width, (LONG)dst_eye_height
+                };
+
+                d3d12::render_srv_to_rtv(
+                    m_game_batch.get(),
+                    commands.cmd_list.Get(),
+                    m_game_tex,
+                    m_stereo_dst_tex,
+                    src_rect,
+                    dest_rect,
+                    D3D12_RESOURCE_STATE_RENDER_TARGET,
+                    D3D12_RESOURCE_STATE_RENDER_TARGET
+                );
+            }
+        }
+    };
+
     // If m_frame_count is even, we're rendering the left eye.
     if (is_left_eye_frame) {
         m_submitted_left_eye = true;
 
         // OpenXR texture
         if (runtime->is_openxr() && vr->m_openxr->ready()) {
-            D3D12_BOX src_box{};
-            src_box.left = 0;
-            src_box.top = 0;
-            src_box.bottom = m_backbuffer_size[1];
-            src_box.front = 0;
-            src_box.back = 1;
-
-            if (vr->is_extreme_compatibility_mode_enabled()) {
-                src_box.right = m_backbuffer_size[0];
-            } else {
-                src_box.right = m_backbuffer_size[0] / 2;
+            // DIAG: log of the actual copy performed into the AFR left-eye swapchain. Logs every
+            // frame for a short warm-up window (unbiased by parity, unlike a fixed modulo stride),
+            // then falls back to a low-frequency heartbeat.
+            {
+                static uint32_t diag_left_copy_count = 0;
+                ++diag_left_copy_count;
+                if (diag_left_copy_count <= 60 || diag_left_copy_count % 300 == 1) {
+                    SPDLOG_INFO("[DIAG] AFR_LEFT_EYE copy (#{}) [is_left_eye_frame branch]: swapchain_idx={} backbuffer={}x{} extreme_compat={} frame_count={}",
+                        diag_left_copy_count, (uint32_t)runtimes::OpenXR::SwapchainIndex::AFR_LEFT_EYE, m_backbuffer_size[0], m_backbuffer_size[1],
+                        vr->is_extreme_compatibility_mode_enabled(), vr->m_render_frame_count);
+                }
             }
 
-            m_openxr.copy((uint32_t)runtimes::OpenXR::SwapchainIndex::AFR_LEFT_EYE, backbuffer.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, &src_box);
+            m_openxr.copy((uint32_t)runtimes::OpenXR::SwapchainIndex::AFR_LEFT_EYE, nullptr,
+                [&](d3d12::CommandContext& commands, ID3D12Resource* render_target) {
+                    composite_afr_eye(commands, render_target, false, "left eye");
+                }, std::nullopt, D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr);
 
             if (scene_depth_tex != nullptr) {
                 m_openxr.copy((uint32_t)runtimes::OpenXR::SwapchainIndex::AFR_DEPTH_LEFT_EYE, scene_depth_tex.Get(), ENGINE_SRC_DEPTH, nullptr);
@@ -559,20 +1133,20 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
         // OpenXR texture
         if (runtime->is_openxr() && vr->m_openxr->ready()) {
             if (is_actually_afr && !is_afr && !m_submitted_left_eye) {
-                D3D12_BOX src_box{};
-                src_box.left = 0;
-                src_box.top = 0;
-                src_box.bottom = m_backbuffer_size[1];
-                src_box.front = 0;
-                src_box.back = 1;
-
-                if (vr->is_extreme_compatibility_mode_enabled()) {
-                    src_box.right = m_backbuffer_size[0];
-                } else {
-                    src_box.right = m_backbuffer_size[0] / 2;
+                // DIAG: throttled log of the actual copy performed into the AFR left-eye swapchain
+                // from the "else" (right-eye-frame) branch's catch-up left-eye copy.
+                {
+                    static uint32_t diag_left_catchup_count = 0;
+                    if (++diag_left_catchup_count % 300 == 1) {
+                        SPDLOG_INFO("[DIAG] AFR_LEFT_EYE copy (#{}) [catch-up branch]: backbuffer={}x{} extreme_compat={}",
+                            diag_left_catchup_count, m_backbuffer_size[0], m_backbuffer_size[1], vr->is_extreme_compatibility_mode_enabled());
+                    }
                 }
 
-                m_openxr.copy((uint32_t)runtimes::OpenXR::SwapchainIndex::AFR_LEFT_EYE, backbuffer.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, &src_box);
+                m_openxr.copy((uint32_t)runtimes::OpenXR::SwapchainIndex::AFR_LEFT_EYE, nullptr,
+                    [&](d3d12::CommandContext& commands, ID3D12Resource* render_target) {
+                        composite_afr_eye(commands, render_target, false, "left eye (catch-up)");
+                    }, std::nullopt, D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr);
 
                 if (scene_depth_tex != nullptr) {
                     m_openxr.copy((uint32_t)runtimes::OpenXR::SwapchainIndex::AFR_DEPTH_LEFT_EYE, scene_depth_tex.Get(), ENGINE_SRC_DEPTH, nullptr);
@@ -580,34 +1154,25 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
             }
 
             if (is_actually_afr) {
-                D3D12_BOX src_box{};
-
-                if (!vr->is_extreme_compatibility_mode_enabled()) {
-                    if (!is_afr) {
-                        src_box.left = m_backbuffer_size[0] / 2;
-                        src_box.right = m_backbuffer_size[0];
-                        src_box.top = 0;
-                        src_box.bottom = m_backbuffer_size[1];
-                        src_box.front = 0;
-                        src_box.back = 1;
-                    } else { // Copy the left eye on AFR
-                        src_box.left = 0;
-                        src_box.right = m_backbuffer_size[0] / 2;
-                        src_box.top = 0;
-                        src_box.bottom = m_backbuffer_size[1];
-                        src_box.front = 0;
-                        src_box.back = 1;
-                    }   
-                } else {
-                    src_box.left = 0;
-                    src_box.right = m_backbuffer_size[0];
-                    src_box.top = 0;
-                    src_box.bottom = m_backbuffer_size[1];
-                    src_box.front = 0;
-                    src_box.back = 1;
+                // DIAG: log of the actual copy performed into the AFR right-eye swapchain. Logs every
+                // frame for a short warm-up window, then falls back to a low-frequency heartbeat.
+                {
+                    static uint32_t diag_right_copy_count = 0;
+                    ++diag_right_copy_count;
+                    if (diag_right_copy_count <= 60 || diag_right_copy_count % 300 == 1) {
+                        SPDLOG_INFO("[DIAG] AFR_RIGHT_EYE copy (#{}): swapchain_idx={} backbuffer={}x{} is_afr={} extreme_compat={} frame_count={}",
+                            diag_right_copy_count, (uint32_t)runtimes::OpenXR::SwapchainIndex::AFR_RIGHT_EYE, m_backbuffer_size[0], m_backbuffer_size[1],
+                            is_afr, vr->is_extreme_compatibility_mode_enabled(), vr->m_render_frame_count);
+                    }
                 }
 
-                m_openxr.copy((uint32_t)runtimes::OpenXR::SwapchainIndex::AFR_RIGHT_EYE, backbuffer.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, &src_box);
+                // NOTE: Regardless of is_afr, the right eye must always be sourced from the right half
+                // of the double-wide backbuffer (or the whole backbuffer in extreme compat mode). See
+                // composite_afr_eye for the size-mismatch-safe crop/blit logic.
+                m_openxr.copy((uint32_t)runtimes::OpenXR::SwapchainIndex::AFR_RIGHT_EYE, nullptr,
+                    [&](d3d12::CommandContext& commands, ID3D12Resource* render_target) {
+                        composite_afr_eye(commands, render_target, true, "right eye");
+                    }, std::nullopt, D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr);
 
                 if (scene_depth_tex != nullptr) {
                     m_openxr.copy((uint32_t)runtimes::OpenXR::SwapchainIndex::AFR_DEPTH_RIGHT_EYE, scene_depth_tex.Get(), ENGINE_SRC_DEPTH, nullptr);
@@ -1131,6 +1696,13 @@ void D3D12Component::on_reset(VR* vr) {
     m_game_ui_tex.reset();
     m_game_tex.reset();
     m_scene_capture_tex.reset();
+
+    // m_stereo_dst_tex wraps a raw swapchain backbuffer pointer (see composite_afr_eye), so if we
+    // don't release it here, it keeps an outstanding reference to the OLD swapchain buffer alive
+    // across ResizeBuffers. DXGI requires ALL outstanding references to swapchain buffers to be
+    // released before ResizeBuffers can succeed; holding onto a stale one here caused
+    // DXGI_ERROR_INVALID_CALL / DXGI_ERROR_DEVICE_REMOVED on resize.
+    m_stereo_dst_tex.reset();
     m_backbuffer_batch.reset();
     m_game_batch.reset();
     m_ui_batch_alpha_invert.reset();
@@ -1389,7 +1961,7 @@ std::optional<std::string> D3D12Component::OpenXR::create_swapchains() {
     spdlog::info("[VR] Creating OpenXR swapchains for D3D12");
 
     this->destroy_swapchains();
-    
+
     auto& hook = g_framework->get_d3d12_hook();
     auto device = hook->get_device();
     auto swapchain = hook->get_swap_chain();
@@ -1407,6 +1979,8 @@ std::optional<std::string> D3D12Component::OpenXR::create_swapchains() {
             has_actual_vr_backbuffer = backbuffer != nullptr;
         }
     }
+
+    // ... Rest of your original create_swapchains code continues as normal below ...
     
     // Get the existing backbuffer
     // so we can get the format and stuff.
@@ -1846,6 +2420,41 @@ void D3D12Component::OpenXR::copy(
             }
 
             texture_ctx->commands.execute();
+
+            // DIAG: destination-side pixel readback for the AFR eye swapchains. Sampled AFTER
+            // our copy has been recorded/executed, so this reflects exactly what will be
+            // submitted to the OpenXR runtime for that eye. Compared against the SOURCE
+            // backbuffer sample above, this tells us definitively whether the black image is:
+            //   - already black in the source (upstream UE/engine rendering issue), or
+            //   - fine in the source but black in the destination (bug in our copy/compositor).
+            // Waited on the fence first so the copy has actually completed by the time we read.
+            if (swapchain_idx == (uint32_t)runtimes::OpenXR::SwapchainIndex::AFR_LEFT_EYE ||
+                swapchain_idx == (uint32_t)runtimes::OpenXR::SwapchainIndex::AFR_RIGHT_EYE) {
+                static uint32_t diag_dst_left_count = 0;
+                static uint32_t diag_dst_right_count = 0;
+
+                const bool is_left = swapchain_idx == (uint32_t)runtimes::OpenXR::SwapchainIndex::AFR_LEFT_EYE;
+                auto& diag_count = is_left ? diag_dst_left_count : diag_dst_right_count;
+                ++diag_count;
+
+                if (diag_count <= 5 || diag_count % 300 == 1) {
+                    texture_ctx->commands.wait(INFINITE);
+
+                    auto& hook = g_framework->get_d3d12_hook();
+                    auto device = hook->get_device();
+                    auto command_queue = hook->get_command_queue();
+
+                    const auto sample = diag_sample_texture(device, command_queue, ctx.textures[texture_index].texture, D3D12_RESOURCE_STATE_RENDER_TARGET);
+
+                    if (sample.succeeded) {
+                        SPDLOG_INFO("[DIAG] DEST {} swapchain pixel sample (#{}): swapchain_idx={} avg_luminance={:.2f} nonzero={}/{} corner=0x{:08X} center=0x{:08X}",
+                            is_left ? "AFR_LEFT_EYE" : "AFR_RIGHT_EYE", diag_count, swapchain_idx,
+                            sample.avg_luminance, sample.nonzero_pixels, sample.sampled_pixels, sample.corner_pixel, sample.center_pixel);
+                    } else {
+                        SPDLOG_INFO("[DIAG] DEST {} swapchain pixel sample (#{}): FAILED to sample.", is_left ? "AFR_LEFT_EYE" : "AFR_RIGHT_EYE", diag_count);
+                    }
+                }
+            }
 
             XrSwapchainImageReleaseInfo release_info{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
             auto result = xrReleaseSwapchainImage(swapchain.handle, &release_info);

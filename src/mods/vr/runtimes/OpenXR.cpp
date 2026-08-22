@@ -5,6 +5,7 @@
 #include <fstream>
 
 #include <spdlog/spdlog.h>
+#include <utility/Logging.hpp>
 
 #include <nlohmann/json.hpp>
 #include <utility/String.hpp>
@@ -735,6 +736,20 @@ void OpenXR::enqueue_render_poses(uint32_t frame_count) {
 }
 
 void OpenXR::enqueue_render_poses_unsafe(uint32_t frame_count) {
+    // DIAG: this is the frame counter that eventually flows into VR::m_frame_count ->
+    // VR::m_render_frame_count -> the AFR left/right eye parity check in D3D12Component::on_frame.
+    // If this value is stuck (never increments, or increments but resets), the AFR eye-state
+    // logic downstream will permanently think we're on the same eye every frame.
+    {
+        static uint32_t s_last_diag_frame_count = 0xFFFFFFFF;
+        if (frame_count != s_last_diag_frame_count) {
+            SPDLOG_INFO("[DIAG] enqueue_render_poses_unsafe: frame_count changed {} -> {}", s_last_diag_frame_count, frame_count);
+            s_last_diag_frame_count = frame_count;
+        } else {
+            SPDLOG_INFO_EVERY_N_SEC(2, "[DIAG] enqueue_render_poses_unsafe: frame_count stuck at {}", frame_count);
+        }
+    }
+
     this->internal_render_frame_count = frame_count;
     this->has_render_frame_count = true;
 }
@@ -1800,6 +1815,19 @@ XrResult OpenXR::end_frame(const std::vector<XrCompositionLayerBaseHeader*>& qua
         dummy_projection_layer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
     }
 
+    // DIAG: throttled visibility into why the projection layer might not be getting submitted -
+    // if shouldRender is false or stage_views is empty for many consecutive frames, no projection
+    // layer is ever pushed into xrEndFrame below, which would explain a black VR view (headset gets
+    // nothing but its previous/last-good frame or a runtime-side fallback) while flat-screen/ImGui
+    // continue to render fine since they don't depend on this submission path.
+    {
+        static uint32_t diag_submit_count = 0;
+        if (++diag_submit_count % 300 == 1) {
+            SPDLOG_INFO("[DIAG] xrEndFrame submit state (#{}): shouldRender={} stage_views.size()={} is_afr={} has_depth={}",
+                diag_submit_count, (int)pipelined_frame_state.shouldRender, pipelined_stage_views.size(), is_afr, has_depth);
+        }
+    }
+
     // we CANT push the layers every time, it cause some layer error
     // in xrEndFrame, so we must only do it when shouldRender is true
     if (pipelined_frame_state.shouldRender == XR_TRUE && !pipelined_stage_views.empty()) {
@@ -1841,6 +1869,21 @@ XrResult OpenXR::end_frame(const std::vector<XrCompositionLayerBaseHeader*>& qua
             // SPDLOG_INFO("image calc for eye {} {}, {}, {}, {}", i, offset_x, extent_x, offset_y, extent_y);
             projection_layer_views[i].subImage.imageRect.offset = {offset_x, offset_y};
             projection_layer_views[i].subImage.imageRect.extent = {extent_x, extent_y};
+
+            // DIAG: per-eye projection view identity (which physical swapchain each eye index is
+            // bound to, and the exact rect being submitted for it). This lets us confirm whether eye
+            // index 0/1 are ever mapped to the SAME swapchain handle, or whether one eye's rect is
+            // degenerate (zero/negative extent), either of which would produce a black eye in the
+            // headset even though shouldRender/layerCount/xrEndFrame all look healthy.
+            {
+                static uint32_t diag_proj_view_count = 0;
+                ++diag_proj_view_count;
+                if (diag_proj_view_count <= 120 || diag_proj_view_count % 600 == 1) {
+                    SPDLOG_INFO("[DIAG] projection_view[{}] (#{}): swapchain_handle={:x} swapchain_idx={} rect=({},{})x({},{}) is_afr={}",
+                        i, diag_proj_view_count, (uintptr_t)swapchain->handle, (uint32_t)(is_afr ? (i == 0 ? OpenXR::SwapchainIndex::AFR_LEFT_EYE : OpenXR::SwapchainIndex::AFR_RIGHT_EYE) : OpenXR::SwapchainIndex::DOUBLE_WIDE),
+                        offset_x, offset_y, extent_x, extent_y, is_afr);
+                }
+            }
 
             if (has_depth) {
                 Swapchain* depth_swapchain = nullptr;
@@ -1906,6 +1949,19 @@ XrResult OpenXR::end_frame(const std::vector<XrCompositionLayerBaseHeader*>& qua
     //spdlog::info("[VR] display time diff: {}", pipelined_frame_state.predictedDisplayTime - this->frame_state.predictedDisplayTime);
     //spdlog::info("[VR] Ending frame, {} layers", frame_end_info.layerCount);
     //spdlog::info("[VR] Ending frame, layer ptr: {:x}", (uintptr_t)frame_end_info.layers);
+
+    // DIAG: throttled visibility into what actually got submitted to xrEndFrame. If layerCount is
+    // consistently 0 here despite shouldRender being true (see the [DIAG] log above), the black
+    // screen is happening downstream of the shouldRender gate - e.g. the swapchain image acquired
+    // for this frame was never actually written to, or the projection_layer_cache/layers vectors
+    // are being cleared/rebuilt incorrectly for Synced Sequential mode specifically.
+    {
+        static uint32_t diag_endframe_count = 0;
+        if (++diag_endframe_count % 300 == 1) {
+            SPDLOG_INFO("[DIAG] xrEndFrame call (#{}): layerCount={} displayTime={} blendMode={}",
+                diag_endframe_count, frame_end_info.layerCount, frame_end_info.displayTime, (int)frame_end_info.environmentBlendMode);
+        }
+    }
 
     this->begin_profile();
     auto result = xrEndFrame(this->session, &frame_end_info);

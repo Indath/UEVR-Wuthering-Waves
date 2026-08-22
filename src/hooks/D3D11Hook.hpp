@@ -1,6 +1,7 @@
 #pragma once
 
 #include <functional>
+#include <chrono>
 
 #include <d3d11.h>
 #include <dxgi.h>
@@ -22,6 +23,10 @@ public:
 
     bool is_inside_present() const {
         return m_inside_present;
+    }
+
+    std::chrono::steady_clock::time_point get_present_enter_time() const {
+        return m_present_enter_time;
     }
 
     void ignore_next_present() {
@@ -54,6 +59,7 @@ protected:
     IDXGISwapChain* m_swapchain_1{};
     bool m_hooked{ false };
     bool m_inside_present{false};
+    std::chrono::steady_clock::time_point m_present_enter_time{};
     bool m_ignore_next_present{false};
 
     std::optional<uint32_t> m_next_present_interval{};

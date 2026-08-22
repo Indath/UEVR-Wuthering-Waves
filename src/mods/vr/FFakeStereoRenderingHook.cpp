@@ -59,14 +59,172 @@
 #include "FFakeStereoRenderingHook.hpp"
 
 #include <tracy/Tracy.hpp>
+#include "uevr/API.hpp"
+#include <cstdint> // Ensure uint32_t / uintptr_t are available
+#include <atomic>
 
 //#define FFAKE_STEREO_RENDERING_LOG_ALL_CALLS
 
 FFakeStereoRenderingHook* g_hook = nullptr;
 uint32_t g_frame_count{};
 
+// While a new level is streaming in (player controller not yet spawned), the scene-capture actor
+// can be repeatedly garbage-collected/invalidated by the engine well after bIsTearingDown has
+// cleared and the engine tick has resumed ticking normally. Neither of those signals catch this
+// window, which is why create_scene_capture() was observed retriggering every frame for 70+
+// seconds straight during a level transition even though tick_stalled/is_loading both read false.
+// D3D12Component.cpp already uses this exact check (uevr::API::get()->get_player_controller(0))
+// to gate its own scene-capture texture setup, so reuse it here as an additional loading signal.
+static bool is_local_player_controller_missing() {
+    auto& api = uevr::API::get();
+    return api == nullptr || api->get_player_controller(0) == nullptr;
+}
+
+// A player controller can exist well before the player is actually in control of a pawn in the
+// world (e.g. during level streaming, cutscenes, or the initial boot loading screen where the
+// controller is spawned early but possession hasn't happened yet). Requiring an actual possessed
+// pawn is a much stronger/harder-to-fool "the player is really in-game" signal than merely
+// checking for a non-null player controller, since a missing pawn cannot be satisfied by the
+// loading screen/transient boot world alone the way frame-pacing or controller-existence can be.
+static bool is_local_pawn_missing() {
+    auto& api = uevr::API::get();
+    return api == nullptr || api->get_local_pawn(0) == nullptr;
+}
+
+// The existing loading guards (bIsTearingDown / tick-stalled / no-player-controller) only detect
+// LEVEL TRANSITIONS after the game has already finished its initial boot. During the very first
+// load into a map, none of those signals fire (world is valid, tick is running, player controller
+// exists) even though the engine is still churning through asset streaming/shader compilation at a
+// tiny fraction of normal frame rate. Observed in the wild: begin_render_viewfamily_real firing
+// roughly once every ~2 seconds during the "stuck at 10%" boot screen. Because none of the existing
+// guards catch this, create_scene_capture() (actor spawn + full D3D12 RTV/SRV setup) was retriggering
+// every single one of those rare frames, since the actor/world it was spawned into gets explicitly
+// destroyed (not just GC'd) as the transient boot/loading world tears itself down between stages.
+//
+// IMPORTANT: the native Unreal loading screen itself (Slate spinner/UI) renders CHEAPLY and FAST,
+// so "30 fast frames in a row" can be satisfied almost instantly by the loading screen alone, well
+// before the underlying world/streaming is actually ready. That was observed directly: this tracker
+// ended after ~1.6s, the same-pass stereo capture then committed to full dual-view rendering, and
+// THAT is what actually starved the boot sequence for the next ~30 seconds (each frame taking ~2s).
+// None of bIsTearingDown/tick-stalled/no-player-controller fired during that 30s stall either, so
+// this tracker cannot be a one-shot latch - it must keep monitoring frame pacing even after first
+// reaching "complete", and re-arm (go back to suppressing) if slow frames resume for a sustained
+// run. This makes it self-correcting instead of trusting a single early fast-frame burst forever.
+static std::atomic<bool> g_boot_phase_active{true};
+
+// Must be called exactly once per rendered frame (from begin_render_viewfamily_real) to advance the
+// frame-pacing tracker. Other call sites should read g_boot_phase_active directly instead.
+static void update_boot_phase_tracking() {
+    static std::chrono::steady_clock::time_point s_boot_first_frame_time{};
+    static std::chrono::steady_clock::time_point s_last_frame_time{};
+    static uint32_t s_consecutive_fast_frames{0};
+    static uint32_t s_consecutive_slow_frames{0};
+
+    const auto now = std::chrono::steady_clock::now();
+
+    if (s_boot_first_frame_time.time_since_epoch().count() == 0) {
+        s_boot_first_frame_time = now;
+        s_last_frame_time = now;
+        return;
+    }
+
+    static constexpr auto fast_frame_threshold = std::chrono::milliseconds(200);
+    // Anything this slow is well outside normal frame pacing (even accounting for hitches) and is a
+    // strong signal that the render thread is starved/blocked, e.g. by the exact same-pass secondary
+    // view cascade this tracker exists to gate. Require several in a row to avoid false positives
+    // from a single one-off hitch (shader compile, disk stall, etc).
+    static constexpr auto slow_frame_threshold = std::chrono::milliseconds(750);
+    static constexpr uint32_t required_consecutive_fast_frames = 30;
+    static constexpr uint32_t required_consecutive_slow_frames = 3;
+    static constexpr auto max_boot_duration = std::chrono::seconds(30); // safety valve, only applies while still active
+
+    const auto dt = now - s_last_frame_time;
+    s_last_frame_time = now;
+
+    const bool currently_active = g_boot_phase_active.load(std::memory_order_relaxed);
+
+    if (!currently_active) {
+        // Re-arm if slow frames resume even after we previously considered boot complete - this is
+        // the case that a one-shot latch missed entirely (fast loading-screen frames satisfied the
+        // original check, then the secondary-view cascade itself caused sustained slow frames).
+        if (dt >= slow_frame_threshold) {
+            ++s_consecutive_slow_frames;
+        } else {
+            s_consecutive_slow_frames = 0;
+        }
+
+        if (s_consecutive_slow_frames >= required_consecutive_slow_frames) {
+            SPDLOG_WARN("[VR] Boot-phase scene-capture suppression RE-ARMED after {} consecutive slow frames (dt={}ms) - "
+                        "something is still starving the render thread post-boot.",
+                s_consecutive_slow_frames, std::chrono::duration_cast<std::chrono::milliseconds>(dt).count());
+            g_boot_phase_active.store(true, std::memory_order_relaxed);
+            s_consecutive_fast_frames = 0;
+            s_consecutive_slow_frames = 0;
+            s_boot_first_frame_time = now;
+
+            // Tear down the existing scene capture (and its expensive secondary-view rendering)
+            // immediately rather than waiting for it to naturally invalidate - the other loading
+            // guards only re-check is_loading when the render target is already null, so without
+            // this the re-arm above would have no effect until something else destroyed it.
+            if (g_hook != nullptr) {
+                if (auto rtm = g_hook->get_render_target_manager(); rtm != nullptr) {
+                    rtm->destroy_scene_capture();
+                }
+            }
+        }
+
+        return;
+    }
+
+    s_consecutive_slow_frames = 0;
+
+    if (dt < fast_frame_threshold) {
+        ++s_consecutive_fast_frames;
+    } else {
+        s_consecutive_fast_frames = 0;
+    }
+
+    if (s_consecutive_fast_frames >= required_consecutive_fast_frames || (now - s_boot_first_frame_time) > max_boot_duration) {
+        g_boot_phase_active.store(false, std::memory_order_relaxed);
+        SPDLOG_INFO("[VR] Boot-phase scene-capture suppression window ended (consecutive_fast_frames={}, elapsed={}ms)",
+            s_consecutive_fast_frames, std::chrono::duration_cast<std::chrono::milliseconds>(now - s_boot_first_frame_time).count());
+    }
+}
+
+static bool is_boot_phase_active() {
+    return g_boot_phase_active.load(std::memory_order_relaxed);
+}
+
+// A/B testing switch: exposed in the UEVR ImGui menu under "Native Stereo Fix" as
+// "Disable Loading Guards (A/B testing)", or via environment variable
+// UEVR_DISABLE_LOADING_GUARDS=1 before launching the game. Bypasses ALL of the
+// loading-detection heuristics added above (tick-stall, no-player-controller, no-local-pawn,
+// boot-phase frame-pacing) in one shot, reverting create_scene_capture() gating to its original
+// pre-guard behavior. This lets the effect of these guards be directly A/B tested against
+// baseline without having to comment out code and rebuild each time.
+static bool are_loading_guards_disabled() {
+    static const bool env_disabled = [] {
+        char buf[8]{};
+        const auto len = GetEnvironmentVariableA("UEVR_DISABLE_LOADING_GUARDS", buf, sizeof(buf));
+        const bool result = len > 0 && buf[0] == '1';
+
+        if (result) {
+            SPDLOG_WARN("[VR] UEVR_DISABLE_LOADING_GUARDS=1 detected - all loading-detection guards "
+                        "(tick-stall/no-controller/no-pawn/boot-phase) are DISABLED for A/B testing.");
+        }
+
+        return result;
+    }();
+
+    if (env_disabled) {
+        return true;
+    }
+
+    return VR::get()->are_loading_guards_disabled();
+}
+
 // Scan through function instructions to detect usage of double
-// floating point precision instructions.
+
 bool is_using_double_precision(uintptr_t addr) {
     SPDLOG_INFO("Scanning function at {:x} for double precision usage", addr);
 
@@ -2229,8 +2387,12 @@ FRHITexture2D** FFakeStereoRenderingHook::viewport_get_render_target_texture_hoo
     auto& ui_target = g_hook->get_render_target_manager()->get_ui_target();
 
     if (ui_target != nullptr) {
+        SPDLOG_INFO_EVERY_N_SEC(2, "[DIAG] viewport_get_render_target_texture_hook: redirecting retaddr={:x} to ui_target={:x}",
+            retaddr, (uintptr_t)ui_target);
         return &ui_target;
     }
+
+    SPDLOG_INFO_EVERY_N_SEC(2, "[DIAG] viewport_get_render_target_texture_hook: ui_target is null, falling back to original for retaddr={:x}", retaddr);
 
     return og(viewport);
 }
@@ -2393,10 +2555,23 @@ void FFakeStereoRenderingHook::game_viewport_client_draw_hook(sdk::UGameViewport
         GameThreadWorker::get().enqueue([=]() {
             if (g_hook->m_viewport_draw_hook && viewport != g_hook->m_last_destroyed_viewport) {
                 __try {
-                    if (*(void***)viewport != g_hook->m_last_viewport_vtable) {
-                        SPDLOG_ERROR("FViewport::Draw called on a viewport with a different vtable! This is not expected!");
+                    auto& current_vtable = *(void***)viewport;
+
+                    if (current_vtable == nullptr || current_vtable[0] == nullptr) {
+                        SPDLOG_ERROR("FViewport::Draw called with a bad viewport pointer! This is not expected!");
                         return;
                     }
+
+                    if (g_hook->m_last_viewport_vtable != nullptr && current_vtable != g_hook->m_last_viewport_vtable) {
+                        SPDLOG_ERROR_EVERY_N_SEC(1, "FViewport::Draw called on a viewport with a different vtable! Updating cached vtable and continuing.");
+                    }
+
+                    // Self-heal instead of permanently disabling the forced second-eye draw: this vtable
+                    // pointer is only ever set from the hooked FViewport::Draw, which may not have fired
+                    // yet the first time this deferred callback runs (e.g. right when the game loads),
+                    // leaving m_last_viewport_vtable null/stale and causing every synced frame to skip
+                    // the second eye forever, resulting in a persistent black screen.
+                    g_hook->m_last_viewport_vtable = current_vtable;
                 } __except (EXCEPTION_EXECUTE_HANDLER) {
                     SPDLOG_ERROR("FViewport::Draw called with a bad viewport pointer! This is not expected!");
                     return;
@@ -2897,7 +3072,14 @@ sdk::FSceneView* FFakeStereoRenderingHook::sceneview_constructor(sdk::FSceneView
         SPDLOG_INFO_ONCE("FSceneView constructor was called before view extensions were installed, aborting");
         return g_hook->m_sceneview_data.constructor_hook.unsafe_call<sdk::FSceneView*>(view, init_options, a3, a4);
     }
-
+    // SOLUTION 2: BYPASS STEREO MODIFICATIONS DURING LOADING SCREENS
+    // =================================================================
+    auto early_view_family = init_options != nullptr ? init_options->get_view_family() : nullptr;
+    if (early_view_family == nullptr || early_view_family->get_scene_interface() == nullptr) {
+        // Scene interface isn't active yet (game is streaming/loading assets).
+        // Let standard Unreal SceneView construction proceed untouched!
+        return g_hook->m_sceneview_data.constructor_hook.unsafe_call<sdk::FSceneView*>(view, init_options, a3, a4);
+    }
     std::scoped_lock ___{g_hook->m_sceneview_data.mtx};
 
     const auto retaddr = (uintptr_t)_ReturnAddress();
@@ -2918,7 +3100,11 @@ sdk::FSceneView* FFakeStereoRenderingHook::sceneview_constructor(sdk::FSceneView
 
     const auto init_options_scene_state = init_options->get_scene_state();
 
-    if (init_options_scene_state != nullptr) {
+    // Validate pointer address range before using it as a map key
+    const auto scene_state_addr = reinterpret_cast<uintptr_t>(init_options_scene_state);
+    const bool is_valid_scene_state = (scene_state_addr > 0x10000 && scene_state_addr < 0x7FFFFFFFFFFF && scene_state_addr % 8 == 0);
+
+    if (init_options_scene_state != nullptr && is_valid_scene_state) {
         if (is_ue5) {
             auto& vio_entry = g_hook->m_sceneview_data.view_init_options_ue5[init_options_scene_state];
             memcpy(&vio_entry, init_options, sizeof(sdk::FSceneViewInitOptionsUE5));
@@ -3022,9 +3208,72 @@ sdk::FSceneView* FFakeStereoRenderingHook::sceneview_constructor(sdk::FSceneView
         vr->is_native_stereo_fix_same_pass_enabled(), (int32_t)init_options_stereo_pass,
         (void*)g_hook->get_render_target_manager()->get_scene_capture_render_target());
 
-    if (vr->is_native_stereo_fix_enabled() && vr->is_native_stereo_fix_same_pass_enabled() && init_options_stereo_pass > EStereoscopicPass::eSSP_PRIMARY) {
-        if (g_hook->get_render_target_manager()->get_scene_capture_render_target() != nullptr) {
-            SPDLOG_INFO_EVERY_N_SEC(2, "[VR] sceneview_constructor: entering same-pass branch, forcing stereo pass to PRIMARY for secondary view");
+    // =========================================================================
+    // LEVEL TRANSITION / LOAD GUARD
+    // =========================================================================
+    bool is_actively_loading = false;
+
+    // Get the active engine and world instance using UEVR's UEngine wrapper
+    auto engine = sdk::UEngine::get();
+    auto world = engine != nullptr ? engine->get_world() : nullptr;
+
+    if (world == nullptr) {
+        is_actively_loading = true;
+    } else {
+        // Safely check the bIsTearingDown property on the world
+        static auto world_class = world->get_class();
+        if (world_class != nullptr) {
+            static auto is_tearing_down_prop = world_class->find_property(L"bIsTearingDown");
+            if (is_tearing_down_prop != nullptr) {
+                // bIsTearingDown is a packed bitfield (uint8:1) shared with other unrelated
+                // bools in the same byte. Reading it as a whole bool* is unsafe and can produce
+                // false positives/negatives depending on neighboring bits. Mask to bit 0 instead,
+                // matching the check used in begin_render_viewfamily_real.
+                auto tearing_down_ptr = (uint8_t*)((uintptr_t)world + is_tearing_down_prop->get_offset());
+                if (tearing_down_ptr != nullptr && (*tearing_down_ptr & 1) != 0) {
+                    is_actively_loading = true;
+                }
+            }
+        }
+    }
+
+    // bIsTearingDown only covers the OLD world's teardown, not the new world's streaming/loading
+    // screen. If the game thread's engine tick hasn't run recently, treat that as authoritative
+    // proof we're on a loading screen / mid level-transition, regardless of the bitfield state.
+    const bool tick_stalled_svc = vr->is_engine_tick_stalled();
+    // Neither bIsTearingDown nor tick-stall catch the window where the new level is still
+    // streaming in after the tick resumes but before the player controller exists again.
+    const bool no_player_controller_svc = is_local_player_controller_missing();
+    // A player controller can exist well before the player is actually possessing a pawn in the
+    // world (initial boot loading screen, cutscenes, level streaming). This is a stronger signal
+    // than controller-existence alone and cannot be satisfied by the transient boot/loading world.
+    const bool no_local_pawn_svc = is_local_pawn_missing();
+    const bool boot_phase_svc = is_boot_phase_active();
+    is_actively_loading = is_actively_loading || tick_stalled_svc || no_player_controller_svc || no_local_pawn_svc || boot_phase_svc;
+
+    if (are_loading_guards_disabled()) {
+        is_actively_loading = false;
+    }
+
+    if (vr->is_native_stereo_fix_enabled() && vr->is_native_stereo_fix_same_pass_enabled() &&
+        init_options_stereo_pass > EStereoscopicPass::eSSP_PRIMARY) {
+
+        // The same-pass secondary-view path does meaningfully more work per frame (full depth/shadow
+        // scene render) than a simple eye copy. Enabling it the instant the scene capture target
+        // becomes valid can still land inside the tail end of level streaming, and that extra
+        // render-thread work can starve streaming of the cycles it needs to finish, manifesting as a
+        // hard stall on the loading screen. Require a short grace period after readiness on top of
+        // the existing loading guard before committing to this path.
+        const bool in_grace_period = g_hook->get_render_target_manager()->is_scene_capture_in_grace_period();
+
+        SPDLOG_INFO_EVERY_N_SEC(2, "[VR] sceneview_constructor: is_actively_loading={} tick_stalled={} no_local_pawn={} boot_phase={} in_grace_period={}",
+            is_actively_loading, tick_stalled_svc, no_local_pawn_svc, boot_phase_svc, in_grace_period);
+
+        // Only alter view counts if the target exists AND the level isn't actively tearing down / loading
+        // AND we're past the post-readiness grace period.
+        if (g_hook->get_render_target_manager()->get_scene_capture_render_target() != nullptr && !is_actively_loading && !in_grace_period) {
+            SPDLOG_INFO_EVERY_N_SEC(
+                2, "[VR] sceneview_constructor: entering same-pass branch, forcing stereo pass to PRIMARY for secondary view");
 
             init_options->set_stereo_pass(EStereoscopicPass::eSSP_PRIMARY);
 
@@ -3033,42 +3282,46 @@ sdk::FSceneView* FFakeStereoRenderingHook::sceneview_constructor(sdk::FSceneView
 
             if (views != nullptr) {
                 // Hide the fact that we have multiple views from the FSceneView constructor.
-                // At least 1 view causes special stereo logic to run in the constructor.
-                // Notably I've seen more than 1 view causing crashes on UE5 with the native stereo fix without doing this.
                 views_original_count = views->count;
                 views->count = 0;
             }
         } else {
-            SPDLOG_INFO_EVERY_N_SEC(2, "[VR] sceneview_constructor: same-pass branch would trigger but scene_capture_render_target is NULL");
+            SPDLOG_INFO_EVERY_N_SEC(2, "[VR] sceneview_constructor: skipping view count override during level transition / null target");
         }
     }
 
-    bool new_scene_state_inserted_this_frame = false;
+    // 1. Declare the boolean flag first
+        bool new_scene_state_inserted_this_frame = false;
 
-    if (init_options_scene_state != nullptr && !g_hook->m_sceneview_data.known_scene_states.contains(init_options_scene_state)) {
-        SPDLOG_INFO("Inserting new scene state {:x}", (uintptr_t)init_options_scene_state);
-        known_scene_states.insert(init_options_scene_state);
-        new_scene_state_inserted_this_frame = true;
-    } else if (init_options_scene_state == nullptr) {
-        SPDLOG_ERROR_ONCE("Scene state passed to FSceneView constructor is null");
 
-        if ((int32_t)init_options_stereo_pass < 0) {
-            SPDLOG_ERROR_ONCE("Stereo pass is negative");
-        }
-    }
+        // 3. Process scene state insertion
+        if (init_options_scene_state != nullptr && is_valid_scene_state &&
+            !g_hook->m_sceneview_data.known_scene_states.contains(init_options_scene_state)) {
+            SPDLOG_INFO("Inserting new valid scene state {:x}", (uintptr_t)init_options_scene_state);
+            known_scene_states.insert(init_options_scene_state);
+            new_scene_state_inserted_this_frame = true;
+        } else if (init_options_scene_state == nullptr) {
+            SPDLOG_ERROR_ONCE("Scene state passed to FSceneView constructor is null");
 
-    if (init_options_scene_state != nullptr && !new_scene_state_inserted_this_frame && vr->is_ghosting_fix_enabled() && !known_scene_states.empty() && vr->is_using_afr() && true_index == 1) {
-        init_options->set_stereo_pass(EStereoscopicPass::eSSP_PRIMARY);
-
-        // Set the scene state to the one that isn't the current one
-        for (auto scene_state : known_scene_states) {
-            if (scene_state != init_options_scene_state) {
-                SPDLOG_INFO_ONCE("Setting scene state to {:x}", (uintptr_t)scene_state);
-                init_options->set_scene_state(scene_state);
-                break;
+            if ((int32_t)init_options_stereo_pass < 0) {
+                SPDLOG_ERROR_ONCE("Stereo pass is negative");
             }
         }
-    }
+
+        // 4. Ghosting fix check (uses the variable declared above)
+        if (init_options_scene_state != nullptr && is_valid_scene_state && !new_scene_state_inserted_this_frame &&
+            vr->is_ghosting_fix_enabled() && !known_scene_states.empty() && vr->is_using_afr() && true_index == 1) {
+            init_options->set_stereo_pass(EStereoscopicPass::eSSP_PRIMARY);
+
+            // Set the scene state to the one that isn't the current one
+            for (auto scene_state : known_scene_states) {
+                if (scene_state != init_options_scene_state) {
+                    SPDLOG_INFO_ONCE("Setting scene state to {:x}", (uintptr_t)scene_state);
+                    init_options->set_scene_state(scene_state);
+                    break;
+                }
+            }
+        }
 
     last_index++;
 
@@ -3173,7 +3426,8 @@ void FFakeStereoRenderingHook::localplayer_setup_viewpoint(void* localplayer, vo
     g_hook->m_localplayer_get_viewpoint_hook.call<void>(localplayer, view_info, pass);
 }
 
-void FFakeStereoRenderingHook::begin_render_viewfamily_real(void* render_module, sdk::FCanvas* canvas, sdk::FSceneViewFamily* view_family_candidate) {
+void FFakeStereoRenderingHook::begin_render_viewfamily_real(
+    void* render_module, sdk::FCanvas* canvas, sdk::FSceneViewFamily* view_family_candidate) {
     ZoneScopedN("BeginRenderViewFamilyReal");
 
     SPDLOG_INFO_ONCE("Called BeginRenderViewFamilyReal for the first time");
@@ -3183,10 +3437,54 @@ void FFakeStereoRenderingHook::begin_render_viewfamily_real(void* render_module,
         return;
     }
 
+    // Advance the boot-phase frame-pacing tracker exactly once per real frame.
+    update_boot_phase_tracking();
+
     auto& vr = VR::get();
     auto rtm = g_hook->get_render_target_manager();
 
-    if (!vr->is_hmd_active() || !vr->is_native_stereo_fix_enabled()) {
+    // Proactively tear down the scene capture the instant we detect its owning world has changed
+    // or is tearing down, rather than relying on GC to notice a stale actor for us. See
+    // is_scene_capture_world_stale() for why this replaced rooting the actor/component.
+    if (rtm->is_scene_capture_world_stale()) {
+        auto engine_ptr = sdk::UEngine::get();
+        auto current_world = engine_ptr != nullptr ? engine_ptr->get_world() : nullptr;
+        SPDLOG_INFO("[VR] begin_render_viewfamily_real: scene capture's world is stale (changed or tearing down), destroying proactively "
+                    "(current_world={})",
+                    (void*)current_world);
+        rtm->destroy_scene_capture();
+    }
+
+    // Automatically suspend/resume Native Stereo Fix across level transitions, replicating the
+    // manual A/B toggle workflow that was confirmed to avoid the scene-capture-actor lifecycle
+    // conflict: flip it off (falling back to the existing, already-working "disabled" compositing
+    // path) the instant a transition is detected, and flip it back on once the world has settled.
+    // This is deliberately independent of are_loading_guards_disabled(), since that toggle governs
+    // whether create_scene_capture() is allowed to run - it says nothing about whether Native
+    // Stereo Fix itself should be temporarily disabled to avoid the actor conflict entirely.
+    {
+        const bool tick_stalled = vr->is_engine_tick_stalled();
+        const bool no_player_controller = is_local_player_controller_missing();
+        const bool no_local_pawn = is_local_pawn_missing();
+        const bool boot_phase = is_boot_phase_active();
+        const bool world_stale = rtm->is_scene_capture_world_stale();
+        const bool should_suspend = tick_stalled || no_player_controller || no_local_pawn || boot_phase || world_stale;
+
+        if (should_suspend != vr->is_native_stereo_fix_suspended()) {
+            SPDLOG_INFO("[VR] begin_render_viewfamily_real: {} Native Stereo Fix (tick_stalled={} no_player_controller={} no_local_pawn={} boot_phase={} world_stale={})",
+                should_suspend ? "suspending" : "resuming", tick_stalled, no_player_controller, no_local_pawn, boot_phase, world_stale);
+            vr->set_native_stereo_fix_suspended(should_suspend);
+
+            if (should_suspend) {
+                rtm->destroy_scene_capture();
+            }
+        }
+    }
+
+    if (!vr->is_hmd_active() || !vr->is_native_stereo_fix_enabled() || vr->is_native_stereo_fix_mirror_enabled()) {
+        // Mirror mode intentionally takes the same no-scene-capture path as native stereo fix
+        // being disabled: no actor is spawned, and the right eye falls back to the existing
+        // "mirror the left/game texture" compositing already present in D3D11Component/D3D12Component.
         rtm->destroy_scene_capture();
 
         g_hook->m_render_module_begin_render_viewfamily_hook.unsafe_call<void>(render_module, canvas, view_family_candidate);
@@ -3205,12 +3503,19 @@ void FFakeStereoRenderingHook::begin_render_viewfamily_real(void* render_module,
         g_hook->m_render_module_begin_render_viewfamily_hook.unsafe_call<void>(render_module, canvas, view_family_candidate);
         return;
     }
-
+    
     // UE5 passes an TArrayView of ViewFamily pointers instead of a single ViewFamily
     sdk::FSceneViewFamily* view_family = uses_tarrayview ? ue5_view_family_array->data[0] : view_family_candidate;
 
+    // PATCH 1: BAIL OUT IF SCENE IS NULL (LOADING / LEVEL TRANSITION)
+    if (view_family == nullptr || view_family->get_scene_interface() == nullptr) {
+        g_hook->m_render_module_begin_render_viewfamily_hook.unsafe_call<void>(render_module, canvas, view_family_candidate);
+        return;
+    }
+
     auto views_ptr = view_family->get_views();
-    if (views_ptr == nullptr) {
+    // ADD THE SIZE/COUNT CHECK HERE:
+    if (views_ptr == nullptr || views_ptr->size() == 0) {
         g_hook->m_render_module_begin_render_viewfamily_hook.unsafe_call<void>(render_module, canvas, view_family_candidate);
         return;
     }
@@ -3223,9 +3528,72 @@ void FFakeStereoRenderingHook::begin_render_viewfamily_real(void* render_module,
     const auto rtfrt = rtrsrc != nullptr ? rtrsrc->as_render_target() : nullptr;
 
     if (rtfrt == nullptr) {
-        // This is fine to call constantly because we use an in-flight render target
-        // that gets unset after the texture is fully created. This function exits early otherwise.
-        rtm->create_scene_capture();
+        // DIAGNOSTIC: pinpoint exactly which link in the chain broke, since "rtfrt null" alone
+        // doesn't tell us whether the utexture, its resource, or the render-target cast failed.
+        SPDLOG_INFO_EVERY_N_SEC(2,
+            "[VR] begin_render_viewfamily_real chain: rt(utex)={:x} rtrsrc={:x} rtfrt={:x}",
+            (uintptr_t)rt, (uintptr_t)rtrsrc, (uintptr_t)rtfrt);
+
+        // --- LEVEL TRANSITION GUARD ---
+        // Check if the world is currently loading/tearing down before spawning a new scene capture component!
+        bool is_loading = false;
+        bool is_tearing_down = false;
+        auto engine = sdk::UEngine::get();
+        auto world = engine != nullptr ? engine->get_world() : nullptr;
+
+        if (world == nullptr) {
+            is_loading = true;
+        } else {
+            static auto world_class = world->get_class();
+            if (world_class != nullptr) {
+                static auto is_tearing_down_prop = world_class->find_property(L"bIsTearingDown");
+                if (is_tearing_down_prop != nullptr) {
+                    auto prop_addr = (uint8_t*)((uintptr_t)world + is_tearing_down_prop->get_offset());
+                    if (prop_addr != nullptr && (*prop_addr & 1) != 0) {
+                        is_tearing_down = true;
+                        is_loading = true;
+                    }
+                }
+            }
+        }
+
+        // bIsTearingDown only reflects the OLD world being torn down. It says nothing about
+        // whether the NEW world's level streaming / loading screen is still active, which is
+        // when create_scene_capture()'s actor-spawn + full render target/swapchain reallocation
+        // cascade is most dangerous. Use engine tick staleness as an additional, more reliable signal.
+        const auto tick_stalled = VR::get()->is_engine_tick_stalled();
+        // Also catch the streaming window after the tick resumes but before the player controller
+        // has respawned, which is when the scene-capture actor keeps getting GC'd/invalidated.
+        const auto no_player_controller = is_local_player_controller_missing();
+        // None of the above catch the INITIAL boot/load into the game: world is valid, tick is
+        // running, player controller exists, yet the engine is still churning through asset
+        // streaming at a fraction of normal frame rate, and the transient boot world explicitly
+        // destroys our scene-capture actor between those rare frames. Suppress based on frame pacing.
+        const auto boot_phase = is_boot_phase_active();
+        is_loading = is_loading || tick_stalled || no_player_controller || boot_phase;
+
+        if (are_loading_guards_disabled()) {
+            is_loading = false;
+        }
+
+        SPDLOG_INFO_EVERY_N_SEC(2,
+            "[VR] begin_render_viewfamily_real: rtfrt null, is_loading={} (tearing_down={} tick_stalled={} no_player_controller={} boot_phase={} world_null={})",
+            is_loading, is_tearing_down, tick_stalled, no_player_controller, boot_phase, world == nullptr);
+
+        // If actively loading, DO NOT call create_scene_capture()!
+        // Simply let standard single-pass Unreal rendering proceed without creating actors.
+        if (!is_loading) {
+            static auto last_create_time = std::chrono::steady_clock::time_point{};
+            const auto now = std::chrono::steady_clock::now();
+            const auto since_last = now - last_create_time;
+            SPDLOG_INFO("[VR] create_scene_capture() invoked from begin_render_viewfamily_real ({}ms since last invocation)",
+                std::chrono::duration_cast<std::chrono::milliseconds>(since_last).count());
+            last_create_time = now;
+            rtm->create_scene_capture();
+        } else {
+            SPDLOG_INFO_EVERY_N_SEC(2, "[VR] Skipping create_scene_capture() - level transition/load in progress");
+        }
+
         views.count = 1;
         g_hook->m_render_module_begin_render_viewfamily_hook.unsafe_call<void>(render_module, canvas, view_family_candidate);
         views.count = prev_count;
@@ -3241,19 +3609,85 @@ void FFakeStereoRenderingHook::begin_render_viewfamily_real(void* render_module,
 
     bool wants_swap = false;
 
+    // NOTE: SPDLOG_INFO_EVERY_N_SEC only prints once per window, so it cannot show true per-frame
+    // cadence/stalls - it previously created the illusion of a fixed ~2s frame interval when in
+    // reality it was just the log throttle firing. Track real per-frame deltas here instead so we
+    // can see min/max/avg/count over each window and know if frames are actually pacing normally.
+    {
+        static std::chrono::steady_clock::time_point s_window_start{};
+        static std::chrono::steady_clock::time_point s_last_frame{};
+        static uint32_t s_frame_count_in_window{0};
+        static double s_min_dt_ms{1e9};
+        static double s_max_dt_ms{0.0};
+
+        const auto now = std::chrono::steady_clock::now();
+
+        if (s_window_start.time_since_epoch().count() == 0) {
+            s_window_start = now;
+            s_last_frame = now;
+        } else {
+            const auto dt_ms = std::chrono::duration<double, std::milli>(now - s_last_frame).count();
+            s_last_frame = now;
+            s_min_dt_ms = std::min(s_min_dt_ms, dt_ms);
+            s_max_dt_ms = std::max(s_max_dt_ms, dt_ms);
+            ++s_frame_count_in_window;
+        }
+
+        if (now - s_window_start >= std::chrono::seconds(2)) {
+            const auto window_ms = std::chrono::duration<double, std::milli>(now - s_window_start).count();
+            const auto avg_dt_ms = s_frame_count_in_window > 0 ? window_ms / s_frame_count_in_window : 0.0;
+
+            SPDLOG_INFO("[VR] begin_render_viewfamily_real FRAME PACING over {:.0f}ms: frames={} min={:.1f}ms max={:.1f}ms avg={:.1f}ms",
+                window_ms, s_frame_count_in_window, s_min_dt_ms, s_max_dt_ms, avg_dt_ms);
+
+            s_window_start = now;
+            s_frame_count_in_window = 0;
+            s_min_dt_ms = 1e9;
+            s_max_dt_ms = 0.0;
+        }
+    }
+
     SPDLOG_INFO_EVERY_N_SEC(2, "[VR] begin_render_viewfamily_real: views.count={} prev_count={} rt_valid={}", views.count, prev_count, rtfrt != nullptr);
 
+    // =================================================================
+    // PATCH 2: GUARDED VIEW COUNT CHECK (REPLACES YOUR OLD IF BLOCK)
+    // =================================================================
     if (views.count > 1) {
+        auto view_0 = views.data[0];
+        auto view_1 = views.data[1];
+
+        // Check if views are valid and actually rendering world geometry (not a 0x0 loading rect)
+        bool is_valid_scene_view = (view_0 != nullptr && view_1 != nullptr);
+        if (is_valid_scene_view) {
+            auto init_options_0 = (sdk::FSceneViewInitOptions*)((uintptr_t)view_0 + INIT_OPTIONS_OFFSET);
+
+            // Read the rect memory directly as 4 32-bit integers: [left, top, right, bottom]
+            const int32_t* rect_raw = (const int32_t*)&init_options_0->view_rect;
+
+            const int32_t width = rect_raw[2] - rect_raw[0];  // right - left
+            const int32_t height = rect_raw[3] - rect_raw[1]; // bottom - top
+
+            // If width or height is invalid, the game is drawing a loading screen or canvas UI
+            if (width <= 0 || height <= 0) {
+                is_valid_scene_view = false;
+            }
+        }
+        // If loading or viewports aren't populated, fall back to native single-pass safely
+        if (!is_valid_scene_view) {
+            g_hook->m_render_module_begin_render_viewfamily_hook.unsafe_call<void>(render_module, canvas, view_family_candidate);
+            return;
+        }
+
         views.count = 1;
         wants_swap = true;
 
         auto runtime = vr->get_runtime();
         const auto frame_count = runtime->internal_frame_count;
 
-        // We need to clone the VR state from last frame to this frame
+        // Clone VR state from last frame to this frame
         if (runtime->is_openxr()) {
             auto openxr = (runtimes::OpenXR*)runtime;
-            std::scoped_lock __{ openxr->sync_assignment_mtx };
+            std::scoped_lock __{openxr->sync_assignment_mtx};
 
             const auto last_frame = (frame_count) % runtimes::OpenXR::QUEUE_SIZE;
             const auto now_frame = (frame_count + 1) % runtimes::OpenXR::QUEUE_SIZE;
@@ -3261,12 +3695,14 @@ void FFakeStereoRenderingHook::begin_render_viewfamily_real(void* render_module,
             openxr->pipeline_states[now_frame].frame_count = now_frame;
         } else {
             auto openvr = (runtimes::OpenVR*)runtime;
-            std::unique_lock __{ openvr->pose_mtx };
+            std::unique_lock __{openvr->pose_mtx};
 
             const auto last_frame = (frame_count) % openvr->pose_queue.size();
             const auto now_frame = (frame_count + 1) % openvr->pose_queue.size();
             openvr->pose_queue[now_frame] = openvr->pose_queue[last_frame];
         }
+    
+    // =================================================================
 
         /*auto init_options = (sdk::FSceneViewInitOptions*)((uintptr_t)view_family.views.data[0] + INIT_OPTIONS_OFFSET);
         init_options->stereo_pass = 0;
@@ -3284,6 +3720,28 @@ void FFakeStereoRenderingHook::begin_render_viewfamily_real(void* render_module,
         view_family.views.data[1]->constructor((sdk::FSceneViewInitOptions*)init_options_copy2.data());*/
     }
 
+    // Pass 1: Render Left Eye
+    // DIAG: confirm the engine is actually being asked to render a view here at all, and that the
+    // view handed to it has a non-degenerate rect (width/height > 0). If this pass is skipped or
+    // repeatedly logs a 0-sized rect while the right-eye pass (below, post-swap) keeps logging a
+    // valid rect, the engine itself is failing to produce left-eye content upstream of any of our
+    // copy/compositor code - i.e. NOT a bug in D3D12Component's AFR/NSF compositing.
+    {
+        static uint32_t diag_pass1_count = 0;
+        ++diag_pass1_count;
+
+        if (wants_swap && views.data[0] != nullptr) {
+            auto init_options_pass1 = (sdk::FSceneViewInitOptions*)((uintptr_t)views.data[0] + INIT_OPTIONS_OFFSET);
+            const int32_t* rect_raw_pass1 = (const int32_t*)&init_options_pass1->view_rect;
+            const int32_t pass1_w = rect_raw_pass1[2] - rect_raw_pass1[0];
+            const int32_t pass1_h = rect_raw_pass1[3] - rect_raw_pass1[1];
+
+            if (diag_pass1_count <= 20 || diag_pass1_count % 301 == 1 || pass1_w <= 0 || pass1_h <= 0) {
+                SPDLOG_INFO("[DIAG] begin_render_viewfamily_real Pass1 (left, #{}): view_rect=({},{})-({},{}) w={} h={}",
+                    diag_pass1_count, rect_raw_pass1[0], rect_raw_pass1[1], rect_raw_pass1[2], rect_raw_pass1[3], pass1_w, pass1_h);
+            }
+        }
+    }
     g_hook->m_render_module_begin_render_viewfamily_hook.unsafe_call<void>(render_module, canvas, view_family_candidate);
 
     if (wants_swap) {
@@ -3298,17 +3756,37 @@ void FFakeStereoRenderingHook::begin_render_viewfamily_real(void* render_module,
         auto scene = (sdk::FScene*)view_family->get_scene_interface();
 
         if (scene != nullptr) {
-            // We decrement the frame count because it fixes motion vectors in the right eye.
+            // Decrement frame count to fix motion vectors in the right eye
             scene->decrement_frame_count();
         }
-        
+
         std::swap(views[0], views[1]);
+
+        // DIAG: same check as Pass 1 above, but for the post-swap (right eye / scene capture)
+        // pass. Only meaningful when Native Stereo Fix is enabled, since this whole function
+        // early-returns otherwise (see the is_native_stereo_fix_enabled() check near the top).
+        {
+            static uint32_t diag_pass2_count = 0;
+            ++diag_pass2_count;
+
+            if (views.data[0] != nullptr) {
+                auto init_options_pass2 = (sdk::FSceneViewInitOptions*)((uintptr_t)views.data[0] + INIT_OPTIONS_OFFSET);
+                const int32_t* rect_raw_pass2 = (const int32_t*)&init_options_pass2->view_rect;
+                const int32_t pass2_w = rect_raw_pass2[2] - rect_raw_pass2[0];
+                const int32_t pass2_h = rect_raw_pass2[3] - rect_raw_pass2[1];
+
+                if (diag_pass2_count <= 20 || diag_pass2_count % 301 == 1 || pass2_w <= 0 || pass2_h <= 0) {
+                    SPDLOG_INFO("[DIAG] begin_render_viewfamily_real Pass2 (right/NSF, #{}): view_rect=({},{})-({},{}) w={} h={}",
+                        diag_pass2_count, rect_raw_pass2[0], rect_raw_pass2[1], rect_raw_pass2[2], rect_raw_pass2[3], pass2_w, pass2_h);
+                }
+            }
+        }
 
         // Call it again
         g_hook->m_render_module_begin_render_viewfamily_hook.unsafe_call<void>(render_module, canvas, view_family_candidate);
 
+        // Restore view order & original target
         std::swap(views[0], views[1]);
-
         view_family->set_render_target(original_target);
     }
 
@@ -3477,10 +3955,14 @@ void FFakeStereoRenderingHook::begin_render_viewfamily(ISceneViewExtension* exte
 
     using BeginRenderViewFamilyRealFn = void(*)(void*, sdk::FCanvas*, sdk::FSceneViewFamily*);
     static BeginRenderViewFamilyRealFn begin_rendering_view_family_real_fn = nullptr;
-    static bool already_tried = false;
-    if (begin_rendering_view_family_real_fn == nullptr && !already_tried && vr->is_native_stereo_fix_enabled()) {
-        already_tried = true;
-
+    // NOTE: this used to be a one-shot latch (a static "already_tried" bool) gated on
+    // vr->is_native_stereo_fix_enabled() being true at the exact moment this function first ran.
+    // If NSF happened to be disabled (or not yet toggled on) on that single frame, "already_tried"
+    // was permanently set to true and the real BeginRenderViewFamily hook was NEVER attempted again
+    // for the rest of the session - silently disabling the entire downstream visual path (scene
+    // capture, AFR eye compositing, etc.) even though the game kept running normally. Retry every
+    // frame instead, regardless of NSF state, until the hook is actually installed.
+    if (begin_rendering_view_family_real_fn == nullptr && !g_hook->m_render_module_begin_render_viewfamily_hook) {
         // Get callstack
         constexpr auto max_stack_depth = 100;
         uintptr_t stack[max_stack_depth]{};
@@ -3652,14 +4134,29 @@ void FFakeStereoRenderingHook::pre_render_viewfamily_renderthread(ISceneViewExte
         });
     };
 
-    // okay well I think this evaluates to false all the time
-    // but apparently it has been working for a LONG TIME so I'm not going to touch this until after release
-    // (the else statement still handles everything... fine?)
+    // FIX: this previously read "(uintptr_t)cmd_list & 1 == 0", which due to operator precedence
+    // (== binds tighter than &) actually parsed as "cmd_list & (1 == 0)" -> "cmd_list & 0" -> always 0,
+    // making has_good_root always false and forcing every frame down the Slate-thread fallback path
+    // below, regardless of whether cmd_list/root were actually valid. Parenthesize the comparisons
+    // explicitly so the alignment check is evaluated correctly.
     const auto has_good_root = 
         cmd_list != nullptr &&
-        ((uintptr_t)cmd_list & 1 == 0) &&
+        (((uintptr_t)cmd_list & 1) == 0) &&
         cmd_list->root != nullptr &&
-        ((uintptr_t)cmd_list->root & 1 == 0);
+        (((uintptr_t)cmd_list->root & 1) == 0);
+
+    if (!has_good_root) {
+        static uint32_t diag_eval_count = 0;
+        if (++diag_eval_count % 300 == 1) {
+            const auto cmd_list_null = cmd_list == nullptr;
+            const auto cmd_list_aligned = cmd_list != nullptr && (((uintptr_t)cmd_list & 1) == 0);
+            const auto root_null = cmd_list != nullptr && cmd_list->root == nullptr;
+            const auto root_aligned = cmd_list != nullptr && cmd_list->root != nullptr && (((uintptr_t)cmd_list->root & 1) == 0);
+            SPDLOG_INFO("[DIAG] has_good_root=false cmd_list={:x} cmd_list_null={} cmd_list_aligned={} root={:x} root_null={} root_aligned={}",
+                (uintptr_t)cmd_list, cmd_list_null, cmd_list_aligned,
+                cmd_list != nullptr ? (uintptr_t)cmd_list->root : 0, root_null, root_aligned);
+        }
+    }
 
     // Hijack the top command in the command list so we can enqueue the render poses on the RHI thread
     if (has_good_root) {
@@ -3769,6 +4266,13 @@ void FFakeStereoRenderingHook::pre_render_viewfamily_renderthread(ISceneViewExte
     } else {
         SPDLOG_INFO_ONCE("Bad root or command list, falling back to Slate thread hook");
 
+        static uint32_t diag_fallback_count = 0;
+        if (++diag_fallback_count % 300 == 1) {
+            SPDLOG_INFO("[DIAG] fallback branch taken (#{}): cmd_list={:x} root={:x} is_ue5_rdg_builder={} ue5_command_offset={:x} analyzed_root_already={} is_old_command_base={} frame_count={}",
+                diag_fallback_count, (uintptr_t)cmd_list, cmd_list != nullptr ? (uintptr_t)cmd_list->root : 0,
+                is_ue5_rdg_builder, ue5_command_offset, analyzed_root_already, is_old_command_base, frame_count);
+        }
+
         // welp v2
         if (g_hook->has_slate_hook()) {
             enqueue_poses_on_slate_thread();
@@ -3797,16 +4301,17 @@ bool FFakeStereoRenderingHook::setup_view_extensions() try {
 
     // This is a proof of concept at the moment for newer UE versions
     // older versions may not work or crash.
-    // TODO: Figure out older versions.
     constexpr auto weak_ptr_size = sizeof(TWeakPtr<void*>);
     static const auto potential_hmd_device_offset = s_stereo_rendering_device_offset + weak_ptr_size;
     static const uintptr_t potential_hmd_device = (uintptr_t)engine + potential_hmd_device_offset;
-    static const uintptr_t potential_view_extensions = (uintptr_t)engine + s_stereo_rendering_device_offset + (weak_ptr_size * 2); // 2 to skip over the XRSystem
+    static const uintptr_t potential_view_extensions =
+        (uintptr_t)engine + s_stereo_rendering_device_offset + (weak_ptr_size * 2); // 2 to skip over the XRSystem
 
     // This can happen if the game left a VR plugin in it
     // Usually this isn't an issue, but some games can leave a valid HMDDevice or XRSystem laying around for whatever reason
     // If this isn't cleaned up, the game will crash because it tries to gather view extensions from the existing device
-    // and the view extensions it gathered will cause a crash when calling them. also the HMD device itself can cause a crash, it's not actually initialized.
+    // and the view extensions it gathered will cause a crash when calling them. also the HMD device itself can cause a crash, it's not
+    // actually initialized.
     if (*(void**)potential_hmd_device != nullptr) {
         // Double check that we're actually replacing a pointer and not an integer or something
         if (!IsBadReadPtr(*(void**)potential_hmd_device, sizeof(void*))) {
@@ -3817,7 +4322,6 @@ bool FFakeStereoRenderingHook::setup_view_extensions() try {
                 replacement_vtable.push_back((uintptr_t)+[]() { return nullptr; });
             }
 
-            //**(void***)potential_hmd_device = replacement_vtable.data();
             *(void**)potential_hmd_device = nullptr;
             m_fixed_localplayer_view_count = true; // If this is already allocated, then there's already a second view for us to use
         }
@@ -3864,10 +4368,7 @@ bool FFakeStereoRenderingHook::setup_view_extensions() try {
 
             const auto& op2 = decoded->Operands[1];
 
-            if (decoded->OperandsCount != 2 || 
-                 op2.Type != ND_OP_MEM      || 
-                !op2.Info.Memory.HasBase)
-            {
+            if (decoded->OperandsCount != 2 || op2.Type != ND_OP_MEM || !op2.Info.Memory.HasBase) {
                 return EXCEPTION_CONTINUE_SEARCH;
             }
 
@@ -3882,18 +4383,14 @@ bool FFakeStereoRenderingHook::setup_view_extensions() try {
             }
 
             if (previous_instruction->instrux.Operands[0].Type != ND_OP_REG ||
-                previous_instruction->instrux.Operands[0].Info.Register.Reg != op2.Info.Memory.Base)
-            {
+                previous_instruction->instrux.Operands[0].Info.Register.Reg != op2.Info.Memory.Base) {
                 SPDLOG_ERROR("Previous instruction does not use the same register as the dereference");
                 return EXCEPTION_CONTINUE_SEARCH;
             }
 
             const auto prev_op2 = previous_instruction->instrux.Operands[1];
 
-            if (previous_instruction->instrux.OperandsCount < 2 ||
-                prev_op2.Type != ND_OP_MEM ||
-                !prev_op2.Info.Memory.HasBase)
-            {
+            if (previous_instruction->instrux.OperandsCount < 2 || prev_op2.Type != ND_OP_MEM || !prev_op2.Info.Memory.HasBase) {
                 SPDLOG_ERROR("Previous instruction is not a memory dereference");
                 return EXCEPTION_CONTINUE_SEARCH;
             }
@@ -3910,7 +4407,6 @@ bool FFakeStereoRenderingHook::setup_view_extensions() try {
 
             SPDLOG_INFO("Found the dereference of the XRSystem or HMDDevice at {:x}", previous_instruction->addr);
 
-            // Patch the initial instruction that caused the crash
             SPDLOG_INFO("Creating first patch...");
 
             std::vector<int16_t> first_patch{};
@@ -3919,6 +4415,7 @@ bool FFakeStereoRenderingHook::setup_view_extensions() try {
                 first_patch.push_back(0x90);
             }
 
+            // --- AFTER ---
             xrsystem_patches.push_back(Patch::create(exception_address, first_patch));
 
             const auto next_instruction_addr = exception_address + decoded->Length;
@@ -3926,26 +4423,25 @@ bool FFakeStereoRenderingHook::setup_view_extensions() try {
 
             if (!next_instruction) {
                 SPDLOG_ERROR("Could not decode next instruction at {:x}", exception_address + decoded->Length);
+                exception->ContextRecord->Rip = next_instruction_addr;
                 return EXCEPTION_CONTINUE_EXECUTION;
             }
 
             if (!std::string_view{next_instruction->Mnemonic}.starts_with("CALL")) {
                 SPDLOG_ERROR("Next instruction is not a call, continuing anyways since we patched the dereference");
+                exception->ContextRecord->Rip = next_instruction_addr;
                 return EXCEPTION_CONTINUE_EXECUTION;
             }
 
             // Patch the next instruction if it's a call
             SPDLOG_INFO("Creating second patch...");
 
-            std::vector<int16_t> second_patch{};
-
-            for (auto i = 0; i < next_instruction->Length; ++i) {
-                second_patch.push_back(0x90);
-            }
-
+            std::vector<int16_t> second_patch(next_instruction->Length, 0x90);
             xrsystem_patches.push_back(Patch::create(next_instruction_addr, second_patch));
 
-            SPDLOG_INFO("Finished creating patches, continuing execution. Hopefully we don't crash...");
+            exception->ContextRecord->Rip = next_instruction_addr + next_instruction->Length;
+
+            SPDLOG_INFO("Finished creating patches, continuing execution.");
             return EXCEPTION_CONTINUE_EXECUTION;
         }
 
@@ -3953,53 +4449,64 @@ bool FFakeStereoRenderingHook::setup_view_extensions() try {
     });
 
     // The TWeakPtr version is for >= 4.11 UE versions
-    TWeakPtr<FSceneViewExtensions>& view_extensions_tweakptr = 
-        *(TWeakPtr<FSceneViewExtensions>*)potential_view_extensions;
+    TWeakPtr<FSceneViewExtensions>& view_extensions_tweakptr = *(TWeakPtr<FSceneViewExtensions>*)potential_view_extensions;
 
-    // This means it's an old version of UE
-    // so the view extensions are a TArray and not a TWeakPtr<TArray>
     if (!m_rendertarget_manager_embedded_in_stereo_device) {
         if (view_extensions_tweakptr.reference == nullptr) {
             view_extensions_tweakptr.allocate_naive(m_use_fmalloc_scene_view_extensions->value());
         }
+
+        // Check if allocation failed or returned null
+        if (view_extensions_tweakptr.reference == nullptr) {
+            SPDLOG_ERROR("Failed to allocate or resolve view_extensions reference!");
+            return false;
+        }
     }
 
-    FSceneViewExtensions& view_extensions = m_rendertarget_manager_embedded_in_stereo_device ?  
-                                            *(FSceneViewExtensions*)potential_view_extensions : *view_extensions_tweakptr.reference;
+    // Pointer approach with standard null safety checks
+    FSceneViewExtensions* view_extensions_ptr = m_rendertarget_manager_embedded_in_stereo_device
+                                                    ? (FSceneViewExtensions*)potential_view_extensions
+                                                    : view_extensions_tweakptr.reference;
+
+    if (view_extensions_ptr == nullptr) {
+        SPDLOG_ERROR("view_extensions pointer is null!");
+        return false;
+    }
+
+    // Reference wrapper for clean compatibility with the rest of the existing code structure
+    FSceneViewExtensions& view_extensions = *view_extensions_ptr;
 
     SPDLOG_INFO("Current ext ptr: {:x}", (uintptr_t)view_extensions.extensions.data);
     SPDLOG_INFO("Current ext count: {}", view_extensions.extensions.count);
     SPDLOG_INFO("Current ext capacity: {}", view_extensions.extensions.capacity);
-    SPDLOG_INFO("Current ext capacity: {}", view_extensions.extensions.capacity);
 
-    // Verifications on the current memory of the FSceneViewExtensions, because pre-4.10 (?) the view extensions array did not actually exist
+    // Verifications on the current memory of the FSceneViewExtensions, because pre-4.10 (?) the view extensions array did not actually
+    // exist
     if (m_rendertarget_manager_embedded_in_stereo_device) {
         SPDLOG_INFO("Performing verifications on the current memory of the FSceneViewExtensions...");
 
         const auto& current_view_extensions_ptr_value = view_extensions.extensions;
 
         // Check if current value is non zero and points to invalid memory
-        if (current_view_extensions_ptr_value.data != nullptr && IsBadReadPtr((void*)current_view_extensions_ptr_value.data, sizeof(void*))) {
+        if (current_view_extensions_ptr_value.data != nullptr &&
+            IsBadReadPtr((void*)current_view_extensions_ptr_value.data, sizeof(void*))) {
             SPDLOG_ERROR("Usual view extensions pointer is non-zero but points to invalid memory! Cannot set up view extensions!");
             SPDLOG_ERROR("This may mean that the UE version is very old and this method of hooking the view extensions is not supported.");
             return false;
         }
 
-        // Check if count is greater than capacity, which is not possible
         if ((uint32_t)current_view_extensions_ptr_value.count > (uint32_t)current_view_extensions_ptr_value.capacity) {
             SPDLOG_ERROR("Usual view extensions count is greater than capacity! Cannot set up view extensions!");
             SPDLOG_ERROR("This may mean that the UE version is very old and this method of hooking the view extensions is not supported.");
             return false;
         }
 
-        // Check if count or capacity is negative, which is not possible
         if ((int32_t)current_view_extensions_ptr_value.count < 0 || (int32_t)current_view_extensions_ptr_value.capacity < 0) {
             SPDLOG_ERROR("Usual view extensions count or capacity is negative! Cannot set up view extensions!");
             SPDLOG_ERROR("This may mean that the UE version is very old and this method of hooking the view extensions is not supported.");
             return false;
         }
-        
-        // Check if the memory at count treated as a pointer points to valid memory, which is not possible
+
         const auto count_as_ptr = *(void**)&current_view_extensions_ptr_value.count;
         if (count_as_ptr != nullptr && !IsBadReadPtr(count_as_ptr, sizeof(void*))) {
             SPDLOG_ERROR("Usual view extensions count is actually a pointer to valid memory! Cannot set up view extensions!");
@@ -4007,27 +4514,25 @@ bool FFakeStereoRenderingHook::setup_view_extensions() try {
             return false;
         }
 
-        // Check if the data pointer is null but capacity is greater than 0, which is not possible
         if (current_view_extensions_ptr_value.data == nullptr && current_view_extensions_ptr_value.capacity > 0) {
             SPDLOG_INFO("Usual view extensions data pointer is null but capacity is greater than 0! Cannot set up view extensions!");
             SPDLOG_INFO("This may mean that the UE version is very old and this method of hooking the view extensions is not supported.");
         }
 
-        // Check if the data pointer is non-null but the capacity is 0, which is not possible
         if (current_view_extensions_ptr_value.data != nullptr && current_view_extensions_ptr_value.capacity == 0) {
             SPDLOG_ERROR("Usual view extensions data pointer is non-null but capacity is 0! Cannot set up view extensions!");
             SPDLOG_ERROR("This may mean that the UE version is very old and this method of hooking the view extensions is not supported.");
             return false;
         }
 
-        // Check if any current entries in the array within the count are invalid, which is not possible
         if (current_view_extensions_ptr_value.data != nullptr) {
             for (auto i = 0; i < current_view_extensions_ptr_value.count; ++i) {
                 const auto ext = current_view_extensions_ptr_value.data[i].reference;
 
                 if (IsBadReadPtr((void*)ext, sizeof(void*))) {
                     SPDLOG_ERROR("Usual view extensions array contains an invalid entry! Cannot set up view extensions!");
-                    SPDLOG_ERROR("This may mean that the UE version is very old and this method of hooking the view extensions is not supported.");
+                    SPDLOG_ERROR(
+                        "This may mean that the UE version is very old and this method of hooking the view extensions is not supported.");
                     return false;
                 }
 
@@ -4035,7 +4540,8 @@ bool FFakeStereoRenderingHook::setup_view_extensions() try {
 
                 if (IsBadReadPtr((void*)ext_vtable, sizeof(void*))) {
                     SPDLOG_ERROR("Usual view extensions array contains an entry with an invalid vtable! Cannot set up view extensions!");
-                    SPDLOG_ERROR("This may mean that the UE version is very old and this method of hooking the view extensions is not supported.");
+                    SPDLOG_ERROR(
+                        "This may mean that the UE version is very old and this method of hooking the view extensions is not supported.");
                     return false;
                 }
             }
@@ -4043,7 +4549,8 @@ bool FFakeStereoRenderingHook::setup_view_extensions() try {
     }
 
     // Allocate a completely new array if the current one is null or empty
-    if (view_extensions.extensions.data == nullptr || view_extensions.extensions.data[0].reference == nullptr || view_extensions.extensions.count == 0) {
+    if (view_extensions.extensions.data == nullptr || view_extensions.extensions.data[0].reference == nullptr ||
+        view_extensions.extensions.count == 0) {
         SPDLOG_INFO("Allocating new view extensions array...");
 
         auto& exts = view_extensions.extensions;
@@ -4052,7 +4559,7 @@ bool FFakeStereoRenderingHook::setup_view_extensions() try {
         const auto new_capacity = 32;
 
         if (!m_use_fmalloc_scene_view_extensions->value()) {
-            exts.data = new TWeakPtr<ISceneViewExtension>[new_capacity]{};
+            exts.data = new TWeakPtr<ISceneViewExtension>[new_capacity] {};
         } else {
             if (auto fmalloc = sdk::FMalloc::get(); fmalloc != nullptr) {
                 exts.data = (TWeakPtr<ISceneViewExtension>*)fmalloc->malloc(new_capacity * sizeof(TWeakPtr<ISceneViewExtension>));
@@ -4060,8 +4567,9 @@ bool FFakeStereoRenderingHook::setup_view_extensions() try {
                     new (&exts.data[i]) TWeakPtr<ISceneViewExtension>();
                 }
             } else {
-                SPDLOG_ERROR("Failed to get FMalloc! Cannot allocate new view extensions array! Falling back to default allocation method...");
-                exts.data = new TWeakPtr<ISceneViewExtension>[new_capacity]{};
+                SPDLOG_ERROR(
+                    "Failed to get FMalloc! Cannot allocate new view extensions array! Falling back to default allocation method...");
+                exts.data = new TWeakPtr<ISceneViewExtension>[new_capacity] {};
             }
         }
 
@@ -4091,7 +4599,8 @@ bool FFakeStereoRenderingHook::setup_view_extensions() try {
                         new (&new_exts[i]) TWeakPtr<ISceneViewExtension>();
                     }
                 } else {
-                    SPDLOG_ERROR("Failed to get FMalloc! Cannot allocate new view extensions array! Falling back to default allocation method...");
+                    SPDLOG_ERROR(
+                        "Failed to get FMalloc! Cannot allocate new view extensions array! Falling back to default allocation method...");
                     new_exts = new TWeakPtr<ISceneViewExtension>[new_capacity];
                 }
             }
@@ -4112,7 +4621,7 @@ bool FFakeStereoRenderingHook::setup_view_extensions() try {
 
     if (view_extensions.extensions.count > 0 && view_extensions.extensions.data != nullptr) {
         // Replace the vtable of the first entry
-        auto& entry = view_extensions.extensions.data[view_extensions.extensions.count-1];
+        auto& entry = view_extensions.extensions.data[view_extensions.extensions.count - 1];
 
         if (entry.reference == nullptr) {
             SPDLOG_ERROR("Failed to get first view extension entry!");
@@ -4125,11 +4634,11 @@ bool FFakeStereoRenderingHook::setup_view_extensions() try {
         g_hook->m_analyzing_view_extensions = true;
 
         if (!m_rendertarget_manager_embedded_in_stereo_device) {
-            SceneViewExtensionAnalyzer::FillVtable<g_view_extension_vtable.size()-1>::fill(g_view_extension_vtable);
+            SceneViewExtensionAnalyzer::FillVtable<g_view_extension_vtable.size() - 1>::fill(g_view_extension_vtable);
         } else {
             // Skip straight to stage 2.
             SPDLOG_INFO("Skipping view extension stage 1...");
-            SceneViewExtensionAnalyzer::FillVtable<g_view_extension_vtable.size()-1>::fill2(g_view_extension_vtable);
+            SceneViewExtensionAnalyzer::FillVtable<g_view_extension_vtable.size() - 1>::fill2(g_view_extension_vtable);
         }
 
         // Will get called when the view extensions are finally hooked.
@@ -4149,7 +4658,7 @@ bool FFakeStereoRenderingHook::setup_view_extensions() try {
     }
 
     return true;
-} catch(...) {
+} catch (...) {
     SPDLOG_ERROR("Unknown exception while setting up view extensions!");
     return false;
 }
@@ -4612,10 +5121,75 @@ void FFakeStereoRenderingHook::adjust_view_rect(FFakeStereoRendering* stereo, in
 
     *w = *w / 2;
 
-    const auto true_index = index_starts_from_one ? ((index + 1) % 2) : (index % 2);
+    auto true_index = index_starts_from_one ? ((index + 1) % 2) : (index % 2);
+
+    // NOTE: In AFR mode this game calls AdjustViewRect with the SAME raw `index` value (e.g.
+    // always 2) for both eye passes, since AFR reuses the same view slot across frames instead of
+    // alternating the index itself. Without this override, true_index would resolve to the same
+    // eye every single call, placing BOTH eyes' geometry into the same half of the backbuffer and
+    // leaving the other half permanently black. Mirror the same call-scoped alternator used in
+    // calculate_stereo_view_offset so this function's eye classification stays in sync with it.
+    if (VR::get()->is_using_afr()) {
+        static uint32_t last_avr_frame_count = 0;
+        static uint32_t avr_call_index = 0;
+
+        if (last_avr_frame_count != g_frame_count || avr_call_index > 1) {
+            avr_call_index = 0;
+        }
+
+        last_avr_frame_count = g_frame_count;
+
+        true_index = (g_frame_count + avr_call_index) % 2;
+        ++avr_call_index;
+    }
 
     if (!VR::get()->is_native_stereo_fix_enabled()) {
         *x += *w * true_index;
+    }
+
+    // Record the actual x-offset the engine assigned to this eye (true_index 0 == left, 1 == right),
+    // so the compositor (D3D12Component::composite_afr_eye / D3D11Component equivalent) can crop from
+    // the real backbuffer half instead of assuming a fixed left=0/right=half layout. See
+    // get_last_left_eye_x_offset()/get_last_right_eye_x_offset() for why this is necessary: the
+    // compositor's own left/right classification is derived from a completely separate frame-parity
+    // counter (vr->m_render_frame_count) that is not guaranteed to stay in phase with true_index here.
+    if (true_index == 0) {
+        g_hook->m_last_left_eye_x_offset = (uint32_t)*x;
+        g_hook->m_left_eye_x_offset_update_count.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        g_hook->m_last_right_eye_x_offset = (uint32_t)*x;
+        g_hook->m_right_eye_x_offset_update_count.fetch_add(1, std::memory_order_relaxed);
+    }
+    g_hook->m_has_seen_eye_x_offsets = true;
+
+    // DIAG: throttled visibility into the final per-eye viewport rect produced by AdjustViewRect.
+    // If one eye's rect is ever zero-sized (w/h == 0) or has an out-of-range x/y offset, the engine
+    // simply never renders any scene geometry into that eye's portion of the backbuffer, which would
+    // explain a permanently-black eye even though our AFR copy path is otherwise working correctly.
+    //
+    // IMPORTANT: this diagnostic's true_index is derived purely from AdjustViewRect's own local
+    // index/index_starts_from_one state, which is INDEPENDENT of D3D12Component.cpp's is_left_eye_frame
+    // classification (which is instead based on vr->m_render_frame_count % 2 == m_left_eye_interval).
+    // If these two independently-computed "which eye is this" trackers ever fall out of phase with
+    // each other, AdjustViewRect could be placing real content at an x-offset that D3D12Component then
+    // samples/copies as the WRONG eye, producing a permanently-black eye despite the engine rendering
+    // both eyes correctly. Log vr's frame-count/interval state here too so the two can be correlated
+    // directly in the log. Also fixed the previous "% 300 == 1" throttle: since this function and
+    // D3D12Component::on_frame's diag_afr_count both increment roughly once per real per-eye call, a
+    // fixed EVEN stride can alias onto a single parity and make it look like only one eye is ever
+    // logged after warm-up, when in fact both are still occurring - use an ODD stride instead so both
+    // parities are sampled during steady-state logging.
+    {
+        static uint32_t diag_adjust_view_rect_count = 0;
+        ++diag_adjust_view_rect_count;
+
+        auto vr = VR::get();
+
+        if (diag_adjust_view_rect_count <= 20 || diag_adjust_view_rect_count % 301 == 1) {
+            SPDLOG_INFO("[DIAG] AdjustViewRect (#{}): index={} true_index={} index_starts_from_one={} x={} y={} w={} h={} native_stereo_fix={} vr_frame_count={} vr_left_interval={} vr_right_interval={} is_using_afr={}",
+                diag_adjust_view_rect_count, index, true_index, index_starts_from_one, *x, *y, *w, *h,
+                vr->is_native_stereo_fix_enabled(), vr->m_render_frame_count, vr->m_left_eye_interval, vr->m_right_eye_interval, vr->is_using_afr());
+        }
     }
 }
 
@@ -4668,7 +5242,26 @@ __forceinline void FFakeStereoRenderingHook::calculate_stereo_view_offset(
     const auto rot_d = (Rotator<double>*)view_rotation;
 
     if (vr->is_using_afr() && !is_full_pass) {
-        true_index = g_frame_count % 2;
+        // NOTE: We used to just do `true_index = g_frame_count % 2;` here, but g_frame_count
+        // reflects the runtime's internal frame counter, which can stall (e.g. during a
+        // dropped/duplicated present) for multiple consecutive calls into this function. When
+        // that happens, every call during the stall resolves to the SAME eye regardless of which
+        // eye the engine actually asked for via view_index, which starves the other eye of any
+        // rendered content (permanently black eye). Instead, fold in a call-scoped alternator
+        // (mirroring the same pattern used in sceneview_constructor) that increments on every
+        // call within an unchanged g_frame_count, so consecutive calls still alternate eyes even
+        // if the underlying frame counter hasn't advanced.
+        static uint32_t last_offset_frame_count = 0;
+        static uint32_t offset_call_index = 0;
+
+        if (last_offset_frame_count != g_frame_count || offset_call_index > 1) {
+            offset_call_index = 0;
+        }
+
+        last_offset_frame_count = g_frame_count;
+
+        true_index = (g_frame_count + offset_call_index) % 2;
+        ++offset_call_index;
 
         if (!vr->is_using_synchronized_afr()) {
             if (g_hook->m_has_double_precision) {
@@ -4695,10 +5288,67 @@ __forceinline void FFakeStereoRenderingHook::calculate_stereo_view_offset(
         }
 
         //vr->wait_for_present();
-        
+
         if (!g_hook->m_has_view_extension_hook && !g_hook->m_has_game_viewport_client_draw_hook) {
             vr->update_hmd_state();
         }
+    }
+
+    // DIAG: throttled visibility into the resolved eye index for this stereo view-offset call.
+    // If true_index never (or rarely) resolves to 0 while is_using_afr() is true, the engine is
+    // never being asked to render the left-eye camera pass at all - which would fully explain a
+    // permanently-black left eye independent of the AFR copy path (which only copies whatever the
+    // engine actually rendered).
+    //
+    // IMPORTANT: this diagnostic's true_index is derived from this function's own local g_frame_count/
+    // index_starts_from_one state, which is INDEPENDENT of D3D12Component.cpp's is_left_eye_frame
+    // classification (based on vr->m_render_frame_count % 2 == m_left_eye_interval). If these two
+    // separately-computed "which eye is this" trackers ever fall out of phase with each other, the
+    // engine could be rendering the left-eye camera into a viewport that D3D12Component then samples/
+    // copies as the wrong eye, producing a permanently-black eye despite both eyes rendering correctly.
+    // Log vr's frame-count/interval state here too so the two can be correlated directly in the log.
+    // Also fixed the previous "% 300 == 1" throttle: since this function and D3D12Component::on_frame's
+    // diag_afr_count both increment roughly once per real per-eye call, a fixed EVEN stride can alias
+    // onto a single parity and make it look like only one eye is ever logged after warm-up, when in
+    // fact both are still occurring - use an ODD stride instead so both parities are sampled during
+    // steady-state logging.
+    {
+        static uint32_t diag_stereo_offset_count = 0;
+        ++diag_stereo_offset_count;
+
+        // DIAG: running per-eye call counters. This directly answers "does the engine ever stop
+        // asking for a left-eye camera pass at all", independent of whatever D3D12Component later
+        // does with that pass's output. If diag_left_calls stops incrementing entirely (while
+        // diag_right_calls keeps climbing) at some point in the log, the black left eye is proven
+        // to originate upstream of our hooks entirely (the engine itself stopped requesting a
+        // left-eye view), not in our copy/compositor code.
+        static uint64_t diag_left_calls = 0;
+        static uint64_t diag_right_calls = 0;
+        static uint32_t diag_last_left_call_index = 0;
+        static uint32_t diag_last_right_call_index = 0;
+
+        if (true_index == 0) {
+            ++diag_left_calls;
+            diag_last_left_call_index = diag_stereo_offset_count;
+        } else {
+            ++diag_right_calls;
+            diag_last_right_call_index = diag_stereo_offset_count;
+        }
+
+        if (diag_stereo_offset_count <= 20 || diag_stereo_offset_count % 301 == 1) {
+            SPDLOG_INFO("[DIAG] calculate_stereo_view_offset (#{}): view_index={} true_index={} is_full_pass={} is_using_afr={} g_frame_count={} index_starts_from_one={} vr_frame_count={} vr_left_interval={} vr_right_interval={} left_calls={} right_calls={} last_left_call=#{} last_right_call=#{}",
+                diag_stereo_offset_count, view_index, true_index, is_full_pass, vr->is_using_afr(), g_frame_count, index_starts_from_one,
+                vr->m_render_frame_count, vr->m_left_eye_interval, vr->m_right_eye_interval,
+                diag_left_calls, diag_right_calls, diag_last_left_call_index, diag_last_right_call_index);
+        }
+
+        // DIAG: unconditional low-frequency heartbeat (time-based, not call-count-based) so a
+        // left-eye stall is visible even if it happens to occur between the count-based throttle
+        // windows above. If "left_calls" is ever seen to stop advancing across two consecutive
+        // heartbeats while "right_calls" keeps advancing, the engine has stopped requesting a
+        // left-eye camera pass entirely - proving the root cause is upstream of any of our hooks.
+        SPDLOG_INFO_EVERY_N_SEC(3, "[DIAG] calculate_stereo_view_offset heartbeat: left_calls={} right_calls={} last_left_call=#{} last_right_call=#{} is_using_afr={}",
+            diag_left_calls, diag_right_calls, diag_last_left_call_index, diag_last_right_call_index, vr->is_using_afr());
     }
 
     /*if (view_index % 2 == 1 && VR::get()->get_synchronize_stage() == VR::SynchronizeStage::EARLY) {
@@ -5041,9 +5691,22 @@ __forceinline Matrix4x4f* FFakeStereoRenderingHook::calculate_stereo_projection_
 
     if (out != nullptr) {
         auto true_index = index_starts_from_one ? ((view_index + 1) % 2) : (view_index % 2);
-    
+
         if (vr->is_using_afr()) {
-            true_index = g_frame_count % 2;
+            // See the matching comment in calculate_stereo_view_offset: fold in a call-scoped
+            // alternator so a stalled g_frame_count doesn't force multiple consecutive calls to
+            // resolve to the same eye.
+            static uint32_t last_proj_frame_count = 0;
+            static uint32_t proj_call_index = 0;
+
+            if (last_proj_frame_count != g_frame_count || proj_call_index > 1) {
+                proj_call_index = 0;
+            }
+
+            last_proj_frame_count = g_frame_count;
+
+            true_index = (g_frame_count + proj_call_index) % 2;
+            ++proj_call_index;
         }
 
         auto& double_matrix = *(Matrix4x4d*)out;
@@ -5240,11 +5903,70 @@ uint32_t FFakeStereoRenderingHook::get_desired_number_of_views_hook(FFakeStereoR
         return 1;
     }
 
-    if (vr->is_native_stereo_fix_enabled()) {
+    if (vr->is_native_stereo_fix_enabled() && !vr->is_native_stereo_fix_mirror_enabled()) {
         auto rtm = g_hook->get_render_target_manager();
         if ((rtm->get_scene_capture_render_target() == nullptr || !g_hook->m_sceneview_data.constructor_hook || !g_hook->m_render_module_begin_render_viewfamily_hook)) {
             if (rtm->get_scene_capture_utexture() == nullptr) {
-                rtm->create_scene_capture();
+                // This vfunc is called every frame, independent of begin_render_viewfamily_real/sceneview_constructor.
+                // Without a loading guard here, this path will spam create_scene_capture() (actor spawn + full
+                // render target/swapchain reallocation) on every single frame while the scene capture is invalid
+                // during a level transition, which is heavy enough to stall the loading screen indefinitely.
+                const bool diag_engine_tick_stalled = vr->is_engine_tick_stalled();
+                const bool diag_local_player_missing = is_local_player_controller_missing();
+                const bool diag_boot_phase_active = is_boot_phase_active();
+                bool is_loading = diag_engine_tick_stalled || diag_local_player_missing || diag_boot_phase_active;
+                const char* diag_loading_reason = "none";
+
+                if (diag_engine_tick_stalled) {
+                    diag_loading_reason = "engine_tick_stalled";
+                } else if (diag_local_player_missing) {
+                    diag_loading_reason = "local_player_controller_missing";
+                } else if (diag_boot_phase_active) {
+                    diag_loading_reason = "boot_phase_active";
+                }
+
+                if (are_loading_guards_disabled()) {
+                    is_loading = false;
+                    diag_loading_reason = "guards_disabled_override";
+                }
+
+                if (!is_loading) {
+                    auto engine = sdk::UEngine::get();
+                    auto world = engine != nullptr ? engine->get_world() : nullptr;
+
+                    if (world == nullptr) {
+                        is_loading = true;
+                        diag_loading_reason = "world_is_null";
+                    } else {
+                        static auto world_class = world->get_class();
+                        if (world_class != nullptr) {
+                            static auto is_tearing_down_prop = world_class->find_property(L"bIsTearingDown");
+                            if (is_tearing_down_prop != nullptr) {
+                                auto prop_addr = (uint8_t*)((uintptr_t)world + is_tearing_down_prop->get_offset());
+                                if (prop_addr != nullptr && (*prop_addr & 1) != 0) {
+                                    is_loading = true;
+                                    diag_loading_reason = "world_is_tearing_down";
+                                }
+                            }
+                        }
+                    }
+                }
+
+                SPDLOG_INFO_EVERY_N_SEC(2, "[DIAG] get_desired_number_of_views_hook: scene_capture_render_target=null scene_capture_utexture=null "
+                    "is_loading={} reason={} sceneview_constructor_hook={} begin_render_viewfamily_hook={}",
+                    is_loading, diag_loading_reason, (bool)g_hook->m_sceneview_data.constructor_hook,
+                    (bool)g_hook->m_render_module_begin_render_viewfamily_hook);
+
+                if (!is_loading) {
+                    static auto last_create_time = std::chrono::steady_clock::time_point{};
+                    const auto now = std::chrono::steady_clock::now();
+                    SPDLOG_INFO("[VR] create_scene_capture() invoked from get_desired_number_of_views_hook ({}ms since last invocation)",
+                        std::chrono::duration_cast<std::chrono::milliseconds>(now - last_create_time).count());
+                    last_create_time = now;
+                    rtm->create_scene_capture();
+                } else {
+                    SPDLOG_INFO_EVERY_N_SEC(2, "[VR] get_desired_number_of_views_hook: skipping create_scene_capture(), level transition/load in progress");
+                }
             }
 
             return 1; // wait for the scene capture render target to be set and FSceneView constructor to be hooked
@@ -6032,99 +6754,129 @@ bool VRRenderTargetManager_Base::need_reallocate_view_target(const sdk::FViewpor
     }
 
     if (!m_attempted_find_force_separate_rt) try {
-        m_attempted_find_force_separate_rt = true;
+            m_attempted_find_force_separate_rt = true;
 
-        // Go up the stack until we find something that isn't in our module.
-        const auto our_module = g_framework->get_framework_module();
-        constexpr auto max_stack_depth = 100;
-        uintptr_t stack[max_stack_depth]{};
+            // Go up the stack until we find something that isn't in our module.
+            const auto our_module = g_framework->get_framework_module();
+            constexpr auto max_stack_depth = 100;
+            uintptr_t stack[max_stack_depth]{};
 
-        const auto depth = RtlCaptureStackBackTrace(0, max_stack_depth, (void**)&stack, nullptr);
+            const auto depth = RtlCaptureStackBackTrace(0, max_stack_depth, (void**)&stack, nullptr);
 
-        std::optional<uintptr_t> ret_addr{};
-        std::optional<HMODULE> module_within{};
+            std::optional<uintptr_t> ret_addr{};
+            std::optional<HMODULE> module_within{};
 
-        for (auto i = 0; i < depth; ++i) {
-            SPDLOG_INFO("Stack[{}]: {:x}", i, stack[i]);
+            for (auto i = 0; i < depth; ++i) {
+                SPDLOG_INFO("Stack[{}]: {:x}", i, stack[i]);
 
-            module_within = utility::get_module_within(stack[i]);
+                module_within = utility::get_module_within(stack[i]);
 
-            if (!module_within) {
-                continue;
+                if (!module_within) {
+                    continue;
+                }
+
+                if (*module_within != our_module) {
+                    ret_addr = stack[i];
+                    break;
+                }
             }
 
-            if (*module_within != our_module) {
-                ret_addr = stack[i];
-                break;
-            }
-        }
+            // Emulate from the return address and find a memory write
+            // this should contain the offset to the force separate rt bool.
+            if (ret_addr) {
+                SPDLOG_INFO("Found return address: {:x}", *ret_addr);
 
-        // Emulate from the return address and find a memory write
-        // this should contain the offset to the force separate rt bool.
-        if (ret_addr) {
-            SPDLOG_INFO("Found return address: {:x}", *ret_addr);
-
-            utility::ShemuContext ctx{*module_within};
-            ctx.ctx->Registers.RegRip = *ret_addr;
-            ctx.ctx->Registers.RegRax = 1; // As if we're returning true from this function.
+                utility::ShemuContext ctx{*module_within};
+                ctx.ctx->Registers.RegRip = *ret_addr;
+                ctx.ctx->Registers.RegRax = 1; // As if we're returning true from this function.
 
             utility::emulate(*module_within, *ret_addr, 100, ctx, [this](const utility::ShemuContextExtended& ctx) -> utility::ExhaustionResult {
-                SPDLOG_INFO("Emulating instruction: {:x}", ctx.ctx->ctx->Registers.RegRip);
+                        SPDLOG_INFO("Emulating instruction: {:x}", ctx.ctx->ctx->Registers.RegRip);
 
-                if (ctx.next.writes_to_memory) {
-                    const auto& ix = ctx.next.ix;
-                    if (ix.Instruction == ND_INS_MOV && ix.Operands[0].Type == ND_OP_MEM && ix.Operands[1].Type == ND_OP_REG) {
-                        // We're looking for a mov [reg1+N], reg2
-                        const auto& op0 = ix.Operands[0];
+                        if (ctx.next.writes_to_memory) {
+                            const auto& ix = ctx.next.ix;
+                            if (ix.Instruction == ND_INS_MOV && ix.Operands[0].Type == ND_OP_MEM && ix.Operands[1].Type == ND_OP_REG) {
+                                // We're looking for a mov [reg1+N], reg2
+                                const auto& op0 = ix.Operands[0];
 
-                        // Needs a register
-                        if (!op0.Info.Memory.HasBase || op0.Info.Memory.IsRipRel) {
+                                // Needs a register
+                                if (!op0.Info.Memory.HasBase || op0.Info.Memory.IsRipRel) {
+                                    return utility::ExhaustionResult::STEP_OVER;
+                                }
+
+                                // Needs a displacement
+                                if (!op0.Info.Memory.HasDisp) {
+                                    return utility::ExhaustionResult::STEP_OVER;
+                                }
+
+                                // We don't want a stack based register
+                                if (op0.Info.Memory.Base == NDR_RSP || op0.Info.Memory.Base == NDR_RBP) {
+                                    return utility::ExhaustionResult::STEP_OVER;
+                                }
+
+                                if (op0.Info.Memory.Disp > 0 && op0.Info.Memory.Disp < 0x2000) {
+                                    m_viewport_force_separate_rt_offset = op0.Info.Memory.Disp;
+                                    SPDLOG_INFO("Found force separate rt offset: {:x}", *m_viewport_force_separate_rt_offset);
+                                    return utility::ExhaustionResult::BREAK;
+                                }
+                            }
+
+                            SPDLOG_INFO("Stepping over...");
+
                             return utility::ExhaustionResult::STEP_OVER;
                         }
 
-                        // Needs a displacement
-                        if (!op0.Info.Memory.HasDisp) {
-                            return utility::ExhaustionResult::STEP_OVER;
-                        }
-
-                        // We don't want a stack based register
-                        if (op0.Info.Memory.Base == NDR_RSP || op0.Info.Memory.Base == NDR_RBP) {
-                            return utility::ExhaustionResult::STEP_OVER;
-                        }
-
-                        if (op0.Info.Memory.Disp > 0 && op0.Info.Memory.Disp < 0x2000) {
-                            m_viewport_force_separate_rt_offset = op0.Info.Memory.Disp;
-                            SPDLOG_INFO("Found force separate rt offset: {:x}", *m_viewport_force_separate_rt_offset);
+                        if (std::string_view{ctx.next.ix.Mnemonic}.starts_with("CALL")) {
+                            // We need to break out of this, we should've found the offset before the call.
+                    SPDLOG_ERROR("Failed to find force separate rt offset! Encountered call at {:x}", ctx.ctx->ctx->Registers.RegRip);
                             return utility::ExhaustionResult::BREAK;
                         }
-                    }
 
-                    SPDLOG_INFO("Stepping over...");
-
-                    return utility::ExhaustionResult::STEP_OVER;
-                }
-
-                if (std::string_view{ctx.next.ix.Mnemonic}.starts_with("CALL")) {
-                    // We need to break out of this, we should've found the offset before the call.
-                    SPDLOG_ERROR("Failed to find force separate rt offset! Encountered call at {:x}", ctx.ctx->ctx->Registers.RegRip);
-                    return utility::ExhaustionResult::BREAK;
-                }
-
-                return utility::ExhaustionResult::CONTINUE;
-            });
-        }
+                        return utility::ExhaustionResult::CONTINUE;
+                    });
+            }
     } catch(...) { // if we dont find it, it's fine, not very many games require it.
-        SPDLOG_ERROR("Failed to find force separate rt offset! (Exception)");
-    }
+            SPDLOG_ERROR("Failed to find force separate rt offset! (Exception)");
+        }
 
     const auto w = VR::get()->get_hmd_width();
     const auto h = VR::get()->get_hmd_height();
 
-    if (w != this->last_width || h != this->last_height || g_hook->should_recreate_textures()) {
+    // In 2D screen mode, get_hmd_width()/height() derive from the game's own render target size
+    // (Framework::get_rt_size()), which can fluctuate frame-to-frame (e.g. dynamic resolution
+    // scaling during a loading screen, or the backbuffer briefly resizing). Reacting to every
+    // transient change here triggers a full, expensive backbuffer + OpenXR swapchain teardown/
+    // recreate cascade (observed costing several hundred ms to ~1-2s each time), which can repeat
+    // continuously and starve the loading process of the cycles it needs to finish, manifesting
+    // as the game appearing stuck on its loading screen even though rendering itself is healthy.
+    // Debounce by requiring the new size to be stable across several consecutive checks before
+    // committing to a reallocation, unless a reallocation is forced via should_recreate_textures().
+    const auto forced = g_hook->should_recreate_textures();
+
+    if (!forced && (w != this->last_width || h != this->last_height)) {
+        if (w != m_pending_width || h != m_pending_height) {
+            m_pending_width = w;
+            m_pending_height = h;
+            m_pending_size_stable_count = 1;
+        } else {
+            ++m_pending_size_stable_count;
+        }
+
+        static constexpr uint32_t required_stable_checks = 5;
+
+        if (m_pending_size_stable_count < required_stable_checks) {
+            SPDLOG_INFO_EVERY_N_SEC(1, "[VR] Deferring view target reallocation ({} {} -> {} {}), waiting for size to stabilize ({}/{})",
+                this->last_width, this->last_height, w, h, m_pending_size_stable_count, required_stable_checks);
+            return false;
+        }
+    }
+
+    if (forced || w != this->last_width || h != this->last_height) {
         SPDLOG_INFO("Reallocating view target! {} {} -> {} {}", this->last_width, this->last_height, w, h);
 
         this->last_width = w;
         this->last_height = h;
+        m_pending_size_stable_count = 0;
         this->wants_depth_reallocate = true;
         this->destroy_scene_capture();
         g_hook->set_should_recreate_textures(false);
@@ -6892,77 +7644,162 @@ void VRRenderTargetManager_Base::texture_hook_callback(safetyhook::Context& ctx,
 
     SPDLOG_INFO(" last texture index: {}", rtm->last_texture_index);
 
+    // DIAG: trace the identity/native-resource of the source texture being handed to the
+    // compositor. If this never changes to a non-null, non-zero native resource, or if it
+    // keeps flipping back to null, the black-screen origin is here rather than downstream in
+    // D3D12Component.cpp.
+    {
+        static void* s_last_diag_texture = nullptr;
+        static void* s_last_diag_native_resource = nullptr;
+        const void* native_resource = texture != nullptr ? texture->get_native_resource() : nullptr;
+
+        if (texture != (FRHITexture2D*)s_last_diag_texture || native_resource != s_last_diag_native_resource) {
+            SPDLOG_INFO("[DIAG] render_target assignment changed: texture={:x} native_resource={:x} (was texture={:x} native_resource={:x})",
+                (uintptr_t)texture, (uintptr_t)native_resource, (uintptr_t)s_last_diag_texture, (uintptr_t)s_last_diag_native_resource);
+            s_last_diag_texture = texture;
+            s_last_diag_native_resource = (void*)native_resource;
+        } else {
+            SPDLOG_INFO_EVERY_N_SEC(2, "[DIAG] render_target assignment unchanged: texture={:x} native_resource={:x}",
+                (uintptr_t)texture, (uintptr_t)native_resource);
+        }
+    }
+
     rtm->render_target = texture;
     //rtm->ui_target = texture;
     rtm->texture_hook_ref = nullptr;
     ++rtm->last_texture_index;
 }
 
+bool VRRenderTargetManager_Base::is_scene_capture_world_stale() const {
+    if (this->scene_capture_actor == nullptr || this->scene_capture_world == nullptr) {
+        return false;
+    }
+
+    auto engine = sdk::UEngine::get();
+    auto world = engine != nullptr ? engine->get_world() : nullptr;
+
+    // The engine's current world no longer matches the world we spawned into - a full level
+    // transition happened underneath us (as opposed to sub-level streaming within the same
+    // persistent world). Our actor/component are about to be (or already are) orphaned from a
+    // dying world; tear ourselves down proactively rather than waiting to notice via GC/null checks.
+    if (world == nullptr || (void*)world != this->scene_capture_world) {
+        return true;
+    }
+
+    // The world hasn't changed yet, but it may already be marked for teardown (bIsTearingDown).
+    static auto world_class = world->get_class();
+    if (world_class != nullptr) {
+        static auto is_tearing_down_prop = world_class->find_property(L"bIsTearingDown");
+        if (is_tearing_down_prop != nullptr) {
+            auto prop_addr = (uint8_t*)((uintptr_t)world + is_tearing_down_prop->get_offset());
+            if (prop_addr != nullptr && (*prop_addr & 1) != 0) {
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
 void VRRenderTargetManager_Base::destroy_scene_capture() try {
+    SPDLOG_INFO("[DIAG] destroy_scene_capture() called: scene_capture_actor={:x} in_flight_target={:x} scene_capture_target_valid={}",
+        (uintptr_t)(sdk::AActor*)this->scene_capture_actor, (uintptr_t)this->in_flight_target, this->scene_capture_target.valid());
+
     if (this->scene_capture_actor != nullptr && this->in_flight_target == nullptr) {
         SPDLOG_INFO("Destroying scene capture!");
 
         if (this->scene_capture_actor.valid()) {
+            // Actor/component are intentionally never rooted (see create_scene_capture()), so no
+            // remove_from_root() call is needed here - they're free to be collected normally by
+            // their owning world's GC pass if we don't get here first.
             this->scene_capture_actor->destroy_actor();
         }
     }
 
     if (this->in_flight_target == nullptr) {
+        // Un-root the target object if it's still valid so Unreal GC can sweep it safely
+        if (this->scene_capture_target.valid()) {
+            if (auto raw_obj = this->scene_capture_target.get(); raw_obj != nullptr) {
+                raw_obj->remove_from_root();
+            }
+        }
+
         this->scene_capture_actor = nullptr;
         this->scene_capture_component = nullptr;
         this->scene_capture_target = nullptr;
+        this->scene_capture_world = nullptr;
+        this->scene_capture_ready_time = std::chrono::steady_clock::time_point{};
 
-        RHIThreadWorker::get().enqueue([this]() -> void {
-            this->scene_capture_target_rhi_thread = nullptr;
-        });
+        // Immediate assignment for local thread safety, sync job for queue ordering
+        this->scene_capture_target_rhi_thread = nullptr;
+
+        RHIThreadWorker::get().enqueue([this]() -> void { this->scene_capture_target_rhi_thread = nullptr; });
     }
 } catch (const std::exception& e) {
     SPDLOG_ERROR("[VRRenderTargetManager] Exception in destroy_scene_capture: {}", e.what());
     this->scene_capture_target = nullptr;
+    this->scene_capture_target_rhi_thread = nullptr;
     this->scene_capture_actor = nullptr;
     this->scene_capture_component = nullptr;
-    
-    RHIThreadWorker::get().enqueue([this]() -> void {
-        this->scene_capture_target_rhi_thread = nullptr;
-    });
+    this->scene_capture_world = nullptr;
+    this->scene_capture_ready_time = std::chrono::steady_clock::time_point{};
 } catch (...) {
     SPDLOG_ERROR("[VRRenderTargetManager] Unknown exception in destroy_scene_capture!");
 }
 
 FRHITexture2D* VRRenderTargetManager_Base::get_scene_capture_render_target() {
     if (this->in_flight_target != nullptr) {
+        SPDLOG_INFO_EVERY_N_SEC(2, "[VRRenderTargetManager] get_scene_capture_render_target: in_flight_target != nullptr, returning null");
         return nullptr;
     }
 
     const auto is_same_as_rhi_thread = RHIThreadWorker::get().is_same_thread();
-    const auto& sct = is_same_as_rhi_thread ? this->scene_capture_target_rhi_thread : this->scene_capture_target;
 
-    if (sct != nullptr) try {
-        // I REALLY don't want to lock a mutex in a hot path so let's hope that our exception handler catches everything.
+    // Cache smart pointer locally to avoid thread torn reads
+    const auto sct = is_same_as_rhi_thread ? this->scene_capture_target_rhi_thread : this->scene_capture_target;
+
+    if (sct == nullptr) {
+        SPDLOG_INFO_EVERY_N_SEC(2, "[VRRenderTargetManager] get_scene_capture_render_target: sct is null (is_same_as_rhi_thread={})", is_same_as_rhi_thread);
+        return nullptr;
+    }
+
+    try {
         if (!sct.valid()) {
-            SPDLOG_WARN("[VRRenderTargetManager] Scene capture target is not a UTexture! Texture probably deleted on level change!");
-            
+            SPDLOG_WARN("[VRRenderTargetManager] get_scene_capture_render_target: sct not valid, nulling out (is_same_as_rhi_thread={})", is_same_as_rhi_thread);
+            // Null out thread references immediately to prevent log spam during level changes
             if (is_same_as_rhi_thread) {
                 this->scene_capture_target_rhi_thread = nullptr;
+            } else {
+                this->scene_capture_target = nullptr;
             }
-
             return nullptr;
         }
 
         auto rsrc = (sdk::FTextureRenderTargetResource*)sct->get_resource();
-        auto rsrc_frt = rsrc != nullptr ? rsrc->as_render_target() : nullptr;
+        if (rsrc == nullptr) {
+            SPDLOG_INFO_EVERY_N_SEC(2, "[VRRenderTargetManager] get_scene_capture_render_target: sct->get_resource() returned null");
+            return nullptr;
+        }
 
-        if (rsrc_frt != nullptr) {  
+        auto rsrc_frt = rsrc->as_render_target();
+        if (rsrc_frt != nullptr) {
             auto tex_ref = rsrc_frt->get_render_target_texture();
-            if (tex_ref != nullptr) {
+            if (tex_ref != nullptr && *tex_ref != nullptr) {
                 return *tex_ref;
             }
+
+            SPDLOG_INFO_EVERY_N_SEC(2, "[VRRenderTargetManager] get_scene_capture_render_target: render_target_texture ref/value is null (tex_ref={:x})", (uintptr_t)tex_ref);
+        } else {
+            SPDLOG_INFO_EVERY_N_SEC(2, "[VRRenderTargetManager] get_scene_capture_render_target: rsrc->as_render_target() returned null (rsrc={:x})", (uintptr_t)rsrc);
         }
     } catch (...) {
-        SPDLOG_ERROR("[VRRenderTargetManager] Exception in get_scene_capture_render_target! Texture probably deleted on level change!");
+        // Quiet down exception handling during level load/tear-down
+        SPDLOG_WARN("[VRRenderTargetManager] Caught exception dereferencing scene capture target!");
 
         if (is_same_as_rhi_thread) {
             this->scene_capture_target_rhi_thread = nullptr;
+        } else {
+            this->scene_capture_target = nullptr;
         }
     }
 
@@ -6971,17 +7808,23 @@ FRHITexture2D* VRRenderTargetManager_Base::get_scene_capture_render_target() {
 
 sdk::UTexture* VRRenderTargetManager_Base::get_scene_capture_utexture() {
     if (this->in_flight_target != nullptr) {
+        SPDLOG_INFO_EVERY_N_SEC(2, "[VRRenderTargetManager] get_scene_capture_utexture: in_flight_target != nullptr, returning null");
         return nullptr;
     }
 
     const auto& utex = this->scene_capture_target;
 
-    if (utex != nullptr) try {
+    if (utex == nullptr) {
+        SPDLOG_INFO_EVERY_N_SEC(2, "[VRRenderTargetManager] get_scene_capture_utexture: scene_capture_target is null");
+        return nullptr;
+    }
+
+    try {
         if (utex.valid()) {
             return (sdk::UTexture*)utex;
         }
 
-        SPDLOG_WARN("[VRRenderTargetManager] Scene capture target is not a UTexture! Texture probably deleted on level change!");
+        SPDLOG_WARN("[VRRenderTargetManager] Scene capture target is not a UTexture! Texture probably deleted on level change! (ptr={:x})", (uintptr_t)utex.get());
 
         GameThreadWorker::get().enqueue([this]() -> void {
             this->in_flight_target = nullptr;
@@ -7009,6 +7852,36 @@ bool VRRenderTargetManager_Base::create_scene_capture() try {
         SPDLOG_WARN("[VRRenderTargetManager] FRHITexture2D vtable is null, waiting for it to be set!");
         return false;
     }
+
+    // Cooldown/throttle: during a level transition the engine tick can flicker (resume for a frame,
+    // then stall again), which previously let every caller's loading-guard open briefly and
+    // re-trigger this whole actor-spawn + FRenderTarget rehook cascade. That work itself eats enough
+    // game-thread time to cause the next stall, creating a self-sustaining loop that starves level
+    // streaming of the cycles it needs to finish loading. Refuse to actually recreate more often than
+    // this, regardless of which call site is asking, so a flickering tick can't retrigger the loop.
+    static constexpr auto scene_capture_recreate_cooldown = std::chrono::milliseconds(3000);
+    const auto now = std::chrono::steady_clock::now();
+    const auto since_last_create = now - this->last_scene_capture_create_time;
+
+    // Refuse to (re)create while the view-target reallocation debounce is still stabilizing on a
+    // new size (e.g. a resolution change mid level-transition). Creating now would size the scene
+    // capture texture using get_hmd_width()/get_hmd_height() at the OLD resolution, just before the
+    // reallocation lands and swaps the destination eye texture to the NEW resolution - producing a
+    // mismatched scene-capture/eye-texture pair that has been observed to fail SRV descriptor heap
+    // creation and take the whole D3D12 device down (DXGI_ERROR_DEVICE_REMOVED).
+    if (is_view_target_reallocation_pending()) {
+        SPDLOG_WARN("[VRRenderTargetManager] create_scene_capture() deferred - view target reallocation is pending/stabilizing.");
+        return false;
+    }
+
+    if (this->last_scene_capture_create_time.time_since_epoch().count() != 0 && since_last_create < scene_capture_recreate_cooldown) {
+        SPDLOG_WARN("[VRRenderTargetManager] create_scene_capture() throttled - only {}ms since last creation (cooldown={}ms). "
+                     "This usually means something is repeatedly invalidating the scene capture during a level transition.",
+            std::chrono::duration_cast<std::chrono::milliseconds>(since_last_create).count(), scene_capture_recreate_cooldown.count());
+        return false;
+    }
+
+    this->last_scene_capture_create_time = now;
 
     destroy_scene_capture();
 
@@ -7063,6 +7936,17 @@ bool VRRenderTargetManager_Base::create_scene_capture() try {
         return false;
     }
 
+    // NOTE: We intentionally do NOT add_to_root() the actor/component here. Rooting them keeps
+    // them alive indefinitely regardless of their owning UWorld, but during a *full* level
+    // transition (e.g. character-select -> game world) the engine's teardown/GC pass expects
+    // every actor belonging to the old world to actually be collectible so it can confirm the
+    // old world is fully gone before finishing initialization of the new one. A rooted actor left
+    // dangling from a torn-down world stalls that handshake (observed as the loading screen
+    // getting stuck at a fixed percentage). Instead we proactively call destroy_scene_capture()
+    // ourselves the moment we detect the owning world is tearing down or has changed (see
+    // is_local_pawn_missing()/update_boot_phase_tracking() callers and the world-change watchdog
+    // in begin_render_viewfamily_real), so we never need to rely on GC sweeping these out from
+    // under us and never need to keep them rooted past their world's natural lifetime.
     this->scene_capture_component = (sdk::USceneCaptureComponent2D*)this->scene_capture_actor->add_component_by_class(scene_capture_c, false);
 
     if (this->scene_capture_component == nullptr) {
@@ -7070,13 +7954,22 @@ bool VRRenderTargetManager_Base::create_scene_capture() try {
         return false;
     }
 
+    // Remember which world we spawned into so is_scene_capture_world_stale() can detect a full
+    // level transition (as opposed to sub-level streaming) and proactively tear us down before
+    // the engine's own GC pass needs to.
+    this->scene_capture_world = world;
+
     const float clear_color[4] {0.0f, 0.0f, 0.0f, 1.0f};
-    auto tgt_raw = kismet_rendering->create_render_target_2d(world, VR::get()->get_hmd_width(), VR::get()->get_hmd_height(), 2, clear_color, false);
+    auto tgt_raw =
+        kismet_rendering->create_render_target_2d(world, VR::get()->get_hmd_width(), VR::get()->get_hmd_height(), 2, clear_color, false);
 
     if (tgt_raw == nullptr) {
         SPDLOG_ERROR("[VRRenderTargetManager] Failed to create texture!");
         return false;
     }
+
+    // FIX: Prevent Unreal Engine GC from sweeping the render target across threads
+    tgt_raw->add_to_root();
 
     sdk::UObjectReference tgt{tgt_raw};
 
@@ -7090,6 +7983,20 @@ bool VRRenderTargetManager_Base::create_scene_capture() try {
     this->scene_capture_component->set_visibility(false);
     if (auto capture_every_frame = scene_capture_c->find_property(L"bCaptureEveryFrame"); capture_every_frame != nullptr) {
         *capture_every_frame->get_data<bool>(this->scene_capture_component) = false;
+    }
+
+    // Without this, the engine doesn't consider the capture's FSceneView to be "continuously live"
+    // since bCaptureEveryFrame is false above, so per-view time-dependent state (WPO/wind phase,
+    // shadow invalidation caching, foliage LOD dithering) can go stale or desync from the primary
+    // view instead of being refreshed each time we manually drive the capture. This is what was
+    // causing wind-animated foliage to appear static and shadows/LOD to be left-eye-dominated in
+    // the right eye. bAlwaysPersistRenderingState tells the engine to keep that per-view state
+    // updated/persisted across captures even though the component itself isn't auto-ticking.
+    if (auto always_persist = scene_capture_c->find_property(L"bAlwaysPersistRenderingState"); always_persist != nullptr) {
+        *always_persist->get_data<bool>(this->scene_capture_component) = true;
+    } else {
+        SPDLOG_WARN("[VRRenderTargetManager] bAlwaysPersistRenderingState property not found on USceneCaptureComponent2D - "
+                    "wind/shadow/LOD desync between eyes may persist");
     }
 
     static bool already_updated{false};
@@ -7177,10 +8084,11 @@ bool VRRenderTargetManager_Base::create_scene_capture() try {
                                     destroy_scene_capture();
                                     return;
                                 }
-                                
+
                                 this->scene_capture_target = tgt;
                                 this->in_flight_target = nullptr;
-    
+                                this->scene_capture_ready_time = std::chrono::steady_clock::now();
+
                                 SPDLOG_INFO("Scene capture texture created!");
                             });
     
@@ -7273,8 +8181,22 @@ bool VRRenderTargetManager_Base::create_scene_capture() try {
     
                     this->in_flight_target = nullptr;
                     this->scene_capture_target = tgt;
-    
-                    SPDLOG_INFO("Scene capture texture fully created!");
+                    this->scene_capture_ready_time = std::chrono::steady_clock::now();
+
+                    // DIAG: confirm the scene capture texture actually resolves to a usable
+                    // FRHITexture2D/native resource at the moment it becomes "ready". If the
+                    // render target texture is black afterwards, this at least proves whether
+                    // the resource exists and what its identity is.
+                    try {
+                        auto rsrc = tgt.valid() ? (sdk::FTextureRenderTargetResource*)tgt->get_resource() : nullptr;
+                        auto frt = rsrc != nullptr ? rsrc->as_render_target() : nullptr;
+                        auto frttex_ref = frt != nullptr ? frt->get_render_target_texture() : nullptr;
+                        auto frttex = frttex_ref != nullptr ? *frttex_ref : nullptr;
+                        SPDLOG_INFO("[DIAG] Scene capture texture fully created! utexture={:x} rhi_texture={:x} native_resource={:x}",
+                            (uintptr_t)(sdk::UTexture*)tgt, (uintptr_t)frttex, frttex != nullptr ? (uintptr_t)frttex->get_native_resource() : 0);
+                    } catch (...) {
+                        SPDLOG_INFO("Scene capture texture fully created! (failed to resolve DIAG identity)");
+                    }
                 });
     
                 return true;
@@ -7410,11 +8332,13 @@ __declspec(noinline) void FFakeStereoRenderingHook::update_viewport_rhi_hook(voi
                     auto& use_separate_rt = *(bool*)((uintptr_t)viewport + (*offset - 1));
 
                     if (!should_force_separate_rt) {
-                        SPDLOG_INFO_ONCE("UpdateViewportRHI was called without should_force_separate_rt being set to true, skipping.");
+                        SPDLOG_INFO_ONCE("UpdateViewportRHI was called without should_force_separate_rt being set to true, setting flags.");
                         should_force_separate_rt = true;
                         use_separate_rt = true;
                         modified_use_separate_rt = true;
-                        return; // NO!!!!!!!!!!!!!!!!!!!
+
+                        call_orig(); // Call original to guarantee RHI setup completes instead of dropping the frame execution
+                        return;
                     }
                 }
             }

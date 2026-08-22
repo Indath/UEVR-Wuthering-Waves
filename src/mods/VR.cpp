@@ -1370,6 +1370,33 @@ void VR::on_pre_engine_tick(sdk::UGameEngine* engine, float delta) {
     m_cvar_manager->on_pre_engine_tick(engine, delta);
     m_last_engine_tick = std::chrono::steady_clock::now();
 
+    // Heartbeat log so we can confirm from the log timeline whether the game thread tick is
+    // actually still running (vs. stalled) during a stuck level transition.
+    {
+        static auto last_heartbeat = std::chrono::steady_clock::time_point{};
+        const auto now = std::chrono::steady_clock::now();
+        if (now - last_heartbeat >= std::chrono::seconds(1)) {
+            last_heartbeat = now;
+            SPDLOG_INFO("[VR] on_pre_engine_tick heartbeat (engine={})", (void*)engine);
+        }
+    }
+
+    // Detect a stale/tearing-down scene capture world as early as possible on the game thread,
+    // rather than waiting for the next render-thread call into begin_render_viewfamily_real().
+    // A full level transition (as opposed to sub-level streaming) can begin tearing down the
+    // world the capture actor lives in well before the next render call arrives, so checking
+    // here closes that window and unhooks the capture setup before the unload proceeds further.
+    if (m_fake_stereo_hook != nullptr) {
+        if (auto rtm = m_fake_stereo_hook->get_render_target_manager(); rtm != nullptr && rtm->is_scene_capture_world_stale()) {
+            auto engine_ptr = sdk::UEngine::get();
+            auto world = engine_ptr != nullptr ? engine_ptr->get_world() : nullptr;
+            SPDLOG_INFO("[VR] on_pre_engine_tick: scene capture's world is stale (changed or tearing down), destroying proactively "
+                        "(current_world={})",
+                        (void*)world);
+            rtm->destroy_scene_capture();
+        }
+    }
+
     if (!get_runtime()->loaded || !is_hmd_active()) {
         return;
     }
@@ -2069,6 +2096,19 @@ void VR::on_present() {
 
     m_frame_count = get_runtime()->internal_render_frame_count;
 
+    // DIAG: trace whether m_frame_count (sourced from the runtime's internal_render_frame_count)
+    // is actually advancing. If it's frozen here, the AFR eye-parity logic downstream
+    // (m_render_frame_count, is_left_eye_frame/is_right_eye_frame) can never toggle eyes.
+    {
+        static uint32_t s_last_diag_present_frame_count = 0xFFFFFFFF;
+        if (m_frame_count != s_last_diag_present_frame_count) {
+            SPDLOG_INFO("[DIAG] VR::on_present: m_frame_count changed {} -> {} (is_using_afr={})", s_last_diag_present_frame_count, m_frame_count, is_using_afr());
+            s_last_diag_present_frame_count = m_frame_count;
+        } else {
+            SPDLOG_INFO_EVERY_N_SEC(2, "[DIAG] VR::on_present: m_frame_count stuck at {} (is_using_afr={})", m_frame_count, is_using_afr());
+        }
+    }
+
     if (!is_using_afr() || m_render_frame_count % 2 == m_left_eye_interval) {
         ResetEvent(m_present_finished_event);
     }
@@ -2198,6 +2238,16 @@ void VR::on_post_present() {
     ZoneScopedN(__FUNCTION__);
 
     const auto is_same_frame = m_render_frame_count > 0 && m_render_frame_count == m_frame_count;
+
+    // DIAG: trace whether m_render_frame_count is actually advancing relative to m_frame_count.
+    // is_same_frame==true every single call is the direct upstream cause of the AFR eye-parity
+    // check in D3D12Component::on_frame() being permanently stuck on one eye.
+    {
+        static uint32_t s_last_diag_render_frame_count = 0xFFFFFFFF;
+        SPDLOG_INFO_EVERY_N_SEC(2, "[DIAG] VR::on_post_present: m_render_frame_count={} m_frame_count={} is_same_frame={}",
+            m_render_frame_count, m_frame_count, is_same_frame);
+        s_last_diag_render_frame_count = m_render_frame_count;
+    }
 
     m_render_frame_count = m_frame_count;
 
@@ -2431,6 +2481,14 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
         if (ImGui::TreeNode("Native Stereo Fix")) {
             m_native_stereo_fix->draw("Enabled");
             m_native_stereo_fix_same_pass->draw("Use Same Stereo Pass");
+            m_native_stereo_fix_mirror->draw("Mirror Right Eye (No Scene Capture)");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Skips spawning the scene-capture actor entirely. The right eye is\njust a flat mirror of the left/game view (no stereoscopic depth).\nUse this as a stable fallback if the scene capture is causing\nstuck loading screens during level transitions.");
+            }
+            m_disable_loading_guards->draw("Disable Loading Guards (A/B testing)");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Bypasses all loading-screen/level-transition detection heuristics\n(tick-stall, missing player controller/pawn, boot-phase) used to gate\nscene capture creation. Use this to test whether these heuristics are\ncontributing to a stuck loading screen.");
+            }
             ImGui::TreePop();
         }
 

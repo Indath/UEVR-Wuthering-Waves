@@ -4,6 +4,7 @@
 
 #include <memory>
 #include <string>
+#include <atomic>
 
 #include <sdk/Math.hpp>
 
@@ -260,6 +261,23 @@ public:
 
     runtimes::OpenVR* get_openvr_runtime() const {
         return m_openvr.get();
+    }
+
+    // Returns true if UEngine::Tick (game thread) hasn't run recently, which is a strong
+    // signal the game is on a loading screen / mid level-transition. This is far more
+    // reliable than reading engine-internal bitfields like UWorld::bIsTearingDown, which
+    // only reflect the OLD world being torn down and say nothing about new-world/streaming
+    // loads still in progress.
+    bool is_engine_tick_stalled(std::chrono::milliseconds threshold = std::chrono::milliseconds(750)) const {
+        // m_last_engine_tick is default-constructed to the epoch (time_point{}) until the engine's
+        // first tick actually occurs. Before that point this must report "not stalled", otherwise
+        // callers (e.g. Framework::hook_monitor()'s D3D rehook backoff) would treat pre-hook/pre-tick
+        // startup as a permanent loading screen and never escalate to install the initial hook at all.
+        if (m_last_engine_tick.time_since_epoch().count() == 0) {
+            return false;
+        }
+
+        return (std::chrono::steady_clock::now() - m_last_engine_tick) > threshold;
     }
 
     bool is_hmd_active() const {
@@ -543,11 +561,37 @@ public:
     }
 
     bool is_native_stereo_fix_enabled() const {
-        return m_native_stereo_fix->value() && !is_using_afr();
+        return m_native_stereo_fix->value() && !is_using_afr() && !m_native_stereo_fix_suspended.load(std::memory_order_relaxed);
+    }
+
+    // Automatically flips Native Stereo Fix off (falling back to its already-working "disabled"
+    // compositing path, not the mirror path) while a level transition/loading screen is detected,
+    // then flips it back on once things settle. This mirrors the manual A/B toggle workflow that
+    // was confirmed to avoid the scene-capture-actor lifecycle conflict during level transitions,
+    // but automatically so the user doesn't have to do it by hand every time.
+    void set_native_stereo_fix_suspended(bool suspended) {
+        m_native_stereo_fix_suspended.store(suspended, std::memory_order_relaxed);
+    }
+
+    bool is_native_stereo_fix_suspended() const {
+        return m_native_stereo_fix_suspended.load(std::memory_order_relaxed);
     }
 
     bool is_native_stereo_fix_same_pass_enabled() const {
         return m_native_stereo_fix_same_pass->value();
+    }
+
+    // When enabled, Native Stereo Fix never spawns/creates the scene-capture actor/component.
+    // The right eye is instead just a mirror of the left (game) texture, via the existing
+    // fallback compositing path in D3D11Component/D3D12Component that already runs when the
+    // scene capture texture is null. No actor lifetime, no depth, and no level-transition
+    // conflicts, at the cost of a flat (non-stereoscopic) right eye.
+    bool is_native_stereo_fix_mirror_enabled() const {
+        return m_native_stereo_fix_mirror->value();
+    }
+
+    bool are_loading_guards_disabled() const {
+        return m_disable_loading_guards->value();
     }
 
     bool is_ahud_compatibility_enabled() const {
@@ -828,6 +872,9 @@ private:
     std::chrono::steady_clock::time_point m_last_interaction_display{};
     std::chrono::steady_clock::time_point m_last_engine_tick{};
 
+    // See set_native_stereo_fix_suspended()/is_native_stereo_fix_enabled().
+    std::atomic<bool> m_native_stereo_fix_suspended{false};
+
     uint32_t m_lowest_xinput_user_index{};
 
     std::chrono::nanoseconds m_last_input_delay{};
@@ -954,6 +1001,8 @@ private:
     const ModToggle::Ptr m_ghosting_fix{ ModToggle::create(generate_name("GhostingFix"), false) };
     const ModToggle::Ptr m_native_stereo_fix{ ModToggle::create(generate_name("NativeStereoFix"), false) };
     const ModToggle::Ptr m_native_stereo_fix_same_pass{ ModToggle::create(generate_name("NativeStereoFixSamePass"), true) };
+    const ModToggle::Ptr m_native_stereo_fix_mirror{ ModToggle::create(generate_name("NativeStereoFixMirror"), false) };
+    const ModToggle::Ptr m_disable_loading_guards{ ModToggle::create(generate_name("DisableLoadingGuards"), false) };
 
     const ModSlider::Ptr m_custom_z_near{ ModSlider::create(generate_name("CustomZNear"), 0.001f, 100.0f, 0.01f, true) };
     const ModToggle::Ptr m_custom_z_near_enabled{ ModToggle::create(generate_name("EnableCustomZNear"), false, true) };
@@ -1072,6 +1121,8 @@ public:
             *m_ghosting_fix,
             *m_native_stereo_fix,
             *m_native_stereo_fix_same_pass,
+            *m_native_stereo_fix_mirror,
+            *m_disable_loading_guards,
             *m_splitscreen_compatibility_mode,
             *m_splitscreen_view_index,
             *m_compatibility_skip_pip,

@@ -77,6 +77,7 @@ private:
 private:
     void hook_monitor();
     void command_thread();
+    void dump_stalled_process_state();
 
 public:
     Framework(HMODULE framework_module);
@@ -349,6 +350,7 @@ private:
     uint32_t m_frames_since_init{0};
     bool m_has_last_chance{true};
     bool m_first_initialize{true};
+    bool m_stall_dump_written{false};
 
     bool m_sent_message{false};
     bool m_message_hook_requested{false};

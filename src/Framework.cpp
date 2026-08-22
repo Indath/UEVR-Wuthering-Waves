@@ -3,6 +3,7 @@
 
 #include <windows.h>
 #include <ShlObj.h>
+#include <DbgHelp.h>
 
 #include <spdlog/sinks/basic_file_sink.h>
 
@@ -18,6 +19,7 @@
 #include "utility/Thread.hpp"
 #include "utility/String.hpp"
 #include "utility/Input.hpp"
+#include "utility/Logging.hpp"
 
 #include "WindowFilter.hpp"
 
@@ -53,6 +55,68 @@ UEVRSharedMemory::UEVRSharedMemory() {
     } else {
         spdlog::error("Failed to map memory!");
     }
+}
+
+void Framework::dump_stalled_process_state() {
+    if (m_stall_dump_written) {
+        return;
+    }
+
+    m_stall_dump_written = true;
+
+    auto dbghelp = LoadLibrary("dbghelp.dll");
+
+    if (!dbghelp) {
+        spdlog::error("[STALL DIAGNOSTIC] Could not load dbghelp.dll, cannot write stall dump");
+        return;
+    }
+
+    const auto final_path = Framework::get_persistent_dir("stall.dmp").string();
+
+    spdlog::error("[STALL DIAGNOSTIC] Hook monitor detected a sustained stall, writing full process dump to {}", final_path);
+
+    auto f = CreateFile(final_path.c_str(),
+        GENERIC_WRITE,
+        FILE_SHARE_WRITE,
+        nullptr,
+        CREATE_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr
+    );
+
+    if (!f || f == INVALID_HANDLE_VALUE) {
+        spdlog::error("[STALL DIAGNOSTIC] Could not create stall dump file");
+        return;
+    }
+
+    auto minidump_write_dump = (decltype(MiniDumpWriteDump)*)GetProcAddress(dbghelp, "MiniDumpWriteDump");
+
+    if (minidump_write_dump == nullptr) {
+        spdlog::error("[STALL DIAGNOSTIC] Could not find MiniDumpWriteDump in dbghelp.dll");
+        CloseHandle(f);
+        return;
+    }
+
+    // No exception pointers here (this is not a crash), but we want full thread contexts/stacks
+    // for every thread in the process so we can see exactly where each one (render/game/RHI) is stuck.
+    const auto dump_flags = (MINIDUMP_TYPE)(MiniDumpNormal | MiniDumpWithThreadInfo);
+
+    const auto success = minidump_write_dump(GetCurrentProcess(),
+        GetCurrentProcessId(),
+        f,
+        dump_flags,
+        nullptr,
+        nullptr,
+        nullptr
+    );
+
+    if (!success) {
+        spdlog::error("[STALL DIAGNOSTIC] MiniDumpWriteDump failed: {:x}", GetLastError());
+    } else {
+        spdlog::error("[STALL DIAGNOSTIC] Stall dump written successfully to {}", final_path);
+    }
+
+    CloseHandle(f);
 }
 
 void Framework::hook_monitor() {
@@ -91,12 +155,69 @@ void Framework::hook_monitor() {
 
     const auto renderer_type = get_renderer_type();
 
+    // Separately detect a hang that occurs while the render thread is still *inside* Present
+    // (e.g. stuck inside a depth texture reallocation call in the RHI chain). The branch below
+    // only watches for time spent *outside* Present, so a hang here would otherwise never be
+    // observed and no stall dump would ever be written.
+    if ((renderer_type == Framework::RendererType::D3D11 && d3d11 != nullptr && d3d11->is_inside_present())
+        || (renderer_type == Framework::RendererType::D3D12 && d3d12 != nullptr && d3d12->is_inside_present()))
+    {
+        const auto present_enter_time = renderer_type == Framework::RendererType::D3D11 ? d3d11->get_present_enter_time() : d3d12->get_present_enter_time();
+
+        if (present_enter_time.time_since_epoch().count() != 0 && m_game_data_initialized && now - present_enter_time >= std::chrono::seconds(15)) {
+            SPDLOG_INFO_EVERY_N_SEC(1, "Framework::hook_monitor(): stuck inside Present for {}ms",
+                std::chrono::duration_cast<std::chrono::milliseconds>(now - present_enter_time).count());
+            dump_stalled_process_state();
+        }
+    }
+
     if (d3d11 == nullptr || d3d12 == nullptr 
         || (renderer_type == Framework::RendererType::D3D11 && d3d11 != nullptr && !d3d11->is_inside_present()) 
         || (renderer_type == Framework::RendererType::D3D12 && d3d12 != nullptr && !d3d12->is_inside_present())) 
     {
         // check if present time is more than 5 seconds ago
         if (now - m_last_present_time >= std::chrono::seconds(5)) {
+            SPDLOG_INFO_EVERY_N_SEC(1, "Framework::hook_monitor(): present stalled for {}ms (has_last_chance={})",
+                std::chrono::duration_cast<std::chrono::milliseconds>(now - m_last_present_time).count(), m_has_last_chance);
+
+            // Present itself has stopped being called for a long time. Regardless of whether this
+            // turns out to be a legitimate loading screen (game thread tick also stalled) or a hang
+            // on the render/RHI thread specifically (e.g. stuck inside depth texture reallocation,
+            // where the game thread may still be ticking fine), capture a full-process minidump
+            // (all threads) once per stall episode so we can inspect exactly where every thread is
+            // actually stuck, since attaching an external debugger is not possible with anti-cheat active.
+            // IMPORTANT: only do this once we've successfully initialized at least once (i.e. Present
+            // has already been hooked and called successfully at least once). Otherwise this branch
+            // also covers the legitimate early-startup window before D3D is even hooked yet (d3d11/d3d12
+            // are still nullptr), which would spuriously fire the dump during completely normal game
+            // bootstrap, before engine threads like RenderThread/RHIThread even exist.
+            if (m_game_data_initialized && now - m_last_present_time >= std::chrono::seconds(15)) {
+                dump_stalled_process_state();
+            }
+
+            // If the engine's game thread tick hasn't run in a while either, this is very likely
+            // a legitimate loading screen / level transition stalling Present, not a dead hook.
+            // Rehooking D3D during this window tears down and recreates the device/swapchain/command
+            // queue for no reason, which can visibly disrupt rendering during the transition.
+            // Give it extra leeway before considering the hook to be actually broken.
+            auto vr = VR::get();
+
+            if (vr != nullptr && vr->is_engine_tick_stalled(std::chrono::milliseconds(5000))) {
+                SPDLOG_INFO_EVERY_N_SEC(1, "Framework::hook_monitor(): engine tick stalled, backing off rehook (loading screen assumed)");
+
+                // IMPORTANT: also push m_last_present_time forward (not just m_last_chance_time),
+                // mirroring the minimized-window case above. Otherwise the engine tick only has to
+                // flicker back to "not stalled" for a single monitor poll (which it does repeatedly
+                // during a real loading screen) to fall through to the last-chance/rehook escalation
+                // below on the very next call, since m_last_present_time would still be stale and
+                // >= 5 seconds old. Resetting it here forces a fresh, full 5-second stall-free window
+                // before we'll even consider escalating again.
+                m_last_present_time = now;
+                m_last_chance_time = now;
+                m_has_last_chance = true;
+                return;
+            }
+
             if (m_has_last_chance) {
                 // the purpose of this is to make sure that the game is not frozen
                 // e.g. if we are debugging the game, so we don't rehook anything on accident
@@ -126,6 +247,7 @@ void Framework::hook_monitor() {
         } else {
             m_last_chance_time = std::chrono::steady_clock::now();
             m_has_last_chance = true;
+            m_stall_dump_written = false;
         }
 
         if (m_initialized && m_wnd != 0 && now - m_last_message_time > std::chrono::seconds(5)) {

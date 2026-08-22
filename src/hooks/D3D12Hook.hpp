@@ -2,6 +2,7 @@
 
 #include <iostream>
 #include <functional>
+#include <chrono>
 
 #pragma comment(lib, "d3d12.lib")
 #pragma comment(lib, "dxgi")
@@ -85,6 +86,10 @@ public:
         return m_inside_present;
     }
 
+    std::chrono::steady_clock::time_point get_present_enter_time() const {
+        return m_present_enter_time;
+    }
+
     bool is_proton_swapchain() const {
         return m_using_proton_swapchain;
     }
@@ -122,6 +127,7 @@ protected:
     bool m_hooked{ false };
     bool m_is_phase_1{ true };
     bool m_inside_present{false};
+    std::chrono::steady_clock::time_point m_present_enter_time{};
     bool m_ignore_next_present{false};
 
     std::unique_ptr<PointerHook> m_present_hook{};

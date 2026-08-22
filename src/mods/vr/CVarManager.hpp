@@ -204,6 +204,13 @@ private:
         std::make_unique<CVarStandard>(L"Renderer", L"r.SSGI.Enable", CVar::Type::BOOL, 0, 1),
         std::make_unique<CVarStandard>(L"Renderer", L"r.Shadow.Virtual.Enable", CVar::Type::BOOL, 0, 1),
         std::make_unique<CVarStandard>(L"Renderer", L"r.TranslucentLightingVolume", CVar::Type::BOOL, 0, 1),
+        // GPUScene (per-instance transform/WPO-relevant data) is normally only re-uploaded for
+        // primitives the engine marks "dirty" against the primary view. If the scene-capture
+        // (mirrored) eye's pass runs out of order relative to the primary view within the same
+        // frame, it can read a stale GPUScene snapshot for primitives that weren't marked dirty
+        // for it, leaving distant WPO-driven animation (wind sway, etc.) frozen for that eye only.
+        // Forcing an upload every frame bypasses that dirty-tracking entirely as a test/fix.
+        std::make_unique<CVarStandard>(L"Renderer", L"r.GPUScene.UploadEveryFrame", CVar::Type::BOOL, 0, 1),
 
         // Ints
         std::make_unique<CVarStandard>(L"Renderer", L"r.DefaultFeature.AntiAliasing", CVar::Type::INT, 0, 2),
