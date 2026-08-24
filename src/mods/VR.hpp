@@ -280,6 +280,10 @@ public:
         return (std::chrono::steady_clock::now() - m_last_engine_tick) > threshold;
     }
 
+    bool is_diag_verbose_logging_enabled() const {
+        return m_diag_verbose_logging;
+    }
+
     bool is_hmd_active() const {
         if (m_disable_vr) {
             return false;
@@ -424,14 +428,50 @@ public:
     }
 
     bool is_using_afr() const {
+        // DIAG: live debug-page toggle to test whether reporting is_using_afr()==false (while
+        // staying in Synchronized rendering mode / VR active) restores normal gamepad UI behavior.
+        if (m_diag_force_afr_off) {
+            return false;
+        }
+
         return m_rendering_method->value() == RenderingMethod::ALTERNATING || 
                m_rendering_method->value() == RenderingMethod::SYNCHRONIZED ||
                m_extreme_compat_mode->value() == true;
     }
 
     bool is_using_synchronized_afr() const {
+        if (m_diag_force_afr_off) {
+            return false;
+        }
+
         return m_rendering_method->value() == RenderingMethod::SYNCHRONIZED ||
                (m_extreme_compat_mode->value() && m_rendering_method->value() == RenderingMethod::NATIVE_STEREO);
+    }
+
+    // When enabled, AdjustViewRect and calculate_stereo_view_offset stop maintaining their own
+    // independent call-scoped eye-parity counters (avr_call_index/offset_call_index) and instead
+    // derive true_index directly from the SAME frame-parity source the D3D11/D3D12 compositor uses
+    // (m_render_frame_count % 2 == m_left_eye_interval). This eliminates a desync between the render
+    // hooks and the compositor that was the root cause of both incorrect 2D-screen/desktop-spectator
+    // UI scaling and lost native gamepad UI confirm/navigation input in Synchronized Sequential mode.
+    //
+    // Confirmed via testing: unifying eye-parity this way breaks true stereoscopic VR rendering
+    // (the right eye intermittently goes black and stops tracking the HMD), because the compositor's
+    // m_render_frame_count parity is not a safe substitute for the render hooks' own call-scoped
+    // alternation in real stereo rendering. It DOES work correctly for the 2D-screen (non-stereo)
+    // rendering path, so it is hard-restricted to only take effect while is_using_2d_screen() is true,
+    // regardless of the option's value, to guarantee it can never affect true stereo VR rendering.
+    bool is_unified_frame_parity_enabled() const {
+        return m_unify_afr_frame_parity->value() && is_using_2d_screen();
+    }
+
+    // Returns 0 for the left eye, 1 for the right eye, using the compositor's own frame-parity source.
+    uint32_t get_unified_true_index() const {
+        return (uint32_t)(m_render_frame_count % 2 == m_left_eye_interval ? 0 : 1);
+    }
+
+    bool is_synced_forced_second_draw_disabled() const {
+        return m_diag_disable_forced_second_draw;
     }
 
     SynchronizeStage get_synchronize_stage() {
@@ -561,6 +601,17 @@ public:
     }
 
     bool is_native_stereo_fix_enabled() const {
+        // Native Stereo Fix's scene-capture/compositing path was previously gated to only ever run
+        // when NOT using AFR/Synchronized-Sequential rendering. Testing showed that this scene-capture
+        // path is actually what keeps the 2D-screen UI scaled correctly to the desktop resolution AND
+        // keeps gamepad confirm/navigation input working (both were broken in Synced Sequential without
+        // it - the UI was rendered at HMD resolution and Slate's hit-testing/focus no longer lined up
+        // with what was drawn on screen). Allow it to run even while is_using_afr() is true when this
+        // option is enabled.
+        if (m_native_stereo_fix_allow_with_afr->value()) {
+            return m_native_stereo_fix->value() && !m_native_stereo_fix_suspended.load(std::memory_order_relaxed);
+        }
+
         return m_native_stereo_fix->value() && !is_using_afr() && !m_native_stereo_fix_suspended.load(std::memory_order_relaxed);
     }
 
@@ -929,6 +980,7 @@ private:
 
     const ModCombo::Ptr m_rendering_method{ ModCombo::create(generate_name("RenderingMethod"), s_rendering_method_names) };
     const ModCombo::Ptr m_synced_afr_method{ ModCombo::create(generate_name("SyncedSequentialMethod"), s_synced_afr_method_names, 1) };
+
     const ModToggle::Ptr m_extreme_compat_mode{ ModToggle::create(generate_name("ExtremeCompatibilityMode"), false, true) };
     const ModToggle::Ptr m_uncap_framerate{ ModToggle::create(generate_name("UncapFramerate"), true) };
     const ModToggle::Ptr m_disable_blur_widgets{ ModToggle::create(generate_name("DisableBlurWidgets"), true) };
@@ -1002,6 +1054,17 @@ private:
     const ModToggle::Ptr m_native_stereo_fix{ ModToggle::create(generate_name("NativeStereoFix"), false) };
     const ModToggle::Ptr m_native_stereo_fix_same_pass{ ModToggle::create(generate_name("NativeStereoFixSamePass"), true) };
     const ModToggle::Ptr m_native_stereo_fix_mirror{ ModToggle::create(generate_name("NativeStereoFixMirror"), false) };
+    // Allows Native Stereo Fix's scene-capture/compositing path (normally exclusive to non-AFR
+    // rendering) to also run while Alternate-Frame-Rendering / Synchronized Sequential mode is active.
+    // Confirmed to fix both incorrect 2D-screen UI scale (previously locked to HMD resolution) and
+    // loss of native gamepad UI confirm/navigation input in Synchronized Sequential mode.
+    const ModToggle::Ptr m_native_stereo_fix_allow_with_afr{ ModToggle::create(generate_name("NativeStereoFixAllowWithAFR"), false) };
+    // Unifies AFR/Synchronized-Sequential eye-parity computation in AdjustViewRect and
+    // calculate_stereo_view_offset with the D3D11/D3D12 compositor's own frame-parity source, fixing
+    // incorrect 2D-screen/desktop-spectator UI scaling and loss of native gamepad UI confirm/navigation
+    // input in Synchronized Sequential mode. Automatically restricted to 2D-screen mode only; has no
+    // effect on true stereoscopic VR rendering (see is_unified_frame_parity_enabled()).
+    const ModToggle::Ptr m_unify_afr_frame_parity{ ModToggle::create(generate_name("UnifyAFRFrameParity"), false) };
     const ModToggle::Ptr m_disable_loading_guards{ ModToggle::create(generate_name("DisableLoadingGuards"), false) };
 
     const ModSlider::Ptr m_custom_z_near{ ModSlider::create(generate_name("CustomZNear"), 0.001f, 100.0f, 0.01f, true) };
@@ -1029,6 +1092,9 @@ private:
     const ModKey::Ptr m_keybind_toggle_2d_screen{ ModKey::create(generate_name("Toggle2DScreenKey")) };
     const ModKey::Ptr m_keybind_disable_vr{ ModKey::create(generate_name("DisableVRKey")) };
     bool m_disable_vr{false}; // definitely should not be persistent
+    bool m_diag_force_afr_off{false}; // definitely should not be persistent
+    bool m_diag_disable_forced_second_draw{false}; // definitely should not be persistent
+    bool m_diag_verbose_logging{false}; // gates high-frequency [DIAG]/[diag] debug logs added while investigating Synced Sequential issues; definitely should not be persistent
 
     const ModKey::Ptr m_keybind_toggle_gui{ ModKey::create(generate_name("ToggleSlateGUIKey")) };
     
@@ -1122,6 +1188,8 @@ public:
             *m_native_stereo_fix,
             *m_native_stereo_fix_same_pass,
             *m_native_stereo_fix_mirror,
+            *m_native_stereo_fix_allow_with_afr,
+            *m_unify_afr_frame_parity,
             *m_disable_loading_guards,
             *m_splitscreen_compatibility_mode,
             *m_splitscreen_view_index,

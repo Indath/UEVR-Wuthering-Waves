@@ -215,6 +215,13 @@ void Framework::hook_monitor() {
                 m_last_present_time = now;
                 m_last_chance_time = now;
                 m_has_last_chance = true;
+
+                // IMPORTANT: also reset ALL message-hook timestamps used in the outer trigger condition
+                // (line 253). Otherwise the message-hook escalation can fire immediately on the next poll
+                // if the stall signal transiently flips, defeating the stall backoff protection.
+                m_last_message_time = now;
+                m_last_sendmessage_time = now;
+
                 return;
             }
 

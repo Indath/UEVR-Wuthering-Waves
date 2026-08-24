@@ -110,6 +110,130 @@ local function dump_instances(class_name, max_count)
 	end
 end
 
+-- For every live instance of the given class (expected: LGUIEventSystem), calls
+-- GetCurrentInputModule() and dumps the returned object's class full name (plus its
+-- own full name). This is the actual runtime input-module type (e.g. a specific
+-- LGUIPointerInputModule/GamepadInputModule subclass) that each event system is
+-- currently using, which is the key signal for diffing native-stereo vs SS/2D input.
+local function dump_current_input_module_class(class_name)
+	local klass = api:find_uobject(class_name)
+	if klass == nil then
+		log(string.format("Class not found: %s", class_name))
+		return
+	end
+
+	log(string.format("---- GetCurrentInputModule() on instances of %s ----", class_name))
+
+	local ok, err = pcall(function()
+		local objs = klass:get_objects_matching(false)
+		for i, obj in ipairs(objs) do
+			local ok_name, obj_name = pcall(function() return obj:get_full_name() end)
+			local ok_mod, mod = pcall(function() return obj:GetCurrentInputModule() end)
+			if ok_mod and mod ~= nil then
+				local ok_cls, cls_name = pcall(function() return mod:get_class():get_full_name() end)
+				local ok_full, mod_full = pcall(function() return mod:get_full_name() end)
+				log(string.format("  sys[%d]=%s input_module_class=%s input_module=%s", i,
+					ok_name and obj_name or "?",
+					ok_cls and cls_name or "?",
+					ok_full and mod_full or "?"))
+			else
+				log(string.format("  sys[%d]=%s input_module=nil (ok_mod=%s)", i,
+					ok_name and obj_name or "?", tostring(ok_mod)))
+			end
+		end
+	end)
+
+	if not ok then
+		log(string.format("  (enumeration failed: %s)", tostring(err)))
+	end
+end
+
+-- CAMERA-REFERENCE PROBE: walks every ObjectProperty on the given class, reads its
+-- LIVE value off a real instance, and if that value resolves to a UObject, logs the
+-- runtime class of that referenced object plus whether it looks camera-related
+-- (CameraComponent/PlayerCameraManager/CameraActor/etc). This is how we find which
+-- specific property LGUI's raycast/hit-test math actually reads its camera from,
+-- since that's not discoverable from static reflection metadata alone (FProperty's
+-- get_property_class() isn't exposed to Lua) - we have to inspect a live value.
+local CAMERA_CLASS_HINTS = {
+	"CameraComponent", "PlayerCameraManager", "CameraActor", "SceneComponent",
+	"CineCameraComponent", "Camera",
+}
+
+local function looks_camera_related(cls_full_name)
+	if cls_full_name == nil then
+		return false
+	end
+	for _, hint in ipairs(CAMERA_CLASS_HINTS) do
+		if cls_full_name:find(hint, 1, true) then
+			return true
+		end
+	end
+	return false
+end
+
+local function dump_object_property_values(class_name, instance_count)
+	local klass = api:find_uobject(class_name)
+	if klass == nil then
+		log(string.format("Class not found: %s", class_name))
+		return
+	end
+
+	log(string.format("---- Live ObjectProperty values on instances of %s ----", class_name))
+
+	local ok, err = pcall(function()
+		-- Collect property names once from the class's reflection data.
+		local prop_names = {}
+		local prop = klass:get_child_properties()
+		while prop ~= nil do
+			local ok2, name = pcall(function() return prop:get_fname():to_string() end)
+			local ok3, cls_name = pcall(function() return prop:get_class():get_fname():to_string() end)
+			if ok2 and ok3 and (cls_name == "ObjectProperty" or cls_name == "WeakObjectProperty"
+				or cls_name == "SoftObjectProperty" or cls_name == "InterfaceProperty") then
+				table.insert(prop_names, name)
+			end
+			prop = prop:get_next()
+		end
+
+		if #prop_names == 0 then
+			log("  (no ObjectProperty-like fields found via reflection)")
+		end
+
+		local objs = klass:get_objects_matching(false)
+		local count = 0
+		for i, obj in ipairs(objs) do
+			count = count + 1
+			if instance_count and count > instance_count then
+				break
+			end
+
+			local ok_name, obj_name = pcall(function() return obj:get_full_name() end)
+			log(string.format("  instance[%d]: %s", i, ok_name and obj_name or "?"))
+
+			for _, pname in ipairs(prop_names) do
+				local ok_val, val = pcall(function() return obj[pname] end)
+				if ok_val and val ~= nil then
+					local ok_cls, cls_full = pcall(function() return val:get_class():get_full_name() end)
+					local ok_full, val_full = pcall(function() return val:get_full_name() end)
+					local is_camera = ok_cls and looks_camera_related(cls_full)
+					log(string.format("    prop %s = %s (class: %s)%s", pname,
+						ok_full and val_full or "?",
+						ok_cls and cls_full or "?",
+						is_camera and "  <-- CAMERA-RELATED CANDIDATE" or ""))
+				elseif ok_val and val == nil then
+					log(string.format("    prop %s = nil", pname))
+				else
+					log(string.format("    prop %s = (read failed)", pname))
+				end
+			end
+		end
+	end)
+
+	if not ok then
+		log(string.format("  (dump_object_property_values failed: %s)", tostring(err)))
+	end
+end
+
 -- Dumps the parameter names/types of a specific UFunction (UFunction is itself
 -- a UStruct, so get_child_properties() works the same way as on a class).
 local function dump_function_params(class_name, function_name)
@@ -212,8 +336,27 @@ function OnUIFocusDumpTick()
 	dump_function_params("Class /Script/LGUI.LGUIEventSystem", "InputNavigationUp")
 	dump_function_params("Class /Script/LGUI.LGUIEventSystem", "InputNavigationDown")
 	dump_function_params("Class /Script/LGUI.LGUIEventSystem", "IsNavigationActive")
+	dump_function_params("Class /Script/LGUI.LGUIEventSystem", "Navigate")
+	dump_function_params("Class /Script/LGUI.LGUIEventSystem", "GetCurrentInputModule")
+	dump_function_params("Class /Script/LGUI.LGUIEventSystem", "ClearEvent")
+	dump_function_params("Class /Script/LGUI.UIItem", "GetPositionInViewPort")
+	dump_function_params("Class /Script/LGUI.UIItem", "GetUIWorldPosition")
 
 	dump_instances("Class /Script/LGUI.LGUIEventSystem", 5)
+
+	-- Dump the actual runtime GetCurrentInputModule() class for each live
+	-- LGUIEventSystem instance, to compare native-stereo vs SS/2D input modules.
+	dump_current_input_module_class("Class /Script/LGUI.LGUIEventSystem")
+
+	-- CAMERA-REFERENCE PROBE: for each class that plausibly performs/owns the
+	-- raycast/hit-test math, dump the live value of every ObjectProperty-like
+	-- field on real instances so we can spot the actual camera reference used
+	-- for menu hit-testing (as opposed to the live HMD render pose).
+	dump_object_property_values("Class /Script/LGUI.LGUIBaseRaycaster", 5)
+	dump_object_property_values("Class /Script/LGUI.LGUIScreenSpaceInteraction", 5)
+	dump_object_property_values("Class /Script/LGUI.LGUICanvas", 5)
+	dump_object_property_values("Class /Script/LGUI.LGUIEventSystem", 5)
+	dump_object_property_values("Class /Script/LGUI.UIItem", 3)
 
 	log("Dump complete.")
 end

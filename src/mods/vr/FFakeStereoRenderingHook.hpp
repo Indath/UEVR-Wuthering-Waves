@@ -459,6 +459,17 @@ public:
         return m_ignore_next_viewport_draw;
     }
 
+    // True only while inside the UEVR-forced, manually re-invoked second FViewport::Draw call
+    // used by Synchronized Sequential mode to draw the second eye within the same engine tick.
+    // FViewport::Draw is also where the engine polls/pumps input devices, so this second forced
+    // call causes a single physical button press to be seen as two separate input frames by the
+    // engine's own input processing (e.g. UMG/Slate gamepad navigation), unlike Native Stereo
+    // which only calls Draw once per tick. Consumers (e.g. XInputHook) can check this to avoid
+    // re-dispatching the same input state as if it were a new frame during this forced redraw.
+    bool is_in_synced_forced_viewport_draw() const {
+        return m_in_synced_forced_viewport_draw;
+    }
+
     auto& get_last_pre_rotation() {
         return m_last_pre_rotation;
     }
@@ -658,6 +669,7 @@ private:
     bool m_in_engine_tick{false};
     bool m_in_viewport_client_draw{false};
     bool m_was_in_viewport_client_draw{false}; // for IsStereoEnabled
+    bool m_in_synced_forced_viewport_draw{false};
     bool m_ignore_next_viewport_draw{false};
     bool m_ignore_next_engine_tick{false};
     void* m_last_destroyed_viewport{nullptr}; // used to check if the viewport is destroyed when we call FViewport::Draw again

@@ -2577,8 +2577,33 @@ void FFakeStereoRenderingHook::game_viewport_client_draw_hook(sdk::UGameViewport
                     return;
                 }
 
-                const auto viewport_draw = (void (*)(void*, bool))g_hook->m_viewport_draw_hook.target();
-                viewport_draw(viewport, true);
+                // Route the forced second-eye draw through our own viewport_draw_hook (instead of
+                // calling the raw original trampoline directly) so it goes through the exact same
+                // gating/state updates as the primary draw call (m_ignore_next_viewport_draw,
+                // is_hmd_active() check, m_last_viewport_vtable update, etc). Calling the raw
+                // trampoline directly skipped all of that, meaning the primary and forced draws
+                // were running through subtly different code paths every tick in Synchronized
+                // Sequential mode - a plausible cause of the UI focus/hover instability (menu
+                // items highlight/flicker but don't confirm) reported only in that mode.
+                const auto viewport_draw = [](void* vp, bool present) {
+                    FFakeStereoRenderingHook::viewport_draw_hook(vp, present);
+                };
+
+                // LIVE DIAGNOSTIC TOGGLE (VR mod menu -> "DIAG_DisableForcedSecondDraw"): lets us
+                // A/B test with the forced second-eye draw fully disabled, without rebuilding.
+                // Screen will look broken (one eye won't update) while enabled for testing.
+                if (!vr->is_synced_forced_second_draw_disabled()) {
+                    // Mark that we're inside the manually-forced second FViewport::Draw call used to
+                    // draw the second eye within the same engine tick for Synchronized Sequential mode.
+                    // FViewport::Draw is also where the engine polls/pumps input devices, so calling it
+                    // twice per tick causes a single physical button press to be seen as two separate
+                    // input frames by the engine's own input processing. Input-facing hooks (e.g.
+                    // XInputHook) check this flag to avoid re-dispatching the same input state as if it
+                    // were a new frame during this forced redraw.
+                    g_hook->m_in_synced_forced_viewport_draw = true;
+                    viewport_draw(viewport, true);
+                    g_hook->m_in_synced_forced_viewport_draw = false;
+                }
 
                 auto& vr = VR::get();
                 const auto method = vr->get_synced_sequential_method();
@@ -3471,8 +3496,10 @@ void FFakeStereoRenderingHook::begin_render_viewfamily_real(
         const bool should_suspend = tick_stalled || no_player_controller || no_local_pawn || boot_phase || world_stale;
 
         if (should_suspend != vr->is_native_stereo_fix_suspended()) {
-            SPDLOG_INFO("[VR] begin_render_viewfamily_real: {} Native Stereo Fix (tick_stalled={} no_player_controller={} no_local_pawn={} boot_phase={} world_stale={})",
-                should_suspend ? "suspending" : "resuming", tick_stalled, no_player_controller, no_local_pawn, boot_phase, world_stale);
+            if (vr->is_diag_verbose_logging_enabled()) {
+                SPDLOG_INFO("[VR] begin_render_viewfamily_real: {} Native Stereo Fix (tick_stalled={} no_player_controller={} no_local_pawn={} boot_phase={} world_stale={})",
+                    should_suspend ? "suspending" : "resuming", tick_stalled, no_player_controller, no_local_pawn, boot_phase, world_stale);
+            }
             vr->set_native_stereo_fix_suspended(should_suspend);
 
             if (should_suspend) {
@@ -5130,17 +5157,26 @@ void FFakeStereoRenderingHook::adjust_view_rect(FFakeStereoRendering* stereo, in
     // leaving the other half permanently black. Mirror the same call-scoped alternator used in
     // calculate_stereo_view_offset so this function's eye classification stays in sync with it.
     if (VR::get()->is_using_afr()) {
-        static uint32_t last_avr_frame_count = 0;
-        static uint32_t avr_call_index = 0;
+        if (VR::get()->is_unified_frame_parity_enabled()) {
+            // DIAG: derive true_index from the same frame-parity source the compositor uses
+            // (m_render_frame_count % 2 == m_left_eye_interval) instead of this function's own
+            // independent call-scoped avr_call_index/g_frame_count alternator, to test whether the
+            // two trackers falling out of phase with each other is contributing to the input/UI
+            // desync seen with Native Stereo Fix disabled under AFR.
+            true_index = VR::get()->get_unified_true_index();
+        } else {
+            static uint32_t last_avr_frame_count = 0;
+            static uint32_t avr_call_index = 0;
 
-        if (last_avr_frame_count != g_frame_count || avr_call_index > 1) {
-            avr_call_index = 0;
+            if (last_avr_frame_count != g_frame_count || avr_call_index > 1) {
+                avr_call_index = 0;
+            }
+
+            last_avr_frame_count = g_frame_count;
+
+            true_index = (g_frame_count + avr_call_index) % 2;
+            ++avr_call_index;
         }
-
-        last_avr_frame_count = g_frame_count;
-
-        true_index = (g_frame_count + avr_call_index) % 2;
-        ++avr_call_index;
     }
 
     if (!VR::get()->is_native_stereo_fix_enabled()) {
@@ -5208,6 +5244,12 @@ __forceinline void FFakeStereoRenderingHook::calculate_stereo_view_offset(
     }
 
     auto vr = VR::get();
+
+    if (vr == nullptr) {
+        SPDLOG_INFO_ONCE("calculate stereo view offset called but VR is not initialized, ignoring.");
+        return;
+    }
+
     //std::scoped_lock _{vr->get_vr_mutex()};
 
     static bool index_starts_from_one = true;
@@ -5251,17 +5293,23 @@ __forceinline void FFakeStereoRenderingHook::calculate_stereo_view_offset(
         // (mirroring the same pattern used in sceneview_constructor) that increments on every
         // call within an unchanged g_frame_count, so consecutive calls still alternate eyes even
         // if the underlying frame counter hasn't advanced.
-        static uint32_t last_offset_frame_count = 0;
-        static uint32_t offset_call_index = 0;
+        if (vr->is_unified_frame_parity_enabled()) {
+            // DIAG: derive true_index from the same frame-parity source the compositor uses
+            // (m_render_frame_count % 2 == m_left_eye_interval), see AdjustViewRect for rationale.
+            true_index = vr->get_unified_true_index();
+        } else {
+            static uint32_t last_offset_frame_count = 0;
+            static uint32_t offset_call_index = 0;
 
-        if (last_offset_frame_count != g_frame_count || offset_call_index > 1) {
-            offset_call_index = 0;
+            if (last_offset_frame_count != g_frame_count || offset_call_index > 1) {
+                offset_call_index = 0;
+            }
+
+            last_offset_frame_count = g_frame_count;
+
+            true_index = (g_frame_count + offset_call_index) % 2;
+            ++offset_call_index;
         }
-
-        last_offset_frame_count = g_frame_count;
-
-        true_index = (g_frame_count + offset_call_index) % 2;
-        ++offset_call_index;
 
         if (!vr->is_using_synchronized_afr()) {
             if (g_hook->m_has_double_precision) {
@@ -5335,7 +5383,7 @@ __forceinline void FFakeStereoRenderingHook::calculate_stereo_view_offset(
             diag_last_right_call_index = diag_stereo_offset_count;
         }
 
-        if (diag_stereo_offset_count <= 20 || diag_stereo_offset_count % 301 == 1) {
+        if (vr->is_diag_verbose_logging_enabled() && (diag_stereo_offset_count <= 20 || diag_stereo_offset_count % 301 == 1)) {
             SPDLOG_INFO("[DIAG] calculate_stereo_view_offset (#{}): view_index={} true_index={} is_full_pass={} is_using_afr={} g_frame_count={} index_starts_from_one={} vr_frame_count={} vr_left_interval={} vr_right_interval={} left_calls={} right_calls={} last_left_call=#{} last_right_call=#{}",
                 diag_stereo_offset_count, view_index, true_index, is_full_pass, vr->is_using_afr(), g_frame_count, index_starts_from_one,
                 vr->m_render_frame_count, vr->m_left_eye_interval, vr->m_right_eye_interval,
@@ -5347,8 +5395,10 @@ __forceinline void FFakeStereoRenderingHook::calculate_stereo_view_offset(
         // windows above. If "left_calls" is ever seen to stop advancing across two consecutive
         // heartbeats while "right_calls" keeps advancing, the engine has stopped requesting a
         // left-eye camera pass entirely - proving the root cause is upstream of any of our hooks.
-        SPDLOG_INFO_EVERY_N_SEC(3, "[DIAG] calculate_stereo_view_offset heartbeat: left_calls={} right_calls={} last_left_call=#{} last_right_call=#{} is_using_afr={}",
-            diag_left_calls, diag_right_calls, diag_last_left_call_index, diag_last_right_call_index, vr->is_using_afr());
+        if (vr->is_diag_verbose_logging_enabled()) {
+            SPDLOG_INFO_EVERY_N_SEC(3, "[DIAG] calculate_stereo_view_offset heartbeat: left_calls={} right_calls={} last_left_call=#{} last_right_call=#{} is_using_afr={}",
+                diag_left_calls, diag_right_calls, diag_last_left_call_index, diag_last_right_call_index, vr->is_using_afr());
+        }
     }
 
     /*if (view_index % 2 == 1 && VR::get()->get_synchronize_stage() == VR::SynchronizeStage::EARLY) {
@@ -5467,18 +5517,24 @@ __forceinline void FFakeStereoRenderingHook::calculate_stereo_view_offset(
         const auto head_offset_flat = quat_converter * (vqi_norm * (pos_flat * world_scale));
         const auto eye_separation = quat_converter * (glm::normalize(new_rotation) * (eye_offset * world_scale));
 
+        // DIAGNOSTIC: confirm whether this hook (and the is_2d_screen guard around
+        // head_offset/eye_separation) is actually reached, and with what values, when
+        // testing 2D-screen-mode UI interaction. Rate-limited to avoid log spam.
+        SPDLOG_INFO_EVERY_N_SEC(2, "[VR][diag] calculate_stereo_view_offset: is_2d_screen={} is_using_afr={} true_index={} eye_separation=({:.3f},{:.3f},{:.3f}) head_offset=({:.3f},{:.3f},{:.3f})",
+            is_2d_screen, vr->is_using_afr(), true_index,
+            eye_separation.x, eye_separation.y, eye_separation.z,
+            head_offset.x, head_offset.y, head_offset.z);
+
         if (!has_double_precision) {
             if (!is_2d_screen) {
                 *view_location -= head_offset;
+                *view_location -= eye_separation;
             }
-
-            *view_location -= eye_separation;
         } else {
             if (!is_2d_screen) {
                 *view_d -= head_offset;
+                *view_d -= eye_separation;
             }
-
-            *view_d -= eye_separation;
         }
 
         if (!is_2d_screen) {

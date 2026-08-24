@@ -1375,7 +1375,7 @@ void VR::on_pre_engine_tick(sdk::UGameEngine* engine, float delta) {
     {
         static auto last_heartbeat = std::chrono::steady_clock::time_point{};
         const auto now = std::chrono::steady_clock::now();
-        if (now - last_heartbeat >= std::chrono::seconds(1)) {
+        if (m_diag_verbose_logging && now - last_heartbeat >= std::chrono::seconds(1)) {
             last_heartbeat = now;
             SPDLOG_INFO("[VR] on_pre_engine_tick heartbeat (engine={})", (void*)engine);
         }
@@ -2485,6 +2485,14 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
             if (ImGui::IsItemHovered()) {
                 ImGui::SetTooltip("Skips spawning the scene-capture actor entirely. The right eye is\njust a flat mirror of the left/game view (no stereoscopic depth).\nUse this as a stable fallback if the scene capture is causing\nstuck loading screens during level transitions.");
             }
+            m_native_stereo_fix_allow_with_afr->draw("Allow While Using AFR/Synchronized Sequential");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Normally Native Stereo Fix only runs when NOT using AFR/Synchronized\nSequential rendering. Enabling this allows it to also run in those modes.\nFixes 2D-screen UI being scaled to HMD resolution instead of the desktop\nresolution, and the resulting loss of native gamepad UI confirm/navigation\ninput, in Synchronized Sequential mode.");
+            }
+            m_unify_afr_frame_parity->draw("Unify AFR Eye-Parity With Compositor (2D Screen)");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Makes AdjustViewRect/calculate_stereo_view_offset derive which eye is\ncurrently being rendered from the SAME frame-parity source the D3D11/D3D12\ncompositor uses, instead of each hook maintaining its own independent\ncounter. Fixes UI scaling/interaction issues AND desktop-spectator/TV\nscreen output in Synchronized Sequential 2D-screen mode. Automatically has\nno effect outside of 2D-screen mode, since it was found to break true\nstereoscopic VR rendering (right-eye black/flicker, lost HMD tracking).");
+            }
             m_disable_loading_guards->draw("Disable Loading Guards (A/B testing)");
             if (ImGui::IsItemHovered()) {
                 ImGui::SetTooltip("Bypasses all loading-screen/level-transition detection heuristics\n(tick-stall, missing player controller/pawn, boot-phase) used to gate\nscene capture creation. Use this to test whether these heuristics are\ncontributing to a stuck loading screen.");
@@ -2718,6 +2726,9 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
         ImGui::Checkbox("Disable Backbuffer Size Override", &m_disable_backbuffer_size_override);
         ImGui::Checkbox("Disable VR Overlay", &m_disable_overlay);
         ImGui::Checkbox("Disable VR Entirely", &m_disable_vr);
+        ImGui::Checkbox("DIAG: Force is_using_afr() off", &m_diag_force_afr_off);
+        ImGui::Checkbox("DIAG: Disable forced 2nd-eye draw", &m_diag_disable_forced_second_draw);
+        ImGui::Checkbox("DIAG: Verbose Sync/Stall Logging", &m_diag_verbose_logging);
         ImGui::Checkbox("Stereo Emulation Mode", &m_stereo_emulation_mode);
         ImGui::Checkbox("Wait for Present", &m_wait_for_present);
         m_controllers_allowed->draw("Controllers allowed");

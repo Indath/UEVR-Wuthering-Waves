@@ -8,6 +8,49 @@
 #include "Framework.hpp"
 #include "Mods.hpp"
 #include "XInputHook.hpp"
+#include "../mods/VR.hpp"
+
+namespace detail {
+// DIAGNOSTIC: dump the raw wButtons bitmask exactly as returned by the real XInputGetState,
+// before any mod (Lua, LGUI routing, etc.) has a chance to touch it. Correlated with VR's
+// synced/AFR mode so we can determine whether A/B/X/Y bits ever arrive at the OS-hook level
+// during Synchronized Sequential mode, or whether they are already missing at this point.
+void log_raw_xinput_diag(const char* tag, uint32_t user_index, uint32_t ret, const XINPUT_STATE* state) {
+    if (ret != ERROR_SUCCESS || state == nullptr) {
+        return;
+    }
+
+    static WORD last_buttons[4]{};
+
+    const auto buttons = state->Gamepad.wButtons;
+
+    if (user_index < 4 && buttons == last_buttons[user_index]) {
+        return;
+    }
+
+    if (user_index < 4) {
+        last_buttons[user_index] = buttons;
+    }
+
+    auto& vr = VR::get();
+
+    if (!vr->is_diag_verbose_logging_enabled()) {
+        return;
+    }
+
+    SPDLOG_INFO("[XInput][diag] {} user_index={} wButtons=0x{:04x} A={} B={} X={} Y={} DUP={} DDOWN={} DLEFT={} DRIGHT={} is_using_afr={} is_using_synchronized_afr={} is_using_2d_screen={} is_hmd_active={}",
+        tag, user_index, buttons,
+        (buttons & XINPUT_GAMEPAD_A) != 0,
+        (buttons & XINPUT_GAMEPAD_B) != 0,
+        (buttons & XINPUT_GAMEPAD_X) != 0,
+        (buttons & XINPUT_GAMEPAD_Y) != 0,
+        (buttons & XINPUT_GAMEPAD_DPAD_UP) != 0,
+        (buttons & XINPUT_GAMEPAD_DPAD_DOWN) != 0,
+        (buttons & XINPUT_GAMEPAD_DPAD_LEFT) != 0,
+        (buttons & XINPUT_GAMEPAD_DPAD_RIGHT) != 0,
+        vr->is_using_afr(), vr->is_using_synchronized_afr(), vr->is_using_2d_screen(), vr->is_hmd_active());
+}
+}
 
 XInputHook* g_hook{nullptr};
 
@@ -213,7 +256,40 @@ uint32_t XInputHook::get_state_hook_1_4(uint32_t user_index, XINPUT_STATE* state
         return g_hook->m_xinput_1_4_get_state_hook.call<uint32_t>(user_index, state);
     }
 
+    // Native Stereo only calls FViewport::Draw (which is where the engine polls/pumps input)
+    // once per engine tick. Synchronized Sequential manually re-invokes FViewport::Draw a
+    // second time per tick to draw the second eye, which re-enters this hook for what is
+    // logically the same input frame. Re-polling the physical controller a second time can
+    // return a subtly different state (a button released/pressed a few ms later), which makes
+    // a single physical press look like a press/release/press transition to the engine's own
+    // edge-triggered input handling (e.g. UI confirm/back), even though mods are only
+    // dispatched once. To keep behavior identical to Native Stereo, replay the exact cached
+    // state from the primary poll during the forced second pass instead of re-polling.
+    auto& vr = VR::get();
+    const auto is_forced_second_pass = user_index < XUSER_MAX_COUNT
+        && [&]() {
+            auto& stereo_hook = vr->get_fake_stereo_hook();
+            return stereo_hook != nullptr && stereo_hook->is_in_synced_forced_viewport_draw();
+        }();
+
+    if (is_forced_second_pass && g_hook->s_has_cached_state_1_4[user_index]) {
+        *state = g_hook->s_cached_state_1_4[user_index];
+        return g_hook->s_cached_ret_1_4[user_index];
+    }
+
     auto ret = g_hook->m_xinput_1_4_get_state_hook.call<uint32_t>(user_index, state);
+
+    detail::log_raw_xinput_diag("get_state_1_4", user_index, ret, state);
+
+    if (user_index < XUSER_MAX_COUNT && !is_forced_second_pass) {
+        g_hook->s_cached_state_1_4[user_index] = *state;
+        g_hook->s_cached_ret_1_4[user_index] = ret;
+        g_hook->s_has_cached_state_1_4[user_index] = true;
+    }
+
+    if (is_forced_second_pass) {
+        return ret;
+    }
 
     const auto& mods = g_framework->get_mods()->get_mods();
 
@@ -245,7 +321,32 @@ uint32_t XInputHook::get_state_hook_1_3(uint32_t user_index, XINPUT_STATE* state
         return g_hook->m_xinput_1_3_get_state_hook.call<uint32_t>(user_index, state);
     }
 
+    // See comment in get_state_hook_1_4 for why the forced second draw pass replays cached state.
+    auto& vr = VR::get();
+    const auto is_forced_second_pass = user_index < XUSER_MAX_COUNT
+        && [&]() {
+            auto& stereo_hook = vr->get_fake_stereo_hook();
+            return stereo_hook != nullptr && stereo_hook->is_in_synced_forced_viewport_draw();
+        }();
+
+    if (is_forced_second_pass && g_hook->s_has_cached_state_1_3[user_index]) {
+        *state = g_hook->s_cached_state_1_3[user_index];
+        return g_hook->s_cached_ret_1_3[user_index];
+    }
+
     auto ret = g_hook->m_xinput_1_3_get_state_hook.call<uint32_t>(user_index, state);
+
+    detail::log_raw_xinput_diag("get_state_1_3", user_index, ret, state);
+
+    if (user_index < XUSER_MAX_COUNT && !is_forced_second_pass) {
+        g_hook->s_cached_state_1_3[user_index] = *state;
+        g_hook->s_cached_ret_1_3[user_index] = ret;
+        g_hook->s_has_cached_state_1_3[user_index] = true;
+    }
+
+    if (is_forced_second_pass) {
+        return ret;
+    }
 
     const auto& mods = g_framework->get_mods()->get_mods();
 

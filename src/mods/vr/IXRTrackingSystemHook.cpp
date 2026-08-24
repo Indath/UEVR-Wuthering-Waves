@@ -1809,7 +1809,27 @@ void IXRTrackingSystemHook::process_view_rotation(
 
     auto& vr = VR::get();
 
+    // DIAGNOSTIC: confirm whether this hook (the actual APlayerCameraManager::ProcessViewRotation
+    // hook that feeds the gameplay-side camera rotation, as opposed to the render-only
+    // calculate_stereo_view_offset hook) is being reached, and whether is_using_2d_screen()
+    // is true here, while testing SS/AFR-2D-mode UI interaction.
+    SPDLOG_INFO_EVERY_N_SEC(2, "[VR][diag] process_view_rotation: is_2d_screen={} is_using_afr={} is_hmd_active={} is_any_aim_method_active={}",
+        vr->is_using_2d_screen(), vr->is_using_afr(), vr->is_hmd_active(), vr->is_any_aim_method_active());
+
     if (!vr->is_hmd_active() || !vr->is_any_aim_method_active()) {
+        call_orig();
+        return;
+    }
+
+    // TARGETED FIX: this hook previously overwrote `rot` with HMD-tracked rotation
+    // unconditionally whenever the HMD was active, with no regard for VR_2DScreenMode.
+    // That meant APlayerCameraManager's real gameplay-side rotation (which native UI
+    // focus/hit-testing reads from) stayed head-tracked even while is_using_2d_screen()
+    // was true, unlike the render-only calculate_stereo_view_offset hook which already
+    // respected this flag. Skip the HMD-driven rotation override here too when in
+    // 2D-screen mode, so gameplay-side camera rotation stays flat/native, matching the
+    // behavior of Native Stereo 2D mode.
+    if (vr->is_using_2d_screen()) {
         call_orig();
         return;
     }
