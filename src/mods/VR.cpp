@@ -2099,7 +2099,7 @@ void VR::on_present() {
     // DIAG: trace whether m_frame_count (sourced from the runtime's internal_render_frame_count)
     // is actually advancing. If it's frozen here, the AFR eye-parity logic downstream
     // (m_render_frame_count, is_left_eye_frame/is_right_eye_frame) can never toggle eyes.
-    {
+    if (is_diag_verbose_logging_enabled()) {
         static uint32_t s_last_diag_present_frame_count = 0xFFFFFFFF;
         if (m_frame_count != s_last_diag_present_frame_count) {
             SPDLOG_INFO("[DIAG] VR::on_present: m_frame_count changed {} -> {} (is_using_afr={})", s_last_diag_present_frame_count, m_frame_count, is_using_afr());
@@ -2242,7 +2242,7 @@ void VR::on_post_present() {
     // DIAG: trace whether m_render_frame_count is actually advancing relative to m_frame_count.
     // is_same_frame==true every single call is the direct upstream cause of the AFR eye-parity
     // check in D3D12Component::on_frame() being permanently stuck on one eye.
-    {
+    if (is_diag_verbose_logging_enabled()) {
         static uint32_t s_last_diag_render_frame_count = 0xFFFFFFFF;
         SPDLOG_INFO_EVERY_N_SEC(2, "[DIAG] VR::on_post_present: m_render_frame_count={} m_frame_count={} is_same_frame={}",
             m_render_frame_count, m_frame_count, is_same_frame);
@@ -2480,7 +2480,24 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
         ImGui::SetNextItemOpen(true, ImGuiCond_::ImGuiCond_Once);
         if (ImGui::TreeNode("Native Stereo Fix")) {
             m_native_stereo_fix->draw("Enabled");
-            m_native_stereo_fix_same_pass->draw("Use Same Stereo Pass");
+            m_native_stereo_fix_right_eye_shadows->draw("Right Eye Shadow Fix");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("While the right eye renders, marks its view as the shadow-owning (primary) eye\nso whole-scene shadows are generated for it. Field offsets are discovered at\nruntime by comparing the two eye views. Camera/projection are untouched, so\nstereo depth is preserved.");
+            }
+            m_native_stereo_fix_same_pass->draw("Use Same Stereo Pass (unstable)");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Legacy approach: hides the view family from the FSceneView constructor and\nforces PRIMARY on the secondary view's init options. Crashes in this game\n(null deref inside the engine). Superseded by Right Eye Shadow Fix.");
+            }
+            m_native_stereo_fix_auto_suspend->draw("Auto-Suspend During Level Transitions");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Automatically turns Native Stereo Fix off while a loading screen / level\ntransition is detected (tick stall, missing pawn/controller, stale world) and\nback on once the world settles - the same as manually toggling it. Untick to\ntest whether the fix is still needed now that the scene capture is no longer\nrooted across LoadMap.");
+            }
+            m_native_stereo_fix_null_pass2_view_state->draw("DIAG: Null View State For Pass 2 (foliage test)");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Renders the right-eye (Pass 2) view with no FSceneViewState: no occlusion or TAA history for that eye. "
+                                  "If distant trees stop freezing in the right eye with this on, shared per-view-state occlusion history is the cause. "
+                                  "Expect aliasing/flicker in the right eye while enabled.");
+            }
             m_native_stereo_fix_mirror->draw("Mirror Right Eye (No Scene Capture)");
             if (ImGui::IsItemHovered()) {
                 ImGui::SetTooltip("Skips spawning the scene-capture actor entirely. The right eye is\njust a flat mirror of the left/game view (no stereoscopic depth).\nUse this as a stable fallback if the scene capture is causing\nstuck loading screens during level transitions.");
@@ -2729,6 +2746,25 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
         ImGui::Checkbox("DIAG: Force is_using_afr() off", &m_diag_force_afr_off);
         ImGui::Checkbox("DIAG: Disable forced 2nd-eye draw", &m_diag_disable_forced_second_draw);
         ImGui::Checkbox("DIAG: Verbose Sync/Stall Logging", &m_diag_verbose_logging);
+        ImGui::Combo("DIAG: NSF Pass2 Frame Count Mode (shadow test)", &m_diag_nsf_pass2_frame_count_mode, "Decrement (default)\0None\0Increment\0");
+        if (ImGui::Button("DIAG: NSF Frame-Diff Logger (capture ~60 frames)")) {
+            m_diag_nsf_frame_diff_logger = true;
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Requires Native Stereo Fix ON. Samples the two eye FSceneViews and the FSceneViewFamily for ~60 frames, then logs "
+                              "dwords that change every frame but are identical in both eyes (per-frame state Pass 2 reads stale, e.g. a wind/time value) "
+                              "and view-family dwords that change every frame. Look for [NSF-DIFF] in the log.");
+        }
+        ImGui::Text("DIAG: NSF Pass2 eye-field bisect (Right Eye Shadow Fix)");
+        for (int i = 0; i < 8; ++i) {
+            if (i > 0) ImGui::SameLine();
+            char label[8]{};
+            snprintf(label, sizeof(label), "F%d", i);
+            ImGui::CheckboxFlags(label, (unsigned int*)&m_diag_nsf_pass2_eye_field_mask, 1u << i);
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Each bit enables flipping one runtime-discovered eye identity field on the\nPass2 view (order as logged by 'sceneview_xref: eye identity fields'). Use to\nisolate which field(s) affect distant foliage culling in the right eye.");
+        }
         ImGui::Checkbox("Stereo Emulation Mode", &m_stereo_emulation_mode);
         ImGui::Checkbox("Wait for Present", &m_wait_for_present);
         m_controllers_allowed->draw("Controllers allowed");

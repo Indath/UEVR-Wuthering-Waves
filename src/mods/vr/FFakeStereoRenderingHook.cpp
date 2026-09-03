@@ -1,10 +1,13 @@
-#define NOMINMAX
+﻿#define NOMINMAX
 
 #include <windows.h>
 #include <winternl.h>
 
 #include <asmjit/asmjit.h>
 #include <future>
+#include <filesystem>
+#include <unordered_map>
+#include <thread>
 
 #include <spdlog/spdlog.h>
 #include <utility/Memory.hpp>
@@ -2624,13 +2627,12 @@ void FFakeStereoRenderingHook::game_viewport_client_draw_hook(sdk::UGameViewport
 }
 
 static std::array<uintptr_t, 50> g_view_extension_vtable{};
+static FSceneViewExtensions* g_engine_view_extensions{nullptr}; // GEngine->ViewExtensions, resolved in setup_view_extensions
 struct SceneViewExtensionAnalyzer;
 
-// Analyzes all of the virtual functions for ISceneViewExtension
-// We create the ISceneViewExtension ourselves and overwrite all of the virtual functions
-// The class will count how many times each virtual is getting called
-// and then when a threshold is reached, it finds the most called one
-// the most called one is IsActiveThisFrame which we need to activate the ISceneViewExtension
+static void diag_dump_engine_view_extensions(sdk::FSceneViewFamily& view_family);
+#include "lgui_anchor_scan.inc"
+
 struct SceneViewExtensionAnalyzer {
     template<int N>
     struct FillVtable {
@@ -3063,6 +3065,168 @@ struct SceneViewExtensionAnalyzer {
     }
 };
 
+// Diagnostic: enumerates every ISceneViewExtension registered in GEngine->ViewExtensions
+// so we can identify which one belongs to the game's UI renderer (e.g. LGUI's FLGUIRenderer)
+static void diag_dump_engine_view_extensions(sdk::FSceneViewFamily& view_family) {
+    static uint32_t call_count = 0;
+    static uint32_t dump_count = 0;
+
+    if (dump_count >= 5 || (call_count++ % 300) != 0) {
+        return;
+    }
+
+    ++dump_count;
+
+    const auto exts = g_engine_view_extensions;
+
+    if (exts == nullptr) {
+        SPDLOG_INFO("[VIEWEXT_DIAG] g_engine_view_extensions is null");
+        return;
+    }
+
+    const auto views = view_family.get_views();
+    const auto rt = view_family.get_render_target();
+
+    SPDLOG_INFO("[VIEWEXT_DIAG] dump #{}: family={:x} rt={:x} views={} exts.data={:x} count={} capacity={} our_vtable={:x} idx(is_active={} begin_render={} pre_render_rt={})",
+        dump_count, (uintptr_t)&view_family, (uintptr_t)rt, views != nullptr ? views->count : -1,
+        (uintptr_t)exts->extensions.data, exts->extensions.count, exts->extensions.capacity, (uintptr_t)g_view_extension_vtable.data(),
+        SceneViewExtensionAnalyzer::is_active_this_frame_index, SceneViewExtensionAnalyzer::begin_render_viewfamily_index, SceneViewExtensionAnalyzer::pre_render_viewfamily_renderthread_index);
+
+    if (exts->extensions.data == nullptr || exts->extensions.count <= 0 || exts->extensions.count > 64) {
+        return;
+    }
+
+    for (int32_t i = 0; i < exts->extensions.count; ++i) try {
+        const auto ext = exts->extensions.data[i].reference;
+
+        if (ext == nullptr || IsBadReadPtr((void*)ext, sizeof(void*))) {
+            SPDLOG_INFO("[VIEWEXT_DIAG]   [{}] ext={:x} (invalid)", i, (uintptr_t)ext);
+            continue;
+        }
+
+        const auto vtable = *(uintptr_t*)ext;
+        const auto is_ours = vtable == (uintptr_t)g_view_extension_vtable.data();
+        const auto module = utility::get_module_within((void*)vtable);
+        std::string module_name = "<none>";
+        uintptr_t rva = 0;
+
+        if (module.has_value()) {
+            if (const auto path = utility::get_module_path(*module); path.has_value()) {
+                module_name = std::filesystem::path(*path).filename().string();
+            }
+
+            rva = vtable - (uintptr_t)*module;
+        }
+
+        // First few virtuals (RVA relative to module) so the user can cross-reference in a disassembler
+        std::string fn_rvas{};
+        for (auto j = 0; j < 6; ++j) {
+            const auto fn = ((uintptr_t*)vtable)[j];
+            if (fn == 0 || IsBadReadPtr((void*)fn, sizeof(void*))) {
+                fn_rvas += "?,";
+                continue;
+            }
+
+            const auto fn_module = utility::get_module_within((void*)fn);
+            fn_rvas += fmt::format("{:x},", fn_module.has_value() ? fn - (uintptr_t)*fn_module : fn);
+        }
+
+        SPDLOG_INFO("[VIEWEXT_DIAG]   [{}] ext={:x} vtable={:x} module={} vtable_rva={:x} ours={} fn_rvas=[{}]",
+            i, (uintptr_t)ext, vtable, module_name, rva, is_ours, fn_rvas);
+
+        // One-time deep scan: list every virtual that isn't the shared default stub
+        if (dump_count == 1 && !is_ours && module.has_value()) {
+            // The default no-op virtuals all resolve to a single shared stub; detect it as the most frequent entry
+            std::unordered_map<uintptr_t, int> freq{};
+            for (auto j = 0; j < 40; ++j) {
+                const auto fn = ((uintptr_t*)vtable)[j];
+                if (fn == 0 || IsBadReadPtr((void*)fn, sizeof(void*))) break;
+                ++freq[fn];
+            }
+
+            uintptr_t stub = 0;
+            int stub_count = 0;
+            for (const auto& [fn, n] : freq) {
+                if (n > stub_count) { stub = fn; stub_count = n; }
+            }
+
+            std::string nontrivial{};
+            for (auto j = 0; j < 40; ++j) {
+                const auto fn = ((uintptr_t*)vtable)[j];
+                if (fn == 0 || IsBadReadPtr((void*)fn, sizeof(void*))) {
+                    break;
+                }
+
+                const auto fn_module = utility::get_module_within((void*)fn);
+                if (!fn_module.has_value() || *fn_module != *module) {
+                    break;
+                }
+
+                if (fn == stub) {
+                    continue;
+                }
+
+                const auto first_byte = *(uint8_t*)fn;
+                if (first_byte == 0xC3) {
+                    continue;
+                }
+
+                nontrivial += fmt::format("{}:{:x},", j, fn - (uintptr_t)*module);
+            }
+
+            SPDLOG_INFO("[VIEWEXT_DIAG]     [{}] stub_rva={:x} (x{}) nontrivial_virtuals=[{}]", i, stub - (uintptr_t)*module, stub_count, nontrivial);
+
+            // Experiment: replace virtuals with the extension's own no-op stub to confirm which
+            // extension/slot draws the UI (it should vanish). Bisect mode: suppress every overridden
+            // slot in [suppress_slot_min, suppress_slot_max] for every extension in the mask.
+            // Already ruled out individually: 2:11, 1:12, 4:12.
+            constexpr uint32_t suppress_ext_mask = 0; // bit i = extension index i
+            constexpr int32_t suppress_slot_min = 1;
+            constexpr int32_t suppress_slot_max = 14;
+
+            if (((suppress_ext_mask >> i) & 1) != 0 && stub != 0) {
+                std::string suppressed{};
+
+                for (auto s = suppress_slot_min; s <= suppress_slot_max && s < 40; ++s) {
+                    auto slot_ptr = &((uintptr_t*)vtable)[s];
+                    const auto fn = *slot_ptr;
+
+                    if (fn == stub || fn == 0 || IsBadReadPtr((void*)fn, sizeof(void*))) {
+                        continue;
+                    }
+
+                    // Only touch this module's overrides, never the shared engine defaults (rva 202d01xx/202d03xx)
+                    const auto fn_module = utility::get_module_within((void*)fn);
+                    if (!fn_module.has_value() || *fn_module != *module) {
+                        continue;
+                    }
+
+                    DWORD old{};
+                    if (VirtualProtect(slot_ptr, sizeof(uintptr_t), PAGE_READWRITE, &old)) {
+                        *slot_ptr = stub;
+                        VirtualProtect(slot_ptr, sizeof(uintptr_t), old, &old);
+                        suppressed += fmt::format("{}:{:x},", s, fn - (uintptr_t)*module);
+                    } else {
+                        SPDLOG_ERROR("[VIEWEXT_DIAG]     [{}] VirtualProtect failed for slot {}", i, s);
+                    }
+                }
+
+                if (!suppressed.empty()) {
+                    SPDLOG_INFO("[VIEWEXT_DIAG]     [{}] SUPPRESSED slots [{}]", i, suppressed);
+                }
+            }
+        }
+    } catch (...) {
+        SPDLOG_ERROR("[VIEWEXT_DIAG]   [{}] exception while reading extension", i);
+    }
+}
+
+// Analyzes all of the virtual functions for ISceneViewExtension
+// We create the ISceneViewExtension ourselves and overwrite all of the virtual functions
+// The class will count how many times each virtual is getting called
+// and then when a threshold is reached, it finds the most called one
+// the most called one is IsActiveThisFrame which we need to activate the ISceneViewExtension
+
 template<int N>
 void SceneViewExtensionAnalyzer::FillVtable<N>::fill(std::array<uintptr_t, 50>& table) {
     table[N] = (uintptr_t)&SceneViewExtensionAnalyzer::analysis_dummy_stage1<N>;
@@ -3078,6 +3242,245 @@ void SceneViewExtensionAnalyzer::FillVtable<N>::fill2(std::array<uintptr_t, 50>&
 // 4.25something to 4.27
 // TODO: Add support for all versions via PDB dumps
 constexpr auto INIT_OPTIONS_OFFSET = 0x50;
+
+// Cross-reference resolver for FSceneViewInitOptions / FSceneView offsets.
+// The SDK's vtable-walk heuristic lands on the wrong fields in this game (get_view_family() returns
+// a non-pointer like 0xf7d602). After the real constructor has run we hold BOTH the raw init options
+// and the fully constructed FSceneView, so we can find the fields by intersection:
+//  - Family:  pointer present in both blocks whose first TArray contains this very view
+//  - State:   pointer present in both blocks with a module-resident vtable, distinct from family
+//  - StereoPass: uint32 that reads 1 for the first eye view of a frame and 2 for the second, in both blocks
+namespace sceneview_xref {
+struct Snapshot {
+    std::array<uint8_t, 0x200> init_options{};
+    std::array<uint8_t, 0x1000> view{};
+};
+
+static constexpr size_t snap_init_size() { return sizeof(Snapshot::init_options); }
+
+static inline bool resolved{false};
+static inline uint32_t attempts{0};
+static inline std::optional<uint32_t> live_view_family_offset{};
+static inline std::optional<uint32_t> live_stereo_pass_offset{};
+// Engine-specific encodings of the eye passes as observed in view[0]/view[1]. Stock 4.25+ is 1/2, this
+// game uses 2/3 (an extra leading enum value).
+static inline uint32_t stereo_pass_left{1};
+static inline uint32_t stereo_pass_right{2};
+// Every dword (< 8) that differs between the two eye views: StereoPass, its cached copies, view index,
+// "is primary" style flags. Used by the Pass2 "full eye identity" test to make the right-eye view
+// carry the left eye's metadata for the duration of its render.
+struct EyeField { uint32_t offset; uint32_t left; uint32_t right; };
+static inline std::vector<EyeField> eye_fields{};
+// Offset of FSceneViewStateInterface* State inside the constructed FSceneView. Found by locating the
+// init options' state pointer (already resolved) inside the live view after the real constructor ran.
+static inline std::optional<uint32_t> live_scene_state_offset{};
+
+static inline void resolve_live_scene_state(sdk::FSceneView* view, void* init_state) {
+    if (live_scene_state_offset.has_value() || view == nullptr || init_state == nullptr) {
+        return;
+    }
+
+    for (uint32_t off = 0; off + sizeof(void*) <= 0x400; off += sizeof(void*)) {
+        if (*(void**)((uintptr_t)view + off) == init_state) {
+            live_scene_state_offset = off;
+            SPDLOG_INFO("[VR] sceneview_xref: RESOLVED live scene state@{:x} (state={:x})", off, (uintptr_t)init_state);
+            return;
+        }
+    }
+}
+
+static bool plausible(uintptr_t p) {
+    return p > 0x10000 && p < 0x7FFFFFFFFFFF && (p % sizeof(void*)) == 0 && !IsBadReadPtr((void*)p, 0x40);
+}
+
+static bool has_module_vtable(uintptr_t p) {
+    if (!plausible(p)) return false;
+    const auto vt = *(uintptr_t*)p;
+    if (!plausible(vt) || !utility::get_module_within((void*)vt)) return false;
+    const auto fn = *(uintptr_t*)vt;
+    return fn != 0 && !IsBadReadPtr((void*)fn, sizeof(void*)) && utility::get_module_within((void*)fn).has_value();
+}
+
+static std::optional<uint32_t> find_ptr(const uint8_t* block, size_t size, uintptr_t value) {
+    for (uint32_t i = 0; i + sizeof(void*) <= size; i += sizeof(void*)) {
+        if (*(const uintptr_t*)(block + i) == value) return i;
+    }
+    return std::nullopt;
+}
+
+// Called from begin_render_viewfamily_real where we hold a VALIDATED FSceneViewFamily* and both
+// constructed eye views. Locate the live FSceneView fields by value:
+//  - Family: the offset in view[0] (and view[1]) holding exactly view_family
+//  - StereoPass: uint32 that is 1 in view[0] and 2 in view[1]
+static void resolve_live(sdk::FSceneViewFamily* family, sdk::FSceneView* v0, sdk::FSceneView* v1) {
+    if (live_view_family_offset && live_stereo_pass_offset) return;
+    if (family == nullptr || v0 == nullptr || v1 == nullptr) return;
+    if (IsBadReadPtr(v0, 0x1000) || IsBadReadPtr(v1, 0x1000)) return;
+
+    static uint32_t live_attempts = 0;
+    if (++live_attempts > 300) return;
+
+    if (!live_view_family_offset) {
+        for (uint32_t i = 0; i + sizeof(void*) <= 0x1000; i += sizeof(void*)) {
+            if (*(uintptr_t*)((uintptr_t)v0 + i) == (uintptr_t)family && *(uintptr_t*)((uintptr_t)v1 + i) == (uintptr_t)family) {
+                live_view_family_offset = i;
+                SPDLOG_INFO("[VR] sceneview_xref: RESOLVED live view family@{:x} (family={:x})", i, (uintptr_t)family);
+                break;
+            }
+        }
+    }
+
+    if (!live_stereo_pass_offset) {
+        // Strict stock encoding first (1 -> 2), then any consecutive small-int pair (a -> a+1, a >= 1) for
+        // engines with a shifted enum. Prefer the lowest offset: the enum lives in the FSceneView header
+        // section, copies deeper in the struct (uniform parameter caches) come later.
+        std::vector<uint32_t> hits{};
+        std::vector<std::tuple<uint32_t, uint32_t, uint32_t>> loose{};
+        for (uint32_t i = 0; i + 4 <= 0x1000; i += 4) {
+            const auto a = *(uint32_t*)((uintptr_t)v0 + i);
+            const auto b = *(uint32_t*)((uintptr_t)v1 + i);
+            if (a == 1 && b == 2) hits.push_back(i);
+            else if (a >= 1 && a < 8 && b == a + 1) loose.emplace_back(i, a, b);
+        }
+
+        std::string s{};
+        for (auto h : hits) s += fmt::format("{:x} ", h);
+
+        if (live_attempts <= 3 || live_attempts % 120 == 0) {
+            SPDLOG_INFO("[VR] sceneview_xref: live stereo pass candidates (v0==1 && v1==2): [{}] family_off={:x}", s, live_view_family_offset.value_or(0xFFFFFFFF));
+
+            // No strict 1/2 hit: this engine may use a different enum (pre-4.25 LEFT/RIGHT_EYE(_SIDE),
+            // a custom one, or a uint8). Dump every dword that differs between the two eye views while
+            // both are small integers - StereoPass MUST be among these since the views only differ in
+            // eye-specific data (pass, matrices, rects).
+            if (hits.empty()) {
+                std::string diffs{};
+                uint32_t n = 0;
+                for (uint32_t i = 0; i + 4 <= 0x1000 && n < 48; i += 4) {
+                    const auto a = *(uint32_t*)((uintptr_t)v0 + i);
+                    const auto b = *(uint32_t*)((uintptr_t)v1 + i);
+                    if (a != b && a < 0x100 && b < 0x100) {
+                        diffs += fmt::format("{:x}:{}->{} ", i, a, b);
+                        ++n;
+                    }
+                }
+                SPDLOG_INFO("[VR] sceneview_xref: small-int dwords differing v0->v1: {}", diffs);
+            }
+        }
+
+        // Standard FSceneView puts StereoPass within a few hundred bytes after Family/State/Drawer; take the
+        // first hit after the family offset if known, otherwise the first hit at all.
+        if (!hits.empty()) {
+            live_stereo_pass_offset = hits.front();
+            if (live_view_family_offset) {
+                for (auto h : hits) {
+                    if (h > *live_view_family_offset) { live_stereo_pass_offset = h; break; }
+                }
+            }
+            stereo_pass_left = 1;
+            stereo_pass_right = 2;
+            SPDLOG_INFO("[VR] sceneview_xref: RESOLVED live stereo pass@{:x} ({} candidates, stock 1/2 encoding)", *live_stereo_pass_offset, hits.size());
+        } else if (!loose.empty()) {
+            const auto& [off, a, b] = loose.front();
+            live_stereo_pass_offset = off;
+            stereo_pass_left = a;
+            stereo_pass_right = b;
+            SPDLOG_INFO("[VR] sceneview_xref: RESOLVED live stereo pass@{:x} with engine-specific encoding left={} right={} ({} loose candidates)",
+                off, a, b, loose.size());
+        }
+
+        if (live_stereo_pass_offset) {
+            eye_fields.clear();
+            std::string s2{};
+            std::string skipped{};
+            for (uint32_t i = 0; i + 4 <= 0x1000; i += 4) {
+                const auto a = *(uint32_t*)((uintptr_t)v0 + i);
+                const auto b = *(uint32_t*)((uintptr_t)v1 + i);
+                if (a == b || a >= 8 || b >= 8) continue;
+
+                // Reject anything that looks like the low dword of a pointer (high dword differs or is
+                // non-zero on either side), and "X -> 0" pairs: those are handles/pointers that are null
+                // on the right eye, not enums. Writing into them crashed the engine (0xc: 5->0, 0x154: 5->0).
+                bool pointer_like = false;
+                if ((i % 8) == 0 && i + 8 <= 0x1000) {
+                    const auto ha = *(uint32_t*)((uintptr_t)v0 + i + 4);
+                    const auto hb = *(uint32_t*)((uintptr_t)v1 + i + 4);
+                    pointer_like = ha != 0 || hb != 0;
+                }
+                if (pointer_like || b == 0) {
+                    skipped += fmt::format("{:x}:{}->{} ", i, a, b);
+                    continue;
+                }
+
+                eye_fields.push_back({i, a, b});
+                s2 += fmt::format("F{}={:x}:{}->{} ", eye_fields.size() - 1, i, a, b);
+            }
+            SPDLOG_INFO("[VR] sceneview_xref: eye identity fields (left->right): {} | skipped pointer-like/null-right: {}", s2, skipped);
+        }
+    }
+}
+
+// Called after the original constructor has run for a full-size game view. Maps the live offsets
+// (resolved above) back into FSceneViewInitOptions by VALUE: the constructor copies Family and
+// StereoPass verbatim from the init options, so whatever the constructed view holds at the live
+// offsets must appear somewhere in the init options block.
+static void feed(sdk::FSceneView* view, sdk::FSceneViewInitOptions* init_options, uint32_t frame) {
+    if (resolved || attempts > 600) return;
+    if (view == nullptr || init_options == nullptr) return;
+    if (!live_view_family_offset) return; // wait for begin_render_viewfamily_real to resolve the live side
+    if (IsBadReadPtr(init_options, sizeof(Snapshot::init_options)) || IsBadReadPtr(view, sizeof(Snapshot::view))) return;
+
+    ++attempts;
+
+    const auto io = (uintptr_t)init_options;
+    const auto family_value = *(uintptr_t*)((uintptr_t)view + *live_view_family_offset);
+
+    if (!plausible(family_value)) return;
+
+    // Family: search past the projection data (view_rect is at +0x90 in this game, matches stock layout).
+    const auto fam_off = find_ptr((const uint8_t*)io + 0x80, snap_init_size() - 0x80, family_value);
+    if (!fam_off) {
+        if (attempts <= 3 || attempts % 120 == 0) {
+            SPDLOG_INFO("[VR] sceneview_xref: family value {:x} not found in init options (attempt {}), dumping 0x80..0x180:", family_value, attempts);
+            for (uint32_t i = 0x80; i < 0x180; i += 0x20) {
+                SPDLOG_INFO("  +{:x}: {:x} {:x} {:x} {:x}", i,
+                    *(uint64_t*)(io + i), *(uint64_t*)(io + i + 8), *(uint64_t*)(io + i + 16), *(uint64_t*)(io + i + 24));
+            }
+        }
+        return;
+    }
+
+    const auto init_family_off = 0x80 + *fam_off;
+
+    // State: stock layout puts SceneViewStateInterface immediately after ViewFamily. Accept it if it is
+    // null or a vtable'd object; otherwise scan forward a little.
+    std::optional<uint32_t> init_state_off{};
+    for (uint32_t s = init_family_off + sizeof(void*); s < init_family_off + 0x30 && s + sizeof(void*) <= snap_init_size(); s += sizeof(void*)) {
+        const auto sc = *(uintptr_t*)(io + s);
+        if (sc == 0 || has_module_vtable(sc)) { init_state_off = s; break; }
+    }
+
+    // StereoPass: the constructed view's value must also appear in the init options after the family.
+    std::optional<uint32_t> init_stereo_off{};
+    if (live_stereo_pass_offset) {
+        const auto sp = *(uint32_t*)((uintptr_t)view + *live_stereo_pass_offset);
+        if (sp == stereo_pass_left || sp == stereo_pass_right) {
+            // Skip the FLinearColor block (1.0f == 0x3f800000, never 1 or 2) - only integer slots will match.
+            for (uint32_t i = init_family_off + sizeof(void*); i + 4 <= snap_init_size(); i += 4) {
+                if (*(uint32_t*)(io + i) == sp) { init_stereo_off = i; break; }
+            }
+        }
+    }
+
+    const auto prev_fam = sdk::FSceneViewInitOptionsBase::get_view_family_offset().value_or(0xFFFFFFFF);
+    const auto prev_sp = sdk::FSceneViewInitOptionsBase::get_stereo_pass_offset().value_or(0xFFFFFFFF);
+    sdk::FSceneViewInitOptionsBase::override_offsets(init_family_off, init_state_off, init_stereo_off);
+    resolved = true;
+
+    SPDLOG_INFO("[VR] sceneview_xref: RESOLVED init_options family@{:x} state@{:x} stereo_pass@{:x} (heuristic had family@{:x} stereo_pass@{:x}; family={:x})",
+        init_family_off, init_state_off.value_or(0xFFFFFFFF), init_stereo_off.value_or(0xFFFFFFFF), prev_fam, prev_sp, family_value);
+}
+} // namespace sceneview_xref
 
 bool FFakeStereoRenderingHook::is_in_viewport_client_draw() const {
     return m_in_viewport_client_draw && GameThreadWorker::get().is_same_thread();
@@ -3097,27 +3500,84 @@ sdk::FSceneView* FFakeStereoRenderingHook::sceneview_constructor(sdk::FSceneView
         SPDLOG_INFO_ONCE("FSceneView constructor was called before view extensions were installed, aborting");
         return g_hook->m_sceneview_data.constructor_hook.unsafe_call<sdk::FSceneView*>(view, init_options, a3, a4);
     }
-    // SOLUTION 2: BYPASS STEREO MODIFICATIONS DURING LOADING SCREENS
-    // =================================================================
-    auto early_view_family = init_options != nullptr ? init_options->get_view_family() : nullptr;
-    if (early_view_family == nullptr || early_view_family->get_scene_interface() == nullptr) {
-        // Scene interface isn't active yet (game is streaming/loading assets).
-        // Let standard Unreal SceneView construction proceed untouched!
+
+    if (init_options == nullptr) {
         return g_hook->m_sceneview_data.constructor_hook.unsafe_call<sdk::FSceneView*>(view, init_options, a3, a4);
     }
+
     std::scoped_lock ___{g_hook->m_sceneview_data.mtx};
 
     const auto retaddr = (uintptr_t)_ReturnAddress();
 
-    if (!g_hook->m_sceneview_data.seen_retaddrs.contains(retaddr)) {
+    const bool first_time_from_this_retaddr = !g_hook->m_sceneview_data.seen_retaddrs.contains(retaddr);
+
+    if (first_time_from_this_retaddr) {
         g_hook->m_sceneview_data.seen_retaddrs.insert(retaddr);
         SPDLOG_INFO("FSceneView constructor called from {:x}", retaddr);
     }
 
+    // The offsets MUST be resolved before get_view_family() is usable: it returns nullptr until
+    // s_view_family_offset has been found. The loading-screen bail-out below previously ran before
+    // this call, so get_view_family() always returned nullptr, the bail-out always fired, and the
+    // rest of this hook (stereo pass -> PRIMARY override, view-count hiding, scene state tracking)
+    // never executed. Confirmed via logs: "[FSceneViewInitOptions] Found ... offset" never appeared.
     sdk::FSceneViewInitOptionsBase::update_offsets(init_options);
 
-    if (auto view_family = init_options->get_view_family(); view_family != nullptr) {
-        sdk::FSceneViewFamily::update_offsets(view_family, nullptr);
+    // A raw pointer read out of FSceneViewInitOptions can be garbage for callers other than
+    // ULocalPlayer::CalcSceneView (e.g. the game's own USceneCaptureComponent / reflection capture
+    // views, which build their init options differently). Observed: a second constructor call site
+    // appeared the moment the main world (AkiWorld_WP) came up and get_view_family() returned 0x3,
+    // which then faulted at ->get_scene_interface() (read of 0x23). Never dereference it unvalidated.
+    const auto is_plausible_ptr = [](const void* p) -> bool {
+        const auto addr = (uintptr_t)p;
+        return addr > 0x10000 && addr < 0x7FFFFFFFFFFF && (addr % sizeof(void*)) == 0 && !IsBadReadPtr(p, 0x40);
+    };
+
+    auto early_view_family = init_options->get_view_family();
+    const bool view_family_plausible = is_plausible_ptr(early_view_family);
+
+    if (first_time_from_this_retaddr) {
+        // One-shot per call site: enough to identify what kind of view this caller is producing
+        // (game view vs scene capture vs something else) without spamming every frame.
+        SPDLOG_INFO("[VR] sceneview_constructor: new call site {:x} -> view_family={:x} plausible={} stereo_pass={} view_rect=({},{})-({},{})",
+            retaddr, (uintptr_t)early_view_family, view_family_plausible, (int32_t)init_options->get_stereo_pass(),
+            init_options->view_rect[0], init_options->view_rect[1], init_options->view_rect[2], init_options->view_rect[3]);
+    }
+
+    if (view_family_plausible) {
+        sdk::FSceneViewFamily::update_offsets(early_view_family, nullptr);
+    }
+
+    // SOLUTION 2: BYPASS STEREO MODIFICATIONS DURING LOADING SCREENS
+    // =================================================================
+    sdk::FSceneInterface* early_scene_interface = nullptr;
+
+    if (view_family_plausible) {
+        try {
+            early_scene_interface = early_view_family->get_scene_interface();
+        } catch (...) {
+            SPDLOG_WARNING_EVERY_N_SEC(2, "[VR] sceneview_constructor: exception reading scene interface from view_family={:x} (retaddr={:x})",
+                (uintptr_t)early_view_family, retaddr);
+            early_scene_interface = nullptr;
+        }
+    }
+
+    if (!view_family_plausible || early_scene_interface == nullptr) {
+        // Either this caller's init options don't carry a usable view family (non-game view), or the
+        // scene interface isn't active yet (game is streaming/loading assets).
+        // Let standard Unreal SceneView construction proceed untouched!
+        SPDLOG_INFO_EVERY_N_SEC(2, "[VR] sceneview_constructor: bypassing (retaddr={:x} view_family={:x} plausible={} scene_interface={:x})",
+            retaddr, (uintptr_t)early_view_family, view_family_plausible, (uintptr_t)early_scene_interface);
+        auto result = g_hook->m_sceneview_data.constructor_hook.unsafe_call<sdk::FSceneView*>(view, init_options, a3, a4);
+
+        // Only full-size views are the eye views we want to learn the layout from (skip 64x64 captures).
+        const int32_t w = init_options->view_rect[2] - init_options->view_rect[0];
+        const int32_t h = init_options->view_rect[3] - init_options->view_rect[1];
+        if (!view_family_plausible && w >= 256 && h >= 256) {
+            sceneview_xref::feed(view, init_options, g_frame_count);
+        }
+
+        return result;
     }
 
     const auto is_ue5 = g_hook->has_double_precision();
@@ -3334,8 +3794,13 @@ sdk::FSceneView* FFakeStereoRenderingHook::sceneview_constructor(sdk::FSceneView
         }
 
         // 4. Ghosting fix check (uses the variable declared above)
+        // AFR only. Do NOT apply to Native Stereo Fix's secondary view: the engine already gives
+        // each stereo view its own persistent FSceneViewState (ULocalPlayer::ViewStates[index]),
+        // and swapping the right eye onto the left eye's state makes two different frusta share one
+        // TAA/occlusion/HZB history, which manifests as smeared/misaligned vision during camera motion.
         if (init_options_scene_state != nullptr && is_valid_scene_state && !new_scene_state_inserted_this_frame &&
-            vr->is_ghosting_fix_enabled() && !known_scene_states.empty() && vr->is_using_afr() && true_index == 1) {
+            vr->is_ghosting_fix_enabled() && !known_scene_states.empty() &&
+            vr->is_using_afr() && true_index == 1) {
             init_options->set_stereo_pass(EStereoscopicPass::eSSP_PRIMARY);
 
             // Set the scene state to the one that isn't the current one
@@ -3351,6 +3816,10 @@ sdk::FSceneView* FFakeStereoRenderingHook::sceneview_constructor(sdk::FSceneView
     last_index++;
 
     auto result = g_hook->m_sceneview_data.constructor_hook.unsafe_call<sdk::FSceneView*>(view, init_options, a3, a4);
+
+    if (is_valid_scene_state) {
+        sceneview_xref::resolve_live_scene_state(view, init_options_scene_state);
+    }
 
     // Reset the view count back to what it was.
     if (views_original_count.has_value()) {
@@ -3493,7 +3962,8 @@ void FFakeStereoRenderingHook::begin_render_viewfamily_real(
         const bool no_local_pawn = is_local_pawn_missing();
         const bool boot_phase = is_boot_phase_active();
         const bool world_stale = rtm->is_scene_capture_world_stale();
-        const bool should_suspend = tick_stalled || no_player_controller || no_local_pawn || boot_phase || world_stale;
+        const bool should_suspend = vr->is_native_stereo_fix_auto_suspend_enabled() &&
+            (tick_stalled || no_player_controller || no_local_pawn || boot_phase || world_stale);
 
         if (should_suspend != vr->is_native_stereo_fix_suspended()) {
             if (vr->is_diag_verbose_logging_enabled()) {
@@ -3708,6 +4178,10 @@ void FFakeStereoRenderingHook::begin_render_viewfamily_real(
         views.count = 1;
         wants_swap = true;
 
+        // We now hold a validated FSceneViewFamily and both constructed eye views - use them to pin
+        // down the live FSceneView field offsets by value (see sceneview_xref).
+        sceneview_xref::resolve_live(view_family, view_0, view_1);
+
         auto runtime = vr->get_runtime();
         const auto frame_count = runtime->internal_frame_count;
 
@@ -3783,8 +4257,27 @@ void FFakeStereoRenderingHook::begin_render_viewfamily_real(
         auto scene = (sdk::FScene*)view_family->get_scene_interface();
 
         if (scene != nullptr) {
-            // Decrement frame count to fix motion vectors in the right eye
-            scene->decrement_frame_count();
+            // Decrement frame count to fix motion vectors in the right eye.
+            // NOTE: this manipulates the Scene's global frame counter, which whole-scene shadow
+            // caching/scheduling also keys off of (e.g. a "shadows already rendered this frame"
+            // skip-optimization for a given light, reset once per frame). Since Pass1 and Pass2
+            // both render through the SAME FSceneViewFamily/Scene without the engine's normal
+            // per-frame increment happening between them, decrementing (or leaving it alone)
+            // still leaves Pass2 looking like "the same or an earlier frame" to that optimization,
+            // which may be why large-world shadows only update for Pass1 (left eye). Use the
+            // "DIAG: NSF Pass2 Frame Count Mode" debug combo to A/B test None/Increment against
+            // the current default (Decrement) - Increment intentionally looks like "a new frame"
+            // to that logic, at the risk of a motion vector artifact, to isolate the true cause.
+            switch (vr->get_diag_nsf_pass2_frame_count_mode()) {
+            case 1: // None
+                break;
+            case 2: // Increment
+                scene->increment_frame_count();
+                break;
+            default: // Decrement (original behavior)
+                scene->decrement_frame_count();
+                break;
+            }
         }
 
         std::swap(views[0], views[1]);
@@ -3810,7 +4303,156 @@ void FFakeStereoRenderingHook::begin_render_viewfamily_real(
         }
 
         // Call it again
+        // Right Eye Shadow Fix: the right-eye view was constructed as the SECONDARY eye. Whole-scene
+        // shadow setup only runs for the shadow-owning (primary) view; secondaries are expected to
+        // reuse it, but during Pass2 the right eye renders alone and finds none - hence no world
+        // shadows in the right eye. While Pass2 renders, give the live FSceneView the left eye's
+        // identity metadata (StereoPass + its cached copy, view index, primary flag - all discovered
+        // at runtime by sceneview_xref; camera/rects untouched) and restore afterwards. Both the enum
+        // and its cached copy must be flipped for the engine to honor it.
+        auto pass2_view = views.data[0];
+        std::vector<std::pair<uint32_t*, uint32_t>> pass2_restore{};
+
+        if (vr->is_native_stereo_fix_right_eye_shadows_enabled() && pass2_view != nullptr) {
+            const auto& fields = sceneview_xref::eye_fields;
+
+            if (!fields.empty()) {
+                const auto mask = vr->get_diag_nsf_pass2_eye_field_mask();
+
+                for (size_t i = 0; i < fields.size(); ++i) {
+                    if (i < 32 && (mask & (1u << i)) == 0) continue;
+                    const auto& f = fields[i];
+                    auto p = (uint32_t*)((uintptr_t)pass2_view + f.offset);
+                    if (*p == f.right) {
+                        pass2_restore.emplace_back(p, *p);
+                        *p = f.left;
+                    }
+                }
+
+                SPDLOG_INFO_EVERY_N_SEC(2, "[VR] NSF right-eye shadow fix: view={:x} flipped {}/{} eye fields (mask={:x})",
+                    (uintptr_t)pass2_view, pass2_restore.size(), fields.size(), mask);
+            } else {
+                SPDLOG_INFO_EVERY_N_SEC(2, "[VR] NSF right-eye shadow fix: eye fields not yet resolved by sceneview_xref (view={:x})", (uintptr_t)pass2_view);
+            }
+        }
+
+        // View State diagnostic / A/B for the "distant foliage frozen in the second-rendered eye" issue.
+        // HISM foliage stores occlusion/visibility results in FSceneViewState and reads them back next
+        // frame. If both passes resolve to the same state, Pass2 consumes Pass1's results and renders a
+        // stale culling set for far clusters. Nulling Pass2's State disables occlusion history for that
+        // pass entirely (everything visible, no TAA history) - a clean test of the hypothesis.
+        void** pass2_state_slot = nullptr;
+        void* pass2_state_saved = nullptr;
+
+        if (pass2_view != nullptr && sceneview_xref::live_scene_state_offset.has_value()) {
+            const auto off = sceneview_xref::live_scene_state_offset.value();
+            pass2_state_slot = (void**)((uintptr_t)pass2_view + off);
+            void* pass1_state = views.data[1] != nullptr ? *(void**)((uintptr_t)views.data[1] + off) : nullptr;
+
+            SPDLOG_INFO_EVERY_N_SEC(2, "[VR] NSF view state: pass1(left)={:x} pass2(right)={:x} shared={} known_states={}",
+                (uintptr_t)pass1_state, (uintptr_t)*pass2_state_slot, pass1_state == *pass2_state_slot,
+                g_hook->m_sceneview_data.known_scene_states.size());
+
+            if (vr->is_native_stereo_fix_null_pass2_view_state_enabled()) {
+                pass2_state_saved = *pass2_state_slot;
+                *pass2_state_slot = nullptr;
+            } else {
+                pass2_state_slot = nullptr;
+            }
+        } else if (pass2_view != nullptr) {
+            SPDLOG_INFO_EVERY_N_SEC(2, "[VR] NSF view state: live scene state offset not yet resolved");
+        }
+
+        // Foliage wind investigation: find per-frame state Pass2 never sees fresh. Sample both eye views and the
+        // family for N frames; report (a) view dwords that change every frame AND are identical between eyes
+        // (a per-frame value that is stamped once for the family, not per view), (b) family dwords that change
+        // every frame. Camera matrices differ between eyes so they are excluded by (a) automatically.
+        if (vr->diag_nsf_frame_diff_logger() && pass2_view != nullptr && views.data[1] != nullptr) {
+            constexpr size_t VIEW_SPAN = 0x1000 / 4;
+            constexpr size_t FAMILY_SPAN = 0x400 / 4;
+            constexpr uint32_t SAMPLE_FRAMES = 60;
+
+            struct Diff {
+                uint32_t frames{0};
+                std::array<uint32_t, VIEW_SPAN> prev_left{}, prev_right{};
+                std::array<uint32_t, FAMILY_SPAN> prev_family{};
+                std::array<uint32_t, VIEW_SPAN> view_changes{}, view_eye_equal{};
+                std::array<uint32_t, FAMILY_SPAN> family_changes{};
+            };
+            static std::unique_ptr<Diff> d{};
+            if (!d) d = std::make_unique<Diff>();
+
+            const auto left = (const uint32_t*)views.data[1];  // post-swap: [1] is the left eye (Pass1) view
+            const auto right = (const uint32_t*)pass2_view;
+            const auto fam = (const uint32_t*)view_family;
+
+            if (d->frames > 0) {
+                for (size_t i = 0; i < VIEW_SPAN; ++i) {
+                    if (left[i] != d->prev_left[i] && right[i] != d->prev_right[i]) d->view_changes[i]++;
+                    if (left[i] == right[i]) d->view_eye_equal[i]++;
+                }
+                for (size_t i = 0; i < FAMILY_SPAN; ++i) {
+                    if (fam[i] != d->prev_family[i]) d->family_changes[i]++;
+                }
+            }
+
+            memcpy(d->prev_left.data(), left, sizeof(d->prev_left));
+            memcpy(d->prev_right.data(), right, sizeof(d->prev_right));
+            memcpy(d->prev_family.data(), fam, sizeof(d->prev_family));
+            d->frames++;
+
+            if (d->frames > SAMPLE_FRAMES) {
+                const uint32_t n = d->frames - 1;
+                SPDLOG_INFO("[NSF-DIFF] ---- {} frames sampled. view={:x}/{:x} family={:x} state_off={:x} stereo_off={:x} ----",
+                    n, (uintptr_t)left, (uintptr_t)right, (uintptr_t)fam,
+                    sceneview_xref::live_scene_state_offset.value_or(0), sceneview_xref::live_stereo_pass_offset.value_or(0));
+
+                SPDLOG_INFO("[NSF-DIFF] FSceneView dwords changing every frame AND equal in both eyes (candidates for stale per-frame state):");
+                for (size_t i = 0; i < VIEW_SPAN; ++i) {
+                    if (d->view_changes[i] >= n * 9 / 10 && d->view_eye_equal[i] >= n * 9 / 10) {
+                        SPDLOG_INFO("[NSF-DIFF]   view+{:04x}: u32={} f32={:.6f}", i * 4, left[i], *(const float*)&left[i]);
+                    }
+                }
+
+                SPDLOG_INFO("[NSF-DIFF] FSceneView dwords changing every frame but DIFFERENT per eye (matrices/eye-specific, for reference):");
+                uint32_t shown = 0;
+                for (size_t i = 0; i < VIEW_SPAN && shown < 40; ++i) {
+                    if (d->view_changes[i] >= n * 9 / 10 && d->view_eye_equal[i] < n / 10) {
+                        SPDLOG_INFO("[NSF-DIFF]   view+{:04x}: L f32={:.4f} R f32={:.4f}", i * 4, *(const float*)&left[i], *(const float*)&right[i]);
+                        ++shown;
+                    }
+                }
+
+                SPDLOG_INFO("[NSF-DIFF] FSceneViewFamily dwords changing every frame:");
+                for (size_t i = 0; i < FAMILY_SPAN; ++i) {
+                    if (d->family_changes[i] >= n * 9 / 10) {
+                        SPDLOG_INFO("[NSF-DIFF]   family+{:04x}: u32={} f32={:.6f}", i * 4, fam[i], *(const float*)&fam[i]);
+                    }
+                }
+
+                SPDLOG_INFO("[NSF-DIFF] ---- done ----");
+                d.reset();
+                vr->diag_nsf_frame_diff_logger() = false;
+            }
+        }
+
+        // DIAG (far-tree sway): optionally re-run KuroImposterUpdater::UpdateImposters so Pass 2 sees fresh impostor data.
+        CVarManager::rerun_imposter_update_for_pass2();
+
+        // DIAG (far-tree sway): optionally make Pass 2 look like a new frame to global per-frame gates (GFrameCounter etc.).
+        CVarManager::bump_frame_counters_for_pass2(true);
+
         g_hook->m_render_module_begin_render_viewfamily_hook.unsafe_call<void>(render_module, canvas, view_family_candidate);
+
+        CVarManager::bump_frame_counters_for_pass2(false);
+
+        if (pass2_state_slot != nullptr) {
+            *pass2_state_slot = pass2_state_saved;
+        }
+
+        for (auto& [p, v] : pass2_restore) {
+            *p = v;
+        }
 
         // Restore view order & original target
         std::swap(views[0], views[1]);
@@ -4062,6 +4704,8 @@ void FFakeStereoRenderingHook::pre_render_viewfamily_renderthread(ISceneViewExte
     if (vr->is_stereo_emulation_enabled()) {
         return;
     }
+
+    diag_dump_engine_view_extensions(view_family);
 
     const auto frame_count = *(uint32_t*)((uintptr_t)&view_family + SceneViewExtensionAnalyzer::frame_count_offset);
     static uint32_t last_frame = 0;
@@ -4502,6 +5146,8 @@ bool FFakeStereoRenderingHook::setup_view_extensions() try {
 
     // Reference wrapper for clean compatibility with the rest of the existing code structure
     FSceneViewExtensions& view_extensions = *view_extensions_ptr;
+    g_engine_view_extensions = view_extensions_ptr;
+    diag_scan_lgui_render_anchors();
 
     SPDLOG_INFO("Current ext ptr: {:x}", (uintptr_t)view_extensions.extensions.data);
     SPDLOG_INFO("Current ext count: {}", view_extensions.extensions.count);
@@ -5961,6 +6607,16 @@ uint32_t FFakeStereoRenderingHook::get_desired_number_of_views_hook(FFakeStereoR
 
     if (vr->is_native_stereo_fix_enabled() && !vr->is_native_stereo_fix_mirror_enabled()) {
         auto rtm = g_hook->get_render_target_manager();
+
+        // This vfunc runs every frame even when begin_render_viewfamily_real is not reached (e.g. the
+        // scene has no FScene yet or the view family is empty during a level transition), so it is the
+        // most reliable place to notice that the world our scene-capture actor/render target lives in
+        // has changed or is tearing down, and to release them before the engine's LoadMap GC pass.
+        if (rtm->is_scene_capture_world_stale()) {
+            SPDLOG_INFO("[VR] get_desired_number_of_views_hook: scene capture's world is stale (changed or tearing down), destroying proactively");
+            rtm->destroy_scene_capture();
+        }
+
         if ((rtm->get_scene_capture_render_target() == nullptr || !g_hook->m_sceneview_data.constructor_hook || !g_hook->m_render_module_begin_render_viewfamily_hook)) {
             if (rtm->get_scene_capture_utexture() == nullptr) {
                 // This vfunc is called every frame, independent of begin_render_viewfamily_real/sceneview_constructor.
@@ -7773,13 +8429,6 @@ void VRRenderTargetManager_Base::destroy_scene_capture() try {
     }
 
     if (this->in_flight_target == nullptr) {
-        // Un-root the target object if it's still valid so Unreal GC can sweep it safely
-        if (this->scene_capture_target.valid()) {
-            if (auto raw_obj = this->scene_capture_target.get(); raw_obj != nullptr) {
-                raw_obj->remove_from_root();
-            }
-        }
-
         this->scene_capture_actor = nullptr;
         this->scene_capture_component = nullptr;
         this->scene_capture_target = nullptr;
@@ -8024,9 +8673,13 @@ bool VRRenderTargetManager_Base::create_scene_capture() try {
         return false;
     }
 
-    // FIX: Prevent Unreal Engine GC from sweeping the render target across threads
-    tgt_raw->add_to_root();
-
+    // NOTE: Do NOT add_to_root() this render target. UKismetRenderingLibrary::CreateRenderTarget2D
+    // creates it with Outer = the UWorld we passed in. Rooting it keeps that entire world reachable
+    // across a LoadMap, and the engine's VerifyLoadMapWorldCleanup() then raises a hard "Fatal
+    // error!" ("World ... not cleaned up by garbage collection") when the old world is still
+    // referenced. Observed directly when a 2D->VR mode switch recreated the scene capture in the
+    // LaunchScene world right as the main map began loading. GC safety across threads is already
+    // handled by UObjectReference::valid() + the in_flight_target handshake below.
     sdk::UObjectReference tgt{tgt_raw};
 
     SPDLOG_INFO("[VRRenderTargetManager] Created texture target: {:x}", (uintptr_t)tgt.get());

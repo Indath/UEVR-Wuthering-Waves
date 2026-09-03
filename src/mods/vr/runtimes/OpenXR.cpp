@@ -740,7 +740,7 @@ void OpenXR::enqueue_render_poses_unsafe(uint32_t frame_count) {
     // VR::m_render_frame_count -> the AFR left/right eye parity check in D3D12Component::on_frame.
     // If this value is stuck (never increments, or increments but resets), the AFR eye-state
     // logic downstream will permanently think we're on the same eye every frame.
-    {
+    if (VR::get()->is_diag_verbose_logging_enabled()) {
         static uint32_t s_last_diag_frame_count = 0xFFFFFFFF;
         if (frame_count != s_last_diag_frame_count) {
             SPDLOG_INFO("[DIAG] enqueue_render_poses_unsafe: frame_count changed {} -> {}", s_last_diag_frame_count, frame_count);
@@ -1820,7 +1820,7 @@ XrResult OpenXR::end_frame(const std::vector<XrCompositionLayerBaseHeader*>& qua
     // layer is ever pushed into xrEndFrame below, which would explain a black VR view (headset gets
     // nothing but its previous/last-good frame or a runtime-side fallback) while flat-screen/ImGui
     // continue to render fine since they don't depend on this submission path.
-    {
+    if (VR::get()->is_diag_verbose_logging_enabled()) {
         static uint32_t diag_submit_count = 0;
         if (++diag_submit_count % 300 == 1) {
             SPDLOG_INFO("[DIAG] xrEndFrame submit state (#{}): shouldRender={} stage_views.size()={} is_afr={} has_depth={}",
@@ -1875,7 +1875,7 @@ XrResult OpenXR::end_frame(const std::vector<XrCompositionLayerBaseHeader*>& qua
             // index 0/1 are ever mapped to the SAME swapchain handle, or whether one eye's rect is
             // degenerate (zero/negative extent), either of which would produce a black eye in the
             // headset even though shouldRender/layerCount/xrEndFrame all look healthy.
-            {
+            if (VR::get()->is_diag_verbose_logging_enabled()) {
                 static uint32_t diag_proj_view_count = 0;
                 ++diag_proj_view_count;
                 if (diag_proj_view_count <= 120 || diag_proj_view_count % 600 == 1) {
@@ -1955,7 +1955,7 @@ XrResult OpenXR::end_frame(const std::vector<XrCompositionLayerBaseHeader*>& qua
     // screen is happening downstream of the shouldRender gate - e.g. the swapchain image acquired
     // for this frame was never actually written to, or the projection_layer_cache/layers vectors
     // are being cleared/rebuilt incorrectly for Synced Sequential mode specifically.
-    {
+    if (VR::get()->is_diag_verbose_logging_enabled()) {
         static uint32_t diag_endframe_count = 0;
         if (++diag_endframe_count % 300 == 1) {
             SPDLOG_INFO("[DIAG] xrEndFrame call (#{}): layerCount={} displayTime={} blendMode={}",

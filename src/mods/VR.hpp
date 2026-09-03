@@ -284,6 +284,14 @@ public:
         return m_diag_verbose_logging;
     }
 
+    int get_diag_nsf_pass2_frame_count_mode() const {
+        return m_diag_nsf_pass2_frame_count_mode;
+    }
+
+    bool& diag_nsf_frame_diff_logger() {
+        return m_diag_nsf_frame_diff_logger;
+    }
+
     bool is_hmd_active() const {
         if (m_disable_vr) {
             return false;
@@ -630,6 +638,23 @@ public:
 
     bool is_native_stereo_fix_same_pass_enabled() const {
         return m_native_stereo_fix_same_pass->value();
+    }
+
+    bool is_native_stereo_fix_right_eye_shadows_enabled() const {
+        return m_native_stereo_fix_right_eye_shadows->value();
+    }
+
+    bool is_native_stereo_fix_auto_suspend_enabled() const {
+        return m_native_stereo_fix_auto_suspend->value();
+    }
+
+    bool is_native_stereo_fix_null_pass2_view_state_enabled() const {
+        return m_native_stereo_fix_null_pass2_view_state->value();
+    }
+
+    // Bitmask over sceneview_xref::eye_fields (bit N = flip the N-th discovered field). Default all.
+    uint32_t get_diag_nsf_pass2_eye_field_mask() const {
+        return (uint32_t)m_diag_nsf_pass2_eye_field_mask;
     }
 
     // When enabled, Native Stereo Fix never spawns/creates the scene-capture actor/component.
@@ -1052,7 +1077,20 @@ private:
 
     const ModToggle::Ptr m_ghosting_fix{ ModToggle::create(generate_name("GhostingFix"), false) };
     const ModToggle::Ptr m_native_stereo_fix{ ModToggle::create(generate_name("NativeStereoFix"), false) };
-    const ModToggle::Ptr m_native_stereo_fix_same_pass{ ModToggle::create(generate_name("NativeStereoFixSamePass"), true) };
+    // Default OFF: with the real FSceneViewInitOptions offsets now resolved (sceneview_xref), this branch
+    // actually executes in this game and null-derefs inside the engine (views->count=0 during construction).
+    // The right-eye shadow fix below makes it unnecessary.
+    const ModToggle::Ptr m_native_stereo_fix_same_pass{ ModToggle::create(generate_name("NativeStereoFixSamePass"), false) };
+    // Flip the Pass2 (right eye) FSceneView's eye-identity metadata (StereoPass + cached copy, view index,
+    // primary flag) to the left eye's values while it renders, so whole-scene shadows are set up for it.
+    // Offsets/values are discovered at runtime by sceneview_xref, never hardcoded. Camera data untouched.
+    const ModToggle::Ptr m_native_stereo_fix_right_eye_shadows{ ModToggle::create(generate_name("NativeStereoFixRightEyeShadows"), true) };
+    // Auto-suspend NSF (fall back to the non-scene-capture compositing path) while a level transition
+    // is detected, and resume once the world settles. Replicates the manual off/on toggle workflow.
+    const ModToggle::Ptr m_native_stereo_fix_auto_suspend{ ModToggle::create(generate_name("NativeStereoFixAutoSuspend"), true) };
+    // DIAG: render NSF Pass2 with a null FSceneViewState (no occlusion/TAA history) to test whether
+    // shared per-view-state history is what freezes distant foliage in the second-rendered eye.
+    const ModToggle::Ptr m_native_stereo_fix_null_pass2_view_state{ ModToggle::create(generate_name("NativeStereoFixNullPass2ViewState"), false) };
     const ModToggle::Ptr m_native_stereo_fix_mirror{ ModToggle::create(generate_name("NativeStereoFixMirror"), false) };
     // Allows Native Stereo Fix's scene-capture/compositing path (normally exclusive to non-AFR
     // rendering) to also run while Alternate-Frame-Rendering / Synchronized Sequential mode is active.
@@ -1095,6 +1133,11 @@ private:
     bool m_diag_force_afr_off{false}; // definitely should not be persistent
     bool m_diag_disable_forced_second_draw{false}; // definitely should not be persistent
     bool m_diag_verbose_logging{false}; // gates high-frequency [DIAG]/[diag] debug logs added while investigating Synced Sequential issues; definitely should not be persistent
+    // Default 0xFB: F2 (a 0/1 "secondary view" flag @0x2ec in WuWa) is NOT flipped. Flipping it made Pass 2 build far
+    // shadow cascades/caster lists with left-eye bounds while rendering the right eye -> far shadows flickering between eyes.
+    int m_diag_nsf_pass2_eye_field_mask{0xFB}; // bisect mask over the runtime-discovered eye identity fields flipped by the right-eye shadow fix; not persistent
+    int m_diag_nsf_pass2_frame_count_mode{0};
+    bool m_diag_nsf_frame_diff_logger{false}; // one-shot: logs per-frame-changing dwords in FSceneView/FSceneViewFamily to locate the foliage wind update Pass2 misses; not persistent
 
     const ModKey::Ptr m_keybind_toggle_gui{ ModKey::create(generate_name("ToggleSlateGUIKey")) };
     
@@ -1187,6 +1230,9 @@ public:
             *m_ghosting_fix,
             *m_native_stereo_fix,
             *m_native_stereo_fix_same_pass,
+            *m_native_stereo_fix_right_eye_shadows,
+            *m_native_stereo_fix_auto_suspend,
+            *m_native_stereo_fix_null_pass2_view_state,
             *m_native_stereo_fix_mirror,
             *m_native_stereo_fix_allow_with_afr,
             *m_unify_afr_frame_parity,

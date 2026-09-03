@@ -309,7 +309,8 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
     // (so both parities are actually observed), and thereafter log every frame whenever the
     // eye selection doesn't alternate as expected (a real symptom of one eye going black),
     // plus a low-frequency heartbeat the rest of the time.
-    {
+    // All three DIAG blocks below are gated behind "DIAG: Verbose Sync/Stall Logging" (Debug section).
+    if (vr->is_diag_verbose_logging_enabled()) {
         static uint32_t diag_afr_count = 0;
         static bool diag_last_was_left = false;
         static bool diag_have_seen_left = false;
@@ -343,7 +344,7 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
     // Also logs the ue4_texture wrapper pointer and whether backbuffer == real_backbuffer, since
     // a change in either between left-eye frames (while staying stable for right-eye frames)
     // would point directly at the engine's render-target binding as the root cause.
-    {
+    if (vr->is_diag_verbose_logging_enabled()) {
         static uint32_t diag_rt_identity_count = 0;
         static void* diag_last_left_backbuffer = nullptr;
         static void* diag_last_right_backbuffer = nullptr;
@@ -377,7 +378,7 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
     // copy/OpenXR submission path. If this reports real pixel data but the destination swapchain
     // sample (further below) is black, the break is in our copy/submission path instead.
     // Throttled hard because this stalls the GPU synchronously.
-    {
+    if (vr->is_diag_verbose_logging_enabled()) {
         static uint32_t diag_src_sample_count = 0;
         ++diag_src_sample_count;
 
@@ -1078,7 +1079,7 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
             // DIAG: log of the actual copy performed into the AFR left-eye swapchain. Logs every
             // frame for a short warm-up window (unbiased by parity, unlike a fixed modulo stride),
             // then falls back to a low-frequency heartbeat.
-            {
+            if (vr->is_diag_verbose_logging_enabled()) {
                 static uint32_t diag_left_copy_count = 0;
                 ++diag_left_copy_count;
                 if (diag_left_copy_count <= 60 || diag_left_copy_count % 300 == 1) {
@@ -1135,7 +1136,7 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
             if (is_actually_afr && !is_afr && !m_submitted_left_eye) {
                 // DIAG: throttled log of the actual copy performed into the AFR left-eye swapchain
                 // from the "else" (right-eye-frame) branch's catch-up left-eye copy.
-                {
+                if (vr->is_diag_verbose_logging_enabled()) {
                     static uint32_t diag_left_catchup_count = 0;
                     if (++diag_left_catchup_count % 300 == 1) {
                         SPDLOG_INFO("[DIAG] AFR_LEFT_EYE copy (#{}) [catch-up branch]: backbuffer={}x{} extreme_compat={}",
@@ -1156,7 +1157,7 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
             if (is_actually_afr) {
                 // DIAG: log of the actual copy performed into the AFR right-eye swapchain. Logs every
                 // frame for a short warm-up window, then falls back to a low-frequency heartbeat.
-                {
+                if (vr->is_diag_verbose_logging_enabled()) {
                     static uint32_t diag_right_copy_count = 0;
                     ++diag_right_copy_count;
                     if (diag_right_copy_count <= 60 || diag_right_copy_count % 300 == 1) {
@@ -2428,8 +2429,9 @@ void D3D12Component::OpenXR::copy(
             //   - already black in the source (upstream UE/engine rendering issue), or
             //   - fine in the source but black in the destination (bug in our copy/compositor).
             // Waited on the fence first so the copy has actually completed by the time we read.
-            if (swapchain_idx == (uint32_t)runtimes::OpenXR::SwapchainIndex::AFR_LEFT_EYE ||
-                swapchain_idx == (uint32_t)runtimes::OpenXR::SwapchainIndex::AFR_RIGHT_EYE) {
+            if (vr->is_diag_verbose_logging_enabled() &&
+                (swapchain_idx == (uint32_t)runtimes::OpenXR::SwapchainIndex::AFR_LEFT_EYE ||
+                 swapchain_idx == (uint32_t)runtimes::OpenXR::SwapchainIndex::AFR_RIGHT_EYE)) {
                 static uint32_t diag_dst_left_count = 0;
                 static uint32_t diag_dst_right_count = 0;
 
