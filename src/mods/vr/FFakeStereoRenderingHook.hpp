@@ -340,6 +340,11 @@ public:
         return m_pixel_format_cvar_found;
     }
 
+    // Region of ui_target (pixels) the redirected LGUI pass actually draws into. Zero when no redirect happened.
+    struct UIDrawExtent { int32_t width{0}; int32_t height{0}; };
+    UIDrawExtent get_ui_draw_extent() const { return m_ui_draw_extent; }
+    void set_ui_draw_extent(int32_t w, int32_t h) { m_ui_draw_extent = {w, h}; }
+
     void attempt_hooking();
     void attempt_hook_game_engine_tick(uintptr_t return_address = 0);
     void attempt_hook_slate_thread(uintptr_t return_address = 0, bool alternate = false);
@@ -639,6 +644,7 @@ private:
     bool m_special_detected_4_27{false};
     bool m_manually_constructed{false};
     bool m_pixel_format_cvar_found{false};
+    UIDrawExtent m_ui_draw_extent{};
     bool m_injected_stereo_at_runtime{false};
     bool m_has_double_precision{false}; // for the projection matrix... AND the view offset... IS UE5 DOING THIS NOW???
     bool m_fixed_localplayer_view_count{false};

@@ -834,6 +834,17 @@ std::optional<std::reference_wrapper<XrCompositionLayerQuad>> OverlayComponent::
     layer.subImage.imageRect.offset.y = 0;
     layer.subImage.imageRect.extent.width = ui_swapchain.width;
     layer.subImage.imageRect.extent.height = ui_swapchain.height;
+
+    // The redirected LGUI pass only draws into a sub-rectangle of ui_target (game viewport aspect, top-left aligned).
+    // Show just that region so the UI keeps its native proportions instead of being stretched over the full quad.
+    if (auto& hook = vr->get_fake_stereo_hook(); hook != nullptr) {
+        const auto ext = hook->get_ui_draw_extent();
+        if (ext.width > 0 && ext.height > 0 && ext.width <= (int32_t)ui_swapchain.width && ext.height <= (int32_t)ui_swapchain.height) {
+            layer.subImage.imageRect.extent.width = ext.width;
+            layer.subImage.imageRect.extent.height = ext.height;
+        }
+    }
+
     layer.eyeVisibility = eye;
 
     auto glm_matrix = glm::identity<glm::mat4>();
@@ -857,7 +868,7 @@ std::optional<std::reference_wrapper<XrCompositionLayerQuad>> OverlayComponent::
     }
 
     const auto size_meters = m_parent->m_slate_size->value();
-    const auto meters_w = (float)ui_swapchain.width / (float)ui_swapchain.height * size_meters;
+    const auto meters_w = (float)layer.subImage.imageRect.extent.width / (float)layer.subImage.imageRect.extent.height * size_meters;
     const auto meters_h = size_meters;
     layer.size = {meters_w, meters_h};
 
@@ -899,8 +910,8 @@ std::optional<std::reference_wrapper<XrCompositionLayerQuad>> OverlayComponent::
                 m_parent->m_intersect_state.intersecting = true;
 
                 if (auto it = vr->m_openxr->swapchains.find((uint32_t)runtimes::OpenXR::SwapchainIndex::UI); it != vr->m_openxr->swapchains.end()) {
-                    const auto client_x = (int32_t)((float)it->second.width * x);
-                    const auto client_y = (int32_t)((float)it->second.height * y);
+                    const auto client_x = (int32_t)((float)layer.subImage.imageRect.extent.width * x);
+                    const auto client_y = (int32_t)((float)layer.subImage.imageRect.extent.height * y);
 
                     m_parent->m_intersect_state.swapchain_intersection_point = {client_x, client_y};
                 }
@@ -941,6 +952,15 @@ std::optional<std::reference_wrapper<XrCompositionLayerCylinderKHR>> OverlayComp
     layer.subImage.imageRect.offset.y = 0;
     layer.subImage.imageRect.extent.width = ui_swapchain.width;
     layer.subImage.imageRect.extent.height = ui_swapchain.height;
+
+    if (auto& hook = vr->get_fake_stereo_hook(); hook != nullptr) {
+        const auto ext = hook->get_ui_draw_extent();
+        if (ext.width > 0 && ext.height > 0 && ext.width <= (int32_t)ui_swapchain.width && ext.height <= (int32_t)ui_swapchain.height) {
+            layer.subImage.imageRect.extent.width = ext.width;
+            layer.subImage.imageRect.extent.height = ext.height;
+        }
+    }
+
     layer.eyeVisibility = eye;
     
     auto glm_matrix = glm::identity<glm::mat4>();
@@ -964,7 +984,7 @@ std::optional<std::reference_wrapper<XrCompositionLayerCylinderKHR>> OverlayComp
     }
 
     const auto size_meters = m_parent->m_slate_size->value();
-    const auto meters_w = (float)ui_swapchain.width / (float)ui_swapchain.height * size_meters;
+    const auto meters_w = (float)layer.subImage.imageRect.extent.width / (float)layer.subImage.imageRect.extent.height * size_meters;
     const auto meters_h = size_meters;
 
     // OpenXR Docs:

@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 #include <optional>
 #include <memory>
@@ -25,52 +25,8 @@ public:
     void on_config_load(const utility::Config& cfg, bool set_defaults) override;
 
     void dump_commands();
-    void dump_foliage_systems();
     void dump_shadow_systems();
     void dump_systems_by_name(const char* tag, const std::vector<std::string>& needles);
-    void dump_plant_anim_instances();
-    // DIAG (far-tree sway): dump MaterialParameterCollection(s) + live instances; repeated presses diff scalar values.
-    void dump_material_parameter_collections();
-    static inline std::unordered_map<std::string, float> s_mpc_scalar_snapshot{};
-    // DIAG (far-tree sway): scale KuroImposterVer2Component::StartDistance/MaxDistance on all live instances.
-    // scale <= 0 restores originals.
-    void apply_imposter_distance_scale(float scale);
-    static inline float s_imposter_distance_scale{1.0f};
-    static inline std::unordered_map<uintptr_t, std::pair<float, float>> s_imposter_distance_originals{};
-
-    // DIAG (far-tree sway): sweep the executable's writable data for dwords that increment by exactly 1 per
-    // engine tick (GFrameCounter/GFrameNumber + any engine/Kuro-private per-frame counters). Once found they
-    // can be bumped (+1) around NSF Pass 2's BeginRenderViewFamily so it looks like a new frame to per-frame gates.
-    void frame_counter_sweep_tick();
-    static void bump_frame_counters_for_pass2(bool begin);
-    static inline bool s_frame_counter_sweep_requested{false};
-    static inline bool s_bump_frame_counters_pass2{false};
-    static inline uint32_t s_frame_counter_sweep_pass{0};
-    static inline std::vector<uint8_t> s_frame_counter_snapshot{};
-    static inline std::vector<std::pair<uintptr_t, uint32_t>> s_frame_counter_ranges{}; // (address, size) of scanned regions
-    static inline std::vector<uint32_t*> s_frame_counter_candidates{};
-    static inline std::vector<uint8_t> s_frame_counter_strikes{};
-    static inline std::vector<uint32_t*> s_frame_counters{};
-    static inline uint32_t s_frame_counter_bumps{0};
-
-    // DIAG: KuroImposterUpdater::UpdateImposters native hook (far-tree sway investigation).
-    void hook_imposter_updater();
-    static void imposter_updater_native_hook(sdk::UObject* obj, void* frame, void* result);
-    // Called by the NSF render path right before Pass 2 (right eye) is submitted.
-    static void rerun_imposter_update_for_pass2();
-
-    static inline bool s_rerun_imposter_update_before_pass2{false};
-    static inline bool s_rerun_imposter_use_real_dt{false};
-    static inline bool s_imposter_params_captured{false};
-    static inline float s_last_engine_delta{0.0f};
-    static inline sdk::UObject* s_imposter_last_dir_light{nullptr};
-    static inline float s_imposter_last_delta_time{0.0f};
-    static inline sdk::UFunction* s_imposter_update_fn{nullptr};
-    static inline sdk::UObject* s_imposter_updater_last_obj{nullptr};
-    static inline std::unique_ptr<PointerHook> s_imposter_update_hook{};
-    static inline uint32_t s_imposter_update_calls_total{0};
-    static inline uint32_t s_imposter_update_calls_window{0};
-    static inline uint32_t s_imposter_update_reruns{0};
 
     std::vector<std::string> m_pending_exec{};
     void spawn_console();

@@ -2,6 +2,7 @@
 
 #include <windows.h>
 #include <winternl.h>
+#include <unordered_set>
 
 #include <asmjit/asmjit.h>
 #include <future>
@@ -2631,7 +2632,91 @@ static FSceneViewExtensions* g_engine_view_extensions{nullptr}; // GEngine->View
 struct SceneViewExtensionAnalyzer;
 
 static void diag_dump_engine_view_extensions(sdk::FSceneViewFamily& view_family);
-#include "lgui_anchor_scan.inc"
+
+// Diagnostic (one-shot, background thread): find LGUI renderer string anchors in the game module and
+// the functions that reference them, to locate the UI draw callsite since it is not a view extension.
+static void diag_scan_lgui_render_anchors() {
+    static bool started = false;
+    if (started) return;
+    started = true;
+
+    std::thread([]() {
+        try {
+            const auto exe = utility::get_executable();
+            const auto base = (uintptr_t)exe;
+            const auto size = utility::get_module_size(exe).value_or(0);
+            SPDLOG_INFO("[LGUI_ANCHOR] scanning module {:x} size {:x}", base, size);
+
+            const std::vector<std::wstring> wanchors = {
+                L"LGUIRenderer", L"RenderLGUI", L"LGUIHudRender", L"ScreenSpaceOverlay",
+            };
+            const std::vector<std::string> anchors = {
+                "ScreenSpaceOverlay", "RenderLGUI", "LGUIHudRender",
+            };
+
+            auto report = [&](const std::string& tag, uintptr_t str_addr, bool wide) {
+                // Rewind to the real start of the string (previous NUL) since substring hits land mid-string
+                const size_t cw = wide ? 2 : 1;
+                auto start = str_addr;
+                for (size_t k = 0; k < 256; ++k) {
+                    const auto prev = start - cw;
+                    if (IsBadReadPtr((void*)prev, cw)) break;
+                    const bool is_nul = wide ? (*(const uint16_t*)prev == 0) : (*(const uint8_t*)prev == 0);
+                    if (is_nul) break;
+                    start = prev;
+                }
+
+                auto refs = utility::scan_displacement_references(exe, start);
+                const auto rel_count = refs.size();
+                if (refs.empty()) {
+                    if (const auto abs = utility::scan_reference(exe, start, false); abs.has_value()) {
+                        refs.push_back(*abs);
+                    }
+                }
+
+                std::string fns{};
+                size_t shown = 0;
+                for (const auto ref : refs) {
+                    const auto fn = utility::find_function_start_with_call(ref);
+                    fns += fmt::format("ref={:x}", ref - base);
+                    if (fn) fns += fmt::format("(fn={:x})", *fn - base);
+                    fns += ",";
+                    if (++shown >= 8) { fns += "..."; break; }
+                }
+
+                SPDLOG_INFO("[LGUI_ANCHOR] {} @rva {:x} start={:x} refs={} rel={} [{}]", tag, str_addr - base, start - base, refs.size(), rel_count, fns);
+            };
+
+            for (const auto& a : wanchors) {
+                const auto hits = utility::scan_strings(exe, a, false);
+                SPDLOG_INFO("[LGUI_ANCHOR] L\"{}\" hits={}", utility::narrow(a), hits.size());
+                size_t n = 0;
+                for (const auto h : hits) {
+                    std::wstring full{};
+                    for (auto p = (const wchar_t*)h; !IsBadReadPtr(p, 2) && *p != 0 && full.size() < 96; ++p) full += *p;
+                    report(fmt::format("  L\"{}\"", utility::narrow(full)), h, true);
+                    if (++n >= 8) break;
+                }
+            }
+
+            for (const auto& a : anchors) {
+                const auto hits = utility::scan_strings(exe, a, false);
+                SPDLOG_INFO("[LGUI_ANCHOR] \"{}\" hits={}", a, hits.size());
+                size_t n = 0;
+                for (const auto h : hits) {
+                    std::string full{};
+                    for (auto p = (const char*)h; !IsBadReadPtr(p, 1) && *p != 0 && full.size() < 96; ++p) full += *p;
+                    report(fmt::format("  \"{}\"", full), h, false);
+                    if (++n >= 8) break;
+                }
+            }
+
+            SPDLOG_INFO("[LGUI_ANCHOR] scan complete");
+        } catch (...) {
+            SPDLOG_ERROR("[LGUI_ANCHOR] exception during scan");
+        }
+    }).detach();
+}
 
 struct SceneViewExtensionAnalyzer {
     template<int N>
@@ -3067,11 +3152,1064 @@ struct SceneViewExtensionAnalyzer {
 
 // Diagnostic: enumerates every ISceneViewExtension registered in GEngine->ViewExtensions
 // so we can identify which one belongs to the game's UI renderer (e.g. LGUI's FLGUIRenderer)
+// LGUI screen-space UI draw: ISceneViewExtension slot 24 on the two LGUI classes (vtable rva 26ca0760 / 26ca0830).
+// Confirmed by bisect: stubbing slot 24 on both removes main menu UI and in-game HUD; 25 alone does not.
+static std::unordered_map<uintptr_t, uintptr_t> g_lgui_slot24_originals{}; // vtable -> original fn
+static constexpr int32_t LGUI_DRAW_SLOT = 24;
+
+// LGUI's screen-space draw is a TRDGLambdaPass (vtable rva 276032d0, found by diffing the FRDGBuilder pass registry at
+// a2+0x378 / arr+0x1168 across the slot-24 call). Slot 1 of that vtable is Execute(FRHIComputeCommandList&).
+// We hook it so the RHI swap on the ViewFamilyTexture FRDGTexture can be undone right after LGUI has drawn.
+static uintptr_t g_lgui_pass_vtable = 0;
+static uintptr_t g_lgui_pass_execute_original = 0;
+static constexpr int32_t LGUI_PASS_EXECUTE_SLOT = 1;
+
+struct LguiSwapState {
+    void* rdg_texture{nullptr};
+    void* shadow_copy{nullptr};
+    void* original_rhi{nullptr};
+    void* ui_target{nullptr};
+    uintptr_t rdg_texture_vtable{0};
+    bool armed{false};
+    bool pass_seen_this_frame{false};
+};
+static LguiSwapState g_lgui_swap{};
+
+// Diagnostic only, kept deliberately cheap: dump the LGUI pass object (lambda captures live inline in TRDGLambdaPass) and
+// flag any qword equal to the textures we know about. No recursion / deep scanning: that stalled the render thread.
+static bool lgui_copy_pass_seh(void* pass, uintptr_t* out, int count) {
+    __try {
+        for (int k = 0; k < count; ++k) {
+            out[k] = ((uintptr_t*)pass)[k];
+        }
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+static void lgui_dump_pass_seh(void* pass, std::string& raw, std::string& hits) {
+    const auto real = (uintptr_t)g_lgui_swap.rdg_texture;
+    const auto copy = (uintptr_t)g_lgui_swap.shadow_copy;
+    const auto orig = (uintptr_t)g_lgui_swap.original_rhi;
+    const auto ui = (uintptr_t)g_lgui_swap.ui_target;
+    const auto rdg_vt = g_lgui_swap.rdg_texture_vtable;
+
+    constexpr int COUNT = 96;
+    uintptr_t q[COUNT]{};
+
+    if (!lgui_copy_pass_seh(pass, q, COUNT)) {
+        hits += "<fault>";
+    }
+
+    for (int k = 0; k < COUNT; ++k) {
+        const auto v = q[k];
+        raw += fmt::format("{:x},", v);
+        if (v == real) hits += fmt::format("[{}]=REAL ", k);
+        else if (copy != 0 && v == copy) hits += fmt::format("[{}]=COPY ", k);
+        else if (orig != 0 && v == orig) hits += fmt::format("[{}]=ORIG_RHI ", k);
+        else if (ui != 0 && v == ui) hits += fmt::format("[{}]=UI_RHI ", k);
+        else if (v > 0x10000 && (v & 7) == 0 && !IsBadReadPtr((void*)v, 0x60)) {
+            const auto vt = *(uintptr_t*)v;
+            if (rdg_vt != 0 && vt == rdg_vt) {
+                hits += fmt::format("[{}]=RDGTEX({:x} rhi={:x} ext={}x{}) ", k, v, *(uintptr_t*)(v + 0x10), *(int32_t*)(v + 0x54), *(int32_t*)(v + 0x58));
+            } else if (orig != 0 && !IsBadReadPtr((void*)orig, 8) && vt == *(uintptr_t*)orig) {
+                hits += fmt::format("[{}]=RHITEX({:x} ext={}x{}) ", k, v, *(int32_t*)(v + 0x54), *(int32_t*)(v + 0x58));
+            }
+        }
+    }
+}
+
+static void lgui_pass_execute_hook(void* pass, void* rhi_cmd_list) {
+    static uint32_t exec_count = 0;
+    const auto n = exec_count++;
+
+    const auto og = (void(*)(void*, void*))g_lgui_pass_execute_original;
+
+    if (n < 6 || (n % 1200) == 0) {
+        std::string raw{}, hits{};
+        lgui_dump_pass_seh(pass, raw, hits);
+        SPDLOG_INFO("[LGUI_SWAP] execute: pass={:x} real={:x} copy={:x} orig_rhi={:x} refs: {}", (uintptr_t)pass,
+            (uintptr_t)g_lgui_swap.rdg_texture, (uintptr_t)g_lgui_swap.shadow_copy, (uintptr_t)g_lgui_swap.original_rhi, hits.empty() ? "<none>" : hits);
+        SPDLOG_INFO("[LGUI_SWAP]   pass raw=[{}]", raw);
+    }
+
+    og(pass, rhi_cmd_list);
+}
+
+static void lgui_try_hook_pass_vtable(uintptr_t pass) {
+    if (g_lgui_pass_execute_original != 0 || pass < 0x10000 || IsBadReadPtr((void*)pass, sizeof(uintptr_t))) {
+        return;
+    }
+
+    const auto vt = *(uintptr_t*)pass;
+    if (IsBadReadPtr((void*)vt, sizeof(uintptr_t) * (LGUI_PASS_EXECUTE_SLOT + 1))) {
+        return;
+    }
+
+    const auto m = utility::get_module_within((void*)vt);
+    if (!m.has_value() || *m != utility::get_executable()) {
+        return;
+    }
+
+    auto slot_ptr = (uintptr_t*)(vt + sizeof(uintptr_t) * LGUI_PASS_EXECUTE_SLOT);
+    const auto fn = *slot_ptr;
+    if (fn == 0 || !utility::get_module_within((void*)fn).has_value()) {
+        return;
+    }
+
+    DWORD old{};
+    if (VirtualProtect(slot_ptr, sizeof(uintptr_t), PAGE_READWRITE, &old)) {
+        g_lgui_pass_vtable = vt;
+        g_lgui_pass_execute_original = fn;
+        *slot_ptr = (uintptr_t)&lgui_pass_execute_hook;
+        VirtualProtect(slot_ptr, sizeof(uintptr_t), old, &old);
+        SPDLOG_INFO("[LGUI_SWAP] hooked pass Execute: vtable rva={:x} slot{} fn rva={:x}", vt - (uintptr_t)*m, LGUI_PASS_EXECUTE_SLOT, fn - (uintptr_t)*m);
+    }
+}
+
+static void* lgui_slot24_hook(void* self, void* a2, void* a3, void* a4, void* a5, void* a6) {
+    const auto vtable = *(uintptr_t*)self;
+    const auto it = g_lgui_slot24_originals.find(vtable);
+
+    if (it == g_lgui_slot24_originals.end()) {
+        return nullptr;
+    }
+
+    static uint32_t call_count = 0;
+    const auto n = call_count++;
+
+    // Hook the LGUI TRDGLambdaPass::Execute up front (vtable exe+276032d0, slots 228bc610/228bde10 observed in the
+    // registry diff log) so the execute-time diagnostics run regardless of which record-time path returns below.
+    if (g_lgui_pass_execute_original == 0) {
+        static bool tried_static = false;
+        if (!tried_static) {
+            tried_static = true;
+            const auto exe = (uintptr_t)utility::get_executable();
+            const auto vt = exe + 0x276032d0;
+            if (!IsBadReadPtr((void*)vt, sizeof(uintptr_t) * 4)) {
+                const auto s0 = ((uintptr_t*)vt)[0], s1 = ((uintptr_t*)vt)[1];
+                const auto m0 = utility::get_module_within((void*)s0), m1 = utility::get_module_within((void*)s1);
+                SPDLOG_INFO("[LGUI_SWAP] static vtable check: vt={:x} slot0 rva={:x} slot1 rva={:x}", vt,
+                    m0.has_value() ? s0 - exe : 0, m1.has_value() ? s1 - exe : 0);
+                if (m0.has_value() && m1.has_value() && s0 - exe == 0x228bc610 && s1 - exe == 0x228bde10) {
+                    uintptr_t fake_pass = vt;
+                    lgui_try_hook_pass_vtable((uintptr_t)&fake_pass);
+                }
+            }
+        }
+    }
+
+    if (n < 40 || (n % 600) == 0) {
+        const auto module = utility::get_module_within((void*)vtable);
+        const auto vrva = module.has_value() ? vtable - (uintptr_t)*module : vtable;
+        const auto ret = (uintptr_t)_ReturnAddress();
+        const auto ret_mod = utility::get_module_within((void*)ret);
+
+        // Hypothesis A: a3 is FSceneViewFamily (PostRenderViewFamily_RenderThread). Validate via views[k]->Family == a3.
+        // Hypothesis B: a3 is FSceneView (PostRenderView_RenderThread); its first member is Family.
+        std::string decoded{};
+
+        if (a3 != nullptr && !IsBadReadPtr(a3, 0x100)) {
+            const auto fam = (sdk::FSceneViewFamily*)a3;
+            const auto views = fam->get_views();
+
+            if (views != nullptr && !IsBadReadPtr(views, sizeof(*views)) && views->count > 0 && views->count <= 4 && views->data != nullptr && !IsBadReadPtr(views->data, sizeof(void*) * views->count)) {
+                bool ok = true;
+                std::string vs{};
+                for (int32_t k = 0; k < views->count; ++k) {
+                    const auto v = (uintptr_t)views->data[k];
+                    if (v == 0 || IsBadReadPtr((void*)v, 0xB00) || *(uintptr_t*)v != (uintptr_t)a3) { ok = false; break; }
+                    vs += fmt::format("{:x}(pass={}),", v, *(uint32_t*)(v + 0xAF0));
+                }
+                if (ok) {
+                    decoded = fmt::format("a3=FAMILY nviews={} views=[{}]", views->count, vs);
+                }
+            }
+
+            if (decoded.empty() && !IsBadReadPtr(a3, 0xB00)) {
+                const auto fam2 = *(uintptr_t*)a3;
+                if (fam2 != 0 && !IsBadReadPtr((void*)fam2, 0x100)) {
+                    const auto views2 = ((sdk::FSceneViewFamily*)fam2)->get_views();
+                    int32_t idx = -1;
+                    if (views2 != nullptr && !IsBadReadPtr(views2, sizeof(*views2)) && views2->count > 0 && views2->count <= 4) {
+                        for (int32_t k = 0; k < views2->count; ++k) {
+                            if ((uintptr_t)views2->data[k] == (uintptr_t)a3) { idx = k; break; }
+                        }
+                    }
+                    if (idx >= 0) {
+                        decoded = fmt::format("a3=VIEW family={:x} nviews={} view_index={} pass={}", fam2, views2->count, idx, *(uint32_t*)((uintptr_t)a3 + 0xAF0));
+                    }
+                }
+            }
+        }
+
+        if (decoded.empty()) {
+            decoded = "a3=UNKNOWN";
+        }
+
+        // Raw dumps so we can identify the arg types by hand (stereo pass 0xAF0 for views, TArray<FSceneView*> for families)
+        auto dump_qwords = [](void* p, int count) -> std::string {
+            std::string s{};
+            if (p == nullptr || IsBadReadPtr(p, sizeof(uintptr_t) * count)) return "<bad>";
+            for (int k = 0; k < count; ++k) s += fmt::format("{:x},", ((uintptr_t*)p)[k]);
+            return s;
+        };
+        auto probe_view = [](void* p) -> std::string {
+            if (p == nullptr || IsBadReadPtr(p, 0xB00)) return "<bad>";
+            return fmt::format("pass@af0={} fam@0={:x}", *(uint32_t*)((uintptr_t)p + 0xAF0), *(uintptr_t*)p);
+        };
+
+        if (n < 6) {
+            // a3/a4 share a vtable (16759ec60) and look like FRDGResource: [vtable, const TCHAR* Name, ...]
+            auto rdg_name = [](void* p) -> std::string {
+                if (p == nullptr || IsBadReadPtr(p, 0x10)) return "<bad>";
+                const auto name = *(wchar_t**)((uintptr_t)p + 8);
+                if (name == nullptr || IsBadReadPtr(name, 64)) return "<noname>";
+                std::wstring w{name, wcsnlen(name, 64)};
+                return utility::narrow(w);
+            };
+            SPDLOG_INFO("[LGUI_DRAW]   a3 raw=[{}] {} name=\"{}\"", dump_qwords(a3, 12), probe_view(a3), rdg_name(a3));
+            SPDLOG_INFO("[LGUI_DRAW]   a4 raw=[{}] {} name=\"{}\"", dump_qwords(a4, 12), probe_view(a4), rdg_name(a4));
+            // a5 is packed data (two floats: looks like 1/w, 1/h of the target), a6 == 0
+            const auto a5v = (uintptr_t)a5;
+            float a5f[2]{};
+            memcpy(a5f, &a5v, sizeof(a5f));
+            SPDLOG_INFO("[LGUI_DRAW]   a5={:x} as_floats=({}, {}) inv=({}, {}) a6={:x}", a5v, a5f[0], a5f[1],
+                a5f[0] != 0.0f ? 1.0f / a5f[0] : 0.0f, a5f[1] != 0.0f ? 1.0f / a5f[1] : 0.0f, (uintptr_t)a6);
+
+            // LGUI gets no FSceneView here, so its viewport/projection must come from its own state: dump the extension object
+            if (n < 2) {
+                SPDLOG_INFO("[LGUI_DRAW]   self[0..23]=[{}]", dump_qwords(self, 24));
+                SPDLOG_INFO("[LGUI_DRAW]   self[24..47]=[{}]", dump_qwords((void*)((uintptr_t)self + 24 * 8), 24));
+                SPDLOG_INFO("[LGUI_DRAW]   self[48..71]=[{}]", dump_qwords((void*)((uintptr_t)self + 48 * 8), 24));
+
+                // self+0x38.. looks like float matrices (1.0/-1.0/100.0/1280.x): decode as floats
+                std::string fl{};
+                for (uint32_t off = 0x38; off < 0x110; off += 4) {
+                    fl += fmt::format("{:x}={:.3f} ", off, *(float*)((uintptr_t)self + off));
+                }
+                SPDLOG_INFO("[LGUI_DRAW]   self floats: {}", fl);
+
+                // Find where LGUI caches the viewport/canvas size: scan for plausible pixel sizes (ints/floats in [600, 8192])
+                std::string sizes{};
+                for (uint32_t off = 0; off < 0x800; off += 4) {
+                    if (IsBadReadPtr((void*)((uintptr_t)self + off), 4)) break;
+                    const auto iv = *(int32_t*)((uintptr_t)self + off);
+                    const auto fv = *(float*)((uintptr_t)self + off);
+                    if (iv >= 600 && iv <= 8192) sizes += fmt::format("{:x}=i{} ", off, iv);
+                    else if (fv >= 600.0f && fv <= 8192.0f && std::isfinite(fv)) sizes += fmt::format("{:x}=f{:.1f} ", off, fv);
+                }
+                SPDLOG_INFO("[LGUI_DRAW]   self size-like values: {}", sizes);
+                SPDLOG_INFO("[LGUI_DRAW]   hmd={}x{} (a5 is constant across resolutions -> likely NOT the RT size)", VR::get()->get_hmd_width(), VR::get()->get_hmd_height());
+
+                // FRDGTexture desc: dump 32 dwords of a3 to find Extent (w,h ints), and compare with a4
+                auto dump_dwords = [](void* p, int count) -> std::string {
+                    std::string s{};
+                    if (p == nullptr || IsBadReadPtr(p, sizeof(uint32_t) * count)) return "<bad>";
+                    for (int k = 0; k < count; ++k) {
+                        const auto v = ((uint32_t*)p)[k];
+                        if (v >= 64 && v <= 16384) s += fmt::format("[{}]={} ", k, v);
+                    }
+                    return s;
+                };
+                SPDLOG_INFO("[LGUI_DRAW]   a3 int-like dwords: {}", dump_dwords(a3, 64));
+                SPDLOG_INFO("[LGUI_DRAW]   a4 int-like dwords: {}", dump_dwords(a4, 64));
+
+                // ViewFamilyTexture extent is 2*hmd_w x hmd_h yet LGUI's layout doesn't follow it. Find where LGUI caches
+                // its viewport size: scan objects pointed to by self (2 levels) for any pixel-size-like dwords [600, 8192].
+                auto scan_sizes = [](uintptr_t p, uint32_t len) -> std::string {
+                    std::string hits{};
+                    for (uint32_t off = 0; off < len; off += 4) {
+                        const auto v = *(uint32_t*)(p + off);
+                        if (v >= 600 && v <= 8192) hits += fmt::format("{:x}={} ", off, v);
+                    }
+                    return hits;
+                };
+                for (int k = 1; k < 24; ++k) {
+                    const auto p = ((uintptr_t*)self)[k];
+                    if (p < 0x10000 || IsBadReadPtr((void*)p, 0x400)) continue;
+                    const auto pvt = *(uintptr_t*)p;
+                    const auto pm = utility::get_module_within((void*)pvt);
+                    const auto hits = scan_sizes(p, 0x400);
+                    SPDLOG_INFO("[LGUI_DRAW]   self[{}]={:x} vt_rva={:x} sizes: {}", k, p, pm.has_value() ? pvt - (uintptr_t)*pm : 0, hits.empty() ? "<none>" : hits);
+
+                    for (int j = 0; j < 32; ++j) {
+                        const auto q = ((uintptr_t*)p)[j];
+                        if (q < 0x10000 || IsBadReadPtr((void*)q, 0x200)) continue;
+                        const auto h2 = scan_sizes(q, 0x200);
+                        if (!h2.empty()) SPDLOG_INFO("[LGUI_DRAW]     self[{}][{}]={:x} sizes: {}", k, j, q, h2);
+                    }
+                }
+
+                // FRDGTexture: [2] should be the pooled RT / RHI resource. Compare against UEVR's targets.
+                auto describe_rhi = [&](void* rdg) -> std::string {
+                    if (rdg == nullptr || IsBadReadPtr(rdg, 0x40)) return "<bad>";
+                    const auto p2 = ((uintptr_t*)rdg)[2];
+                    std::string s = fmt::format("[2]={:x}", p2);
+                    if (p2 != 0 && !IsBadReadPtr((void*)p2, 0x60)) {
+                        const auto vt = *(uintptr_t*)p2;
+                        const auto m = utility::get_module_within((void*)vt);
+                        s += fmt::format(" vt_rva={:x} q=[{}]", m.has_value() ? vt - (uintptr_t)*m : vt, dump_qwords((void*)p2, 12));
+                    }
+                    return s;
+                };
+                const auto ui_target = g_hook != nullptr && g_hook->get_render_target_manager() != nullptr ? (uintptr_t)g_hook->get_render_target_manager()->get_ui_target() : 0;
+                SPDLOG_INFO("[LGUI_DRAW]   a3 {} | ui_target={:x}", describe_rhi(a3), ui_target);
+                SPDLOG_INFO("[LGUI_DRAW]   a4 {}", describe_rhi(a4));
+
+                // Stock LGUI takes the viewport from FSceneView::UnscaledViewRect in PostRenderView_RenderThread(FRDGBuilder&, FSceneView&).
+                // self holds only the design resolution (1280x768) and a3/a4 are RDG textures, so a2 is the only remaining
+                // candidate for the view (or GraphBuilder). Dump it: FSceneView has Family at +0, view rects as int32 pairs.
+                if (a2 != nullptr && !IsBadReadPtr(a2, 0x1000)) {
+                    const auto a2vt = *(uintptr_t*)a2;
+                    const auto a2m = utility::get_module_within((void*)a2vt);
+                    SPDLOG_INFO("[LGUI_DRAW]   a2 q0_rva={:x} raw=[{}]", a2m.has_value() ? a2vt - (uintptr_t)*a2m : 0, dump_qwords(a2, 16));
+
+                    std::string rects{};
+                    const auto hw = (int32_t)VR::get()->get_hmd_width();
+                    const auto hh = (int32_t)VR::get()->get_hmd_height();
+                    for (uint32_t off = 0; off < 0x1000; off += 4) {
+                        const auto v = *(int32_t*)((uintptr_t)a2 + off);
+                        if (v == hw || v == hh || v == hw * 2) rects += fmt::format("{:x}={} ", off, v);
+                    }
+                    SPDLOG_INFO("[LGUI_DRAW]   a2 hmd-size hits (hmd={}x{}): {}", hw, hh, rects.empty() ? "<none>" : rects);
+
+                    // Also try a2 as a view: does a2->Family (+0) contain a2 in its Views array?
+                    const auto fam = *(uintptr_t*)a2;
+                    if (fam != 0 && !IsBadReadPtr((void*)fam, 0x100)) {
+                        const auto views = ((sdk::FSceneViewFamily*)fam)->get_views();
+                        if (views != nullptr && !IsBadReadPtr(views, sizeof(*views)) && views->count > 0 && views->count <= 4 && views->data != nullptr && !IsBadReadPtr(views->data, sizeof(void*) * views->count)) {
+                            for (int32_t k = 0; k < views->count; ++k) {
+                                if ((uintptr_t)views->data[k] == (uintptr_t)a2) {
+                                    SPDLOG_INFO("[LGUI_DRAW]   a2 IS FSceneView: family={:x} nviews={} view_index={}", fam, views->count, k);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        SPDLOG_INFO("[LGUI_DRAW] #{} vtable_rva={:x} self={:x} rdg={:x} a3={:x} a4={:x} ret_rva={:x} frame={} {}",
+            n, vrva, (uintptr_t)self, (uintptr_t)a2, (uintptr_t)a3, (uintptr_t)a4,
+            ret_mod.has_value() ? ret - (uintptr_t)*ret_mod : ret, VR::get()->get_frame_count(), decoded);
+    }
+
+    // EXPERIMENT: LGUI gets no view rect; it appears to size its ortho canvas from the target's Desc.Extent
+    // (a3 dwords [21],[22] == 2*hmd_w, hmd_h). A 16:9 canvas laid out over a 6296-wide target is 3541 tall,
+    // so only the top-left quarter lands in the left eye ("blown up top-left corner"). Temporarily present the
+    // extent as one eye wide while LGUI records its pass; restore afterwards.
+    // RESULT: patching extent.x had no visible effect -> LGUI does not derive its layout from Desc.Extent.
+    constexpr bool LGUI_PATCH_EXTENT = false;
+    constexpr int LGUI_EXTENT_X_DWORD = 21;
+    uint32_t saved_extent_x = 0;
+    bool patched = false;
+
+    if (LGUI_PATCH_EXTENT && a3 != nullptr && !IsBadReadPtr(a3, 0x80)) {
+        const auto hw = VR::get()->get_hmd_width();
+        auto& ext_x = ((uint32_t*)a3)[LGUI_EXTENT_X_DWORD];
+        if (hw > 0 && ext_x == hw * 2) {
+            saved_extent_x = ext_x;
+            ext_x = hw;
+            patched = true;
+            if (n < 5) SPDLOG_INFO("[LGUI_DRAW]   patched a3 extent.x {} -> {}", saved_extent_x, hw);
+        }
+    }
+
+    // a2 is NOT an FSceneView: its first qword equals a5 (packed 1/w,1/h floats), it is stable across frames (58883b3d0),
+    // and it is >0x1000 readable with the eye size repeated at 0x3e0/0x410/0x4a0/0x4f8. That layout matches a per-view
+    // uniform-parameter block (ViewSizeAndInvSize / BufferSizeAndInvSize / ViewRect...). Dump that block as int+float pairs.
+    if (n < 3 && a2 != nullptr && !IsBadReadPtr(a2, 0x520)) {
+        std::string head{};
+        for (uint32_t off = 0; off < 0x60; off += 4) head += fmt::format("{:x}={:.4f} ", off, *(float*)((uintptr_t)a2 + off));
+        SPDLOG_INFO("[LGUI_DRAW]   a2 head floats: {}", head);
+
+        std::string rb{};
+        for (uint32_t off = 0x3d0; off < 0x510; off += 4) {
+            const auto iv = *(int32_t*)((uintptr_t)a2 + off);
+            const auto fv = *(float*)((uintptr_t)a2 + off);
+            if (iv > -16384 && iv < 16384) rb += fmt::format("{:x}=i{} ", off, iv);
+            else rb += fmt::format("{:x}=f{:.4f} ", off, fv);
+        }
+        SPDLOG_INFO("[LGUI_DRAW]   a2 size block: {}", rb);
+
+        // Nothing in the block equals the real target width (2*hmd_w). Look for it as an inverse (1/w, 1/h) or ratio
+        // (hmd_w / 2hmd_w = 0.5) anywhere in the block, and dump every "interesting" float in 0x60..0x3d0.
+        const auto hw = (float)VR::get()->get_hmd_width();
+        const auto hh = (float)VR::get()->get_hmd_height();
+        std::string inv{};
+        std::string mid{};
+        for (uint32_t off = 0; off < 0x1000; off += 4) {
+            const auto fv = *(float*)((uintptr_t)a2 + off);
+            if (!std::isfinite(fv) || fv == 0.0f) continue;
+            auto approx = [&](float a, float b) { return std::fabs(a - b) <= std::fabs(b) * 0.002f; };
+            if (approx(fv, 1.0f / hw)) inv += fmt::format("{:x}=1/hmd_w ", off);
+            else if (approx(fv, 1.0f / hh)) inv += fmt::format("{:x}=1/hmd_h ", off);
+            else if (approx(fv, 1.0f / (hw * 2.0f))) inv += fmt::format("{:x}=1/(2hmd_w) ", off);
+            else if (approx(fv, hw * 2.0f)) inv += fmt::format("{:x}=2hmd_w ", off);
+            else if (approx(fv, hw / hh)) inv += fmt::format("{:x}=hmd_aspect ", off);
+            else if (approx(fv, (hw * 2.0f) / hh)) inv += fmt::format("{:x}=2hmd_aspect ", off);
+            if (off >= 0x60 && off < 0x3d0 && std::fabs(fv) > 1e-6f && std::fabs(fv) < 1e6f && fv != 1.0f) mid += fmt::format("{:x}={:.4f} ", off, fv);
+        }
+        SPDLOG_INFO("[LGUI_DRAW]   a2 hmd-derived floats: {}", inv.empty() ? "<none>" : inv);
+        SPDLOG_INFO("[LGUI_DRAW]   a2 mid floats: {}", mid);
+    }
+
+    // EXPERIMENT 3: a2's size block only knows the eye size (hmd_w x hmd_h) while the RDG target is 2*hmd_w wide.
+    // Present the target as one eye wide to LGUI by patching every X == hmd_w in the block to 2*hmd_w before the draw
+    // (restored afterwards). If the UI un-folds / changes scale, this block is the layout source.
+    // EXPERIMENT 3 RESULT: patching the 4 rects to full width drew a single centered UI across the double-wide target
+    // (visible in both eyes but not converged) -> the a2 rect block IS LGUI's layout source.
+    // EXPERIMENT 4: draw LGUI once per eye. The rects are FIntRect {Min.X, Min.Y, Max.X, Max.Y} with Max at the offsets
+    // below. Pass 1 uses [0, hw), pass 2 uses [hw, 2hw); both eyes then receive the identical UI image.
+    // FIX: redirect the LGUI draw into UEVR's ui_target so the UI is presented as the detached OpenXR quad layer
+    // (UI_Distance / UI_Size / UI_X_Offset / UI_Y_Offset / UI_FollowView) instead of being baked into the eye texture.
+    // a3 is the FRDGTexture for ViewFamilyTexture: +0x10 = FRHITexture* ResourceRHI, +0x54 = Desc.Extent (confirmed in log).
+    // LGUI records RDG passes that hold the FRDGTexture pointer, so we hand it a per-frame shadow copy whose RHI pointer and
+    // extent describe ui_target (desktop resolution). Viewport rects in a2 are captured by value at record time.
+    // RESULT: rects patched + RHI/extent swapped in the RDG copy, still no visual change -> LGUI does not take its render
+    // target from a3 at all. Stock LGUI fetches it via InView.Family->RenderTarget->GetRenderTargetTexture(), i.e. the
+    // FViewport vtable slot that UEVR's "AHUD UI Compatibility" option (viewport_get_render_target_texture_hook) redirects
+    // to ui_target. Disabled; test that option instead.
+    // EXPERIMENT 8 RESULT (persistent swap of the real a3 RHI): the UI *did* land in ui_target, but so did the whole scene
+    // composite (ViewFamilyTexture is shared by every pass writing the final image) -> eyes went blank. So RDG resolves
+    // the RT from the FRDGTexture object at execute time and LGUI honours the texture it is given; we just must not touch
+    // the shared object. Re-enable the private shadow copy (the first attempt likely ran while ui_target was still null).
+    // RESULT: shadow copy has no visible effect (LGUI does not take its RT from the a3 pointer). Disabled so the pass
+    // registry diff further below can run (this branch returns early and starved it).
+    constexpr bool LGUI_REDIRECT_TO_UI_TARGET = false;
+    constexpr uint32_t LGUI_RECT_MAX_OFFS_UI[] = {0x3e0, 0x410, 0x4a0, 0x4f8};
+    constexpr uint32_t RDG_RESOURCE_RHI_OFF = 0x10;
+    constexpr uint32_t TEX_EXTENT_OFF = 0x54;
+
+    // EXPERIMENT 10: reinterpretation. Persistent swap of the *real* a3 object redirected LGUI, the shadow copy passed as
+    // a3 did not, and no pass registry grows during the call. So LGUI reaches the real FRDGTexture through another
+    // reference: a2 (eye rects at 0x3e0.. = FSceneView::*ViewRect -> a2 is the FViewInfo, not the builder) or its Family.
+    // Find every qword == a3 in a2 / *(a2) and point those at the shadow copy for the duration of the call: whatever LGUI
+    // captures from there then resolves to ui_target at execute time, while the real texture stays untouched.
+    constexpr bool LGUI_PATCH_A3_REFS = true;
+
+    if (LGUI_PATCH_A3_REFS && g_hook != nullptr && g_hook->get_render_target_manager() != nullptr &&
+        a2 != nullptr && !IsBadReadPtr(a2, 0x1000) && a3 != nullptr && !IsBadReadPtr(a3, 0x200))
+    {
+        const auto ui_target = g_hook->get_render_target_manager()->get_ui_target();
+
+        if (ui_target != nullptr && !IsBadReadPtr(ui_target, TEX_EXTENT_OFF + 8)) {
+            const auto ui_w = *(int32_t*)((uintptr_t)ui_target + TEX_EXTENT_OFF);
+            const auto ui_h = *(int32_t*)((uintptr_t)ui_target + TEX_EXTENT_OFF + 4);
+            const auto hw = (int32_t)VR::get()->get_hmd_width();
+            const auto hh = (int32_t)VR::get()->get_hmd_height();
+
+            if (ui_w >= 64 && ui_w <= 16384 && ui_h >= 64 && ui_h <= 16384) {
+                // Copy is padded so readers touching fields past what we duplicated still land in valid (zeroed) memory.
+                constexpr size_t COPY_SIZE = 0x200;
+                constexpr size_t COPY_STRIDE = 0x800;
+                constexpr size_t COPY_COUNT = 32;
+                static uint8_t copies[COPY_COUNT + 1][COPY_STRIDE]{};
+                static uint32_t copy_idx = 0;
+                auto copy = copies[copy_idx++ % COPY_COUNT];
+                memset(copy, 0, COPY_STRIDE);
+                memcpy(copy, a3, COPY_SIZE);
+                *(void**)(copy + RDG_RESOURCE_RHI_OFF) = ui_target;
+
+                // LGUI sets its viewport from Desc.Extent of the target (not from any rect in a2) and its ortho projection from
+                // the game-thread viewport size: 2*hw x hh normally, hw x hh with the native stereo fix. Give the copy an extent
+                // with that aspect fitted inside ui_target so the layout is drawn undistorted (top-left aligned).
+                {
+                    const auto hw0 = (int32_t)VR::get()->get_hmd_width();
+                    const auto hh0 = (int32_t)VR::get()->get_hmd_height();
+                    const bool nsf = VR::get()->is_native_stereo_fix_enabled();
+                    const float vp_aspect = (hw0 > 0 && hh0 > 0) ? (float)(nsf ? hw0 : hw0 * 2) / (float)hh0 : (float)ui_w / (float)ui_h;
+                    int32_t ext_w = ui_w, ext_h = ui_h;
+                    if (vp_aspect > 0.0f) {
+                        ext_h = ui_h;
+                        ext_w = (int32_t)((float)ui_h * vp_aspect + 0.5f);
+                        if (ext_w > ui_w) { ext_w = ui_w; ext_h = (int32_t)((float)ui_w / vp_aspect + 0.5f); }
+                    }
+                    *(int32_t*)(copy + TEX_EXTENT_OFF) = ext_w;
+                    *(int32_t*)(copy + TEX_EXTENT_OFF + 4) = ext_h;
+                    g_hook->set_ui_draw_extent(ext_w, ext_h);
+                    if (n < 3 || (n % 600) == 0) SPDLOG_INFO("[LGUI_REFS]   copy extent {}x{} (vp_aspect={:.3f} nsf={})", ext_w, ext_h, vp_aspect, nsf);
+                }
+
+                uint32_t a2_len = 0;
+                while (a2_len < 0x8000 && !IsBadReadPtr((void*)((uintptr_t)a2 + a2_len), 0x1000)) a2_len += 0x1000;
+
+                // Bisect: patching all 14 refs redirected the UI (success) but crashed (null deref in game code) when the in-game
+                // menu opened -> some other pass reads the stale copy through one of these slots. Only patch offsets below
+                // LGUI_REF_MAX_OFF (the view-parameter group 0x270..0x4e8) first; the 0x12d0+ group is left on the real texture.
+                // RESULT: with only 3d0/400/4e8 the UI went back into the scene (no crash) -> the draw target comes from
+                // 270/348/3a0. Flip the bisect: patch only that group, the exception handler now logs registers for the crash.
+                constexpr uint32_t LGUI_REF_MAX_OFF = 0x3d0;
+                constexpr uint32_t LGUI_REF_MIN_OFF = 0x0;
+
+                std::vector<uintptr_t*> refs{};
+                std::string where{};
+                uint32_t skipped = 0;
+                for (uint32_t off = 0; off + 8 <= a2_len; off += 8) {
+                    auto p = (uintptr_t*)((uintptr_t)a2 + off);
+                    if (*p != (uintptr_t)a3) continue;
+                    if (off < LGUI_REF_MIN_OFF || off >= LGUI_REF_MAX_OFF) { ++skipped; continue; }
+                    refs.push_back(p);
+                    where += fmt::format("a2+{:x} ", off);
+                }
+
+                // Stretch persists with every int (hw,hh) pair patched -> the ortho projection is built from a size we do not see as
+                // ints (float aspect / 1/w / matrix) or from game-thread canvas data. Two-pronged:
+                //  (a) diagnostics: log any float in a2 that equals hw, hh, hw/hh, hh/hw, 1/hw, 1/hh, 2/hw, 2/hh;
+                //  (b) fallback: instead of stretching a portrait (hw x hh) layout over 3840x2160, give LGUI a viewport rect with the
+                //      eye's aspect letterboxed inside ui_target so proportions are right even if the projection stays eye-sized.
+                constexpr bool LGUI_LETTERBOX_RECT = false;
+                int32_t rect_x0 = 0, rect_y0 = 0, rect_w = ui_w, rect_h = ui_h;
+
+                if (LGUI_LETTERBOX_RECT && hw > 0 && hh > 0) {
+                    const float eye_aspect = (float)hw / (float)hh;
+                    rect_h = ui_h;
+                    rect_w = (int32_t)((float)ui_h * eye_aspect);
+                    if (rect_w > ui_w) { rect_w = ui_w; rect_h = (int32_t)((float)ui_w / eye_aspect); }
+                    rect_x0 = (ui_w - rect_w) / 2;
+                    rect_y0 = (ui_h - rect_h) / 2;
+                }
+
+                if (n < 3) {
+                    std::string fl{};
+                    const float cands[] = {(float)hw, (float)hh, (float)hw / (float)hh, (float)hh / (float)hw, 1.0f / (float)hw, 1.0f / (float)hh, 2.0f / (float)hw, 2.0f / (float)hh};
+                    const char* names[] = {"w", "h", "w/h", "h/w", "1/w", "1/h", "2/w", "2/h"};
+                    for (uint32_t off = 0; off + 4 <= 0x1000; off += 4) {
+                        const auto v = *(float*)((uintptr_t)a2 + off);
+                        for (int c = 0; c < 8; ++c) {
+                            if (std::fabs(v - cands[c]) <= std::fabs(cands[c]) * 1e-4f) { fl += fmt::format("{:x}={} ", off, names[c]); break; }
+                        }
+                    }
+                    SPDLOG_INFO("[LGUI_REFS]   float size candidates: {} | letterbox rect=({},{} {}x{})", fl.empty() ? "<none>" : fl, rect_x0, rect_y0, rect_w, rect_h);
+                }
+
+                std::vector<std::pair<int32_t*, int32_t>> saved{};
+                for (auto off : LGUI_RECT_MAX_OFFS_UI) {
+                    auto max_x = (int32_t*)((uintptr_t)a2 + off);
+                    auto min_x = max_x - 2;
+                    if (*(min_x + 1) == 0 && (*max_x == hw || *max_x == hw * 2) && *(max_x + 1) == hh) {
+                        saved.emplace_back(min_x, *min_x);
+                        saved.emplace_back(min_x + 1, *(min_x + 1));
+                        saved.emplace_back(max_x, *max_x);
+                        saved.emplace_back(max_x + 1, *(max_x + 1));
+                        *min_x = rect_x0;
+                        *(min_x + 1) = rect_y0;
+                        *max_x = rect_x0 + rect_w;
+                        *(max_x + 1) = rect_y0 + rect_h;
+                    }
+                }
+
+                for (auto p : refs) *p = (uintptr_t)copy;
+
+                // Stretch: UI fills the quad but is laid out for the portrait eye (2229x2637) -> projection/canvas size still comes
+                // from an eye-sized field we have not patched. The a2 dump shows further (hw,hh) pairs at 0x778/0x77c, 0xe08/0xe0c
+                // and a lone hw at 0x66c. Patch every remaining (hw,hh) pair (and lone hw/hh next to zero) in a2 to (ui_w, ui_h).
+                constexpr bool LGUI_PATCH_ALL_SIZE_PAIRS = false;
+                uint32_t extra_patched = 0;
+                std::string extra_where{};
+
+                if (LGUI_PATCH_ALL_SIZE_PAIRS) {
+                    for (uint32_t off = 0x60; off + 8 <= 0x1000; off += 4) {
+                        auto x = (int32_t*)((uintptr_t)a2 + off);
+                        if (x[0] == hw && x[1] == hh) {
+                            x[0] = rect_w;
+                            x[1] = rect_h;
+                            ++extra_patched;
+                            if (n < 5) extra_where += fmt::format("{:x} ", off);
+                            off += 4;
+                        } else if (x[0] == hw * 2 && x[1] == hh) {
+                            x[0] = rect_w;
+                            x[1] = rect_h;
+                            ++extra_patched;
+                            if (n < 5) extra_where += fmt::format("{:x}(2w) ", off);
+                            off += 4;
+                        }
+                    }
+                    if (n < 5) SPDLOG_INFO("[LGUI_REFS]   extra size pairs patched={} at [{}]", extra_patched, extra_where.empty() ? "-" : extra_where);
+                }
+
+                // Stretch fix: a5 (and a2+0/+4, same values) is a packed (1/w, 1/h) float pair describing the eye view, which
+                // LGUI uses for its ortho canvas layout. Present the UI target's inverse size instead so the canvas fills 3840x2160.
+                constexpr bool LGUI_PATCH_INV_SIZE = false;
+                void* a5_patched = a5;
+
+                if (LGUI_PATCH_INV_SIZE) {
+                    const float inv[2] = {1.0f / (float)rect_w, 1.0f / (float)rect_h};
+                    uint64_t packed = 0;
+                    memcpy(&packed, inv, sizeof(packed));
+                    a5_patched = (void*)packed;
+
+                    const auto a2_inv = (float*)a2;
+                    const auto old_inv = *(uint64_t*)a2;
+                    if (old_inv == (uint64_t)a5 && a2_inv[0] > 0.0f && a2_inv[0] < 0.1f && a2_inv[1] > 0.0f && a2_inv[1] < 0.1f) {
+                        a2_inv[0] = inv[0];
+                        a2_inv[1] = inv[1];
+                    }
+                }
+
+                if (n < 5 || (n % 300) == 0) {
+                    SPDLOG_INFO("[LGUI_REFS] a3={:x} a2_len={:x} refs={} (skipped {}) at [{}] -> copy={:x} (ui_target={:x} {}x{}), rects patched={}",
+                        (uintptr_t)a3, a2_len, refs.size(), skipped, where.empty() ? "-" : where, (uintptr_t)copy, (uintptr_t)ui_target, ui_w, ui_h, saved.size() / 3);
+                }
+
+                const auto result = ((void*(*)(void*, void*, void*, void*, void*, void*))it->second)(self, a2, copy, a4, a5_patched, a6);
+
+                // EXPERIMENT 11: restoring the refs immediately had no effect
+                // swap of the real object did redirect. => the pass reads the field at RDG execute time, i.e. after we return.
+                // Leave a2's refs/rects pointing at the copy; a2 is per-frame view state so it dies with the frame anyway.
+                constexpr bool LGUI_KEEP_REFS_PATCHED = true;
+
+                if (!LGUI_KEEP_REFS_PATCHED) {
+                    for (auto p : refs) *p = (uintptr_t)a3;
+                    for (auto& [p, v] : saved) *p = v;
+                }
+
+                return result;
+            }
+        }
+    }
+
+    if (LGUI_REDIRECT_TO_UI_TARGET && g_hook != nullptr && g_hook->get_render_target_manager() != nullptr &&
+        a2 != nullptr && !IsBadReadPtr(a2, 0x520) && a3 != nullptr && !IsBadReadPtr(a3, 0x200))
+    {
+        const auto ui_target = g_hook->get_render_target_manager()->get_ui_target();
+
+        if (ui_target != nullptr && !IsBadReadPtr(ui_target, TEX_EXTENT_OFF + 8)) {
+            const auto ui_w = *(int32_t*)((uintptr_t)ui_target + TEX_EXTENT_OFF);
+            const auto ui_h = *(int32_t*)((uintptr_t)ui_target + TEX_EXTENT_OFF + 4);
+            const auto hw = (int32_t)VR::get()->get_hmd_width();
+            const auto hh = (int32_t)VR::get()->get_hmd_height();
+
+            if (ui_w >= 64 && ui_w <= 16384 && ui_h >= 64 && ui_h <= 16384) {
+                // Shadow copies must outlive this call (RDG executes the recorded passes later in the frame).
+                constexpr size_t COPY_SIZE = 0x200;
+                constexpr size_t COPY_COUNT = 16;
+                static uint8_t copies[COPY_COUNT][COPY_SIZE]{};
+                static uint32_t copy_idx = 0;
+                auto copy = copies[copy_idx++ % COPY_COUNT];
+                memcpy(copy, a3, COPY_SIZE);
+                *(void**)(copy + RDG_RESOURCE_RHI_OFF) = ui_target;
+                *(int32_t*)(copy + TEX_EXTENT_OFF) = ui_w;
+                *(int32_t*)(copy + TEX_EXTENT_OFF + 4) = ui_h;
+                g_lgui_swap.rdg_texture = a3;
+                g_lgui_swap.shadow_copy = copy;
+                g_lgui_swap.ui_target = ui_target;
+                g_lgui_swap.rdg_texture_vtable = *(uintptr_t*)a3;
+                g_lgui_swap.original_rhi = *(void**)((uintptr_t)a3 + RDG_RESOURCE_RHI_OFF);
+
+                std::vector<std::pair<int32_t*, int32_t>> saved{};
+                for (auto off : LGUI_RECT_MAX_OFFS_UI) {
+                    auto max_x = (int32_t*)((uintptr_t)a2 + off);
+                    auto min_x = max_x - 2;
+                    if (*(min_x + 1) == 0 && (*max_x == hw || *max_x == hw * 2) && *(max_x + 1) == hh) {
+                        saved.emplace_back(min_x, *min_x);
+                        saved.emplace_back(max_x, *max_x);
+                        saved.emplace_back(max_x + 1, *(max_x + 1));
+                        *min_x = 0;
+                        *max_x = ui_w;
+                        *(max_x + 1) = ui_h;
+                    }
+                }
+
+                if (n < 5 || (n % 300) == 0) {
+                    SPDLOG_INFO("[LGUI_DRAW]   redirect -> ui_target={:x} {}x{} (was rhi={:x} {}x{}), rects patched={}",
+                        (uintptr_t)ui_target, ui_w, ui_h, *(uintptr_t*)((uintptr_t)a3 + RDG_RESOURCE_RHI_OFF),
+                        *(int32_t*)((uintptr_t)a3 + TEX_EXTENT_OFF), *(int32_t*)((uintptr_t)a3 + TEX_EXTENT_OFF + 4), saved.size() / 3);
+                }
+
+                const auto result = ((void*(*)(void*, void*, void*, void*, void*, void*))it->second)(self, a2, copy, a4, a5, a6);
+
+                for (auto& [p, v] : saved) {
+                    *p = v;
+                }
+
+                return result;
+            }
+        }
+
+        if (n < 5) SPDLOG_INFO("[LGUI_DRAW]   redirect skipped: ui_target={:x}", (uintptr_t)ui_target);
+    }
+
+    constexpr bool LGUI_PER_EYE_DRAW = false;
+    constexpr uint32_t LGUI_RECT_MAX_OFFS[] = {0x3e0, 0x410, 0x4a0, 0x4f8};
+
+    // EXPERIMENT 8: persistent swap. RDG resolves the render target from FRDGTexture::GetRHI() (a3+0x10) when the pass is
+    // *executed*, so we leave a3's RHI pointing at ui_target after this hook returns and restore it from the hooked
+    // TRDGLambdaPass::Execute (vtable slot 1, installed below when the pass registry grows) once LGUI has drawn.
+    constexpr bool LGUI_PERSIST_SWAP = false;
+
+    if (LGUI_PERSIST_SWAP && g_hook != nullptr && g_hook->get_render_target_manager() != nullptr &&
+        a2 != nullptr && !IsBadReadPtr(a2, 0x520) && a3 != nullptr && !IsBadReadPtr(a3, 0x80) && g_lgui_pass_execute_original != 0)
+    {
+        const auto ui_target = g_hook->get_render_target_manager()->get_ui_target();
+
+        if (ui_target != nullptr && !IsBadReadPtr(ui_target, TEX_EXTENT_OFF + 8)) {
+            const auto ui_w = *(int32_t*)((uintptr_t)ui_target + TEX_EXTENT_OFF);
+            const auto ui_h = *(int32_t*)((uintptr_t)ui_target + TEX_EXTENT_OFF + 4);
+            const auto hw = (int32_t)VR::get()->get_hmd_width();
+            const auto hh = (int32_t)VR::get()->get_hmd_height();
+
+            if (ui_w >= 64 && ui_w <= 16384 && ui_h >= 64 && ui_h <= 16384) {
+                std::vector<std::pair<int32_t*, int32_t>> saved{};
+                for (auto off : LGUI_RECT_MAX_OFFS) {
+                    auto max_x = (int32_t*)((uintptr_t)a2 + off);
+                    auto min_x = max_x - 2;
+                    if (*(min_x + 1) == 0 && (*max_x == hw || *max_x == hw * 2) && *(max_x + 1) == hh) {
+                        saved.emplace_back(min_x, *min_x);
+                        saved.emplace_back(max_x, *max_x);
+                        saved.emplace_back(max_x + 1, *(max_x + 1));
+                        *min_x = 0;
+                        *max_x = ui_w;
+                        *(max_x + 1) = ui_h;
+                    }
+                }
+
+                auto& rhi_slot = *(void**)((uintptr_t)a3 + RDG_RESOURCE_RHI_OFF);
+                g_lgui_swap.rdg_texture = a3;
+                g_lgui_swap.original_rhi = rhi_slot;
+                g_lgui_swap.ui_target = ui_target;
+                g_lgui_swap.armed = true;
+                rhi_slot = ui_target;
+
+                // Extent too, in case RDG derives the viewport from the desc.
+                const auto ext_x = (int32_t*)((uintptr_t)a3 + TEX_EXTENT_OFF);
+                const auto saved_ext_x = *ext_x, saved_ext_y = *(ext_x + 1);
+                *ext_x = ui_w;
+                *(ext_x + 1) = ui_h;
+
+                if (n < 5 || (n % 600) == 0) {
+                    SPDLOG_INFO("[LGUI_SWAP] record: a3={:x} rhi {:x} -> ui_target={:x} {}x{} (was {}x{}), rects patched={}, fmt_dword={:x}",
+                        (uintptr_t)a3, (uintptr_t)g_lgui_swap.original_rhi, (uintptr_t)ui_target, ui_w, ui_h, saved_ext_x, saved_ext_y,
+                        saved.size() / 3, ((uint32_t*)a3)[LGUI_EXTENT_X_DWORD + 2]);
+                }
+
+                const auto result = ((void*(*)(void*, void*, void*, void*, void*, void*))it->second)(self, a2, a3, a4, a5, a6);
+
+                for (auto& [p, v] : saved) {
+                    *p = v;
+                }
+
+                *ext_x = saved_ext_x;
+                *(ext_x + 1) = saved_ext_y;
+
+                return result;
+            }
+        }
+    }
+
+    if (LGUI_PER_EYE_DRAW && a2 != nullptr && !IsBadReadPtr(a2, 0x520)) {
+        const auto hw = (int32_t)VR::get()->get_hmd_width();
+        const auto hh = (int32_t)VR::get()->get_hmd_height();
+        std::vector<int32_t*> rects{};
+
+        for (auto off : LGUI_RECT_MAX_OFFS) {
+            auto max_x = (int32_t*)((uintptr_t)a2 + off);
+            auto min_x = max_x - 2;
+            if (*min_x == 0 && *max_x == hw && *(max_x + 1) == hh) {
+                rects.push_back(max_x);
+            }
+        }
+
+        if (n < 5) SPDLOG_INFO("[LGUI_DRAW]   per-eye draw: {} rects matched (hw={} hh={})", rects.size(), hw, hh);
+
+        // EXPERIMENT 4 RESULT: each eye shows its half of a UI still laid out 2*hw wide -> the rect is only a viewport/scissor;
+        // the layout width comes from the target texture itself (2*hw). Patching the RDG desc copy (a3 dword 21) did nothing,
+        // so LGUI must read the RHI texture (a3[2]) size. EXPERIMENT 5: find every (2*hw, hh) pair in a3, a3[2], a4[2] and
+        // present them as (hw, hh) for the duration of both eye draws.
+        std::vector<std::pair<int32_t*, int32_t>> ext_patches{};
+        auto patch_extents = [&](void* obj, uint32_t len, const char* tag) {
+            if (obj == nullptr || IsBadReadPtr(obj, len)) return;
+            std::string hits{};
+            for (uint32_t off = 0; off + 8 <= len; off += 4) {
+                auto p = (int32_t*)((uintptr_t)obj + off);
+                if (*p == hw * 2 && *(p + 1) == hh) {
+                    hits += fmt::format("{:x} ", off);
+                    ext_patches.emplace_back(p, *p);
+                    *p = hw;
+                }
+            }
+            if (n < 5) SPDLOG_INFO("[LGUI_DRAW]   {} 2hw-extent hits: {}", tag, hits.empty() ? "<none>" : hits);
+        };
+
+        if (!rects.empty()) {
+            // EXPERIMENT 5 RESULT: hits at a3+0x54 and a3[2]+0x54 but no visual change. RDG passes execute *after* this
+            // hook returns, so anything restored here is invisible to the pass lambdas (the rects worked because they are
+            // captured by value at AddPass time). EXPERIMENT 6: a3 is a transient per-graph FRDGTexture (address changes
+            // every frame), so leave ITS extent patched for the whole graph; only restore the shared RHI texture (a3[2]).
+            std::vector<std::pair<int32_t*, int32_t>> rhi_patches{};
+            patch_extents(a3, 0x100, "a3(rdg)");
+            const auto n_rdg = ext_patches.size();
+            if (!IsBadReadPtr(a3, 0x20)) patch_extents((void*)((uintptr_t*)a3)[2], 0x200, "a3[2](rhi)");
+            rhi_patches.assign(ext_patches.begin() + n_rdg, ext_patches.end());
+
+            // Left eye: rects already [0, hw)
+            ((void*(*)(void*, void*, void*, void*, void*, void*))it->second)(self, a2, a3, a4, a5, a6);
+
+            // Right eye: [hw, 2hw)
+            for (auto max_x : rects) { *(max_x - 2) = hw; *max_x = hw * 2; }
+            const auto result = ((void*(*)(void*, void*, void*, void*, void*, void*))it->second)(self, a2, a3, a4, a5, a6);
+            for (auto max_x : rects) { *(max_x - 2) = 0; *max_x = hw; }
+            for (auto& [p, v] : rhi_patches) { *p = v; }
+            return result;
+        }
+    }
+
+    constexpr bool LGUI_PATCH_A2_SIZES = false;
+    std::vector<std::pair<int32_t*, int32_t>> a2_patches{};
+
+    if (LGUI_PATCH_A2_SIZES && a2 != nullptr && !IsBadReadPtr(a2, 0x520)) {
+        const auto hw = (int32_t)VR::get()->get_hmd_width();
+        const auto hh = (int32_t)VR::get()->get_hmd_height();
+        if (hw > 0) {
+            for (uint32_t off = 0x3d0; off < 0x510; off += 4) {
+                auto p = (int32_t*)((uintptr_t)a2 + off);
+                if (*p == hw && *(p + 1) == hh) {
+                    a2_patches.emplace_back(p, *p);
+                    *p = hw * 2;
+                }
+            }
+            if (n < 5) SPDLOG_INFO("[LGUI_DRAW]   patched {} a2 X entries {} -> {}", a2_patches.size(), hw, hw * 2);
+        }
+    }
+
+    // DIAG 7: the record-time patches on a3 are invisible to the pass lambdas (they re-read the FRDGTexture at execute time).
+    // To swap the target at execute time we need the FRDGPass LGUI appends. Locate the FRDGBuilder by finding a
+    // TArray<FRDGTexture*> that contains a3 (texture registry), then diff every pointer-TArray in that object across the
+    // original call: the array that grows is the pass registry and the new entries are LGUI's passes.
+    constexpr bool LGUI_FIND_RDG_PASS = false;
+    struct ArrSnap { uintptr_t owner; uint32_t a2_off; uint32_t off; int32_t num; };
+    std::vector<ArrSnap> arr_snaps{};
+    auto dump_qwords_rdg = [](void* p, int count) -> std::string {
+        std::string s{};
+        if (p == nullptr || IsBadReadPtr(p, sizeof(uintptr_t) * count)) return "<bad>";
+        for (int k = 0; k < count; ++k) s += fmt::format("{:x},", ((uintptr_t*)p)[k]);
+        return s;
+    };
+
+    // The first calls happen during load (no canvases -> no passes added), so sample periodically instead.
+    static uint32_t rdg_samples = 0;
+    const bool rdg_sample_now = LGUI_FIND_RDG_PASS && g_lgui_pass_execute_original == 0 && rdg_samples < 6 && n >= 300 && (n % 300) == 0;
+
+    // Targeted: pass registry is at (*(a2+0x378))+0x1168 (TArray<FRDGPass*>). Snapshot every call until Execute is hooked.
+    constexpr uint32_t LGUI_PASS_OWNER_OFF = 0x378;
+    constexpr uint32_t LGUI_PASS_ARR_OFF = 0x1168;
+    std::optional<std::pair<uintptr_t, int32_t>> pass_arr_snap{};
+
+    // DIAG 9: the vtable we hooked (276032d0) turned out to be a generic lambda pass with no captured state, so the LGUI
+    // draw pass was never observed. Diff *every* pointer-TArray inside the builder block itself on every 10th call
+    // (cheap: a2 is one contiguous 0x20000 block) and report all new entries, including their captured state, so we can
+    // pick the vtable that actually carries LGUI's renderer/canvas pointers.
+    // The registries are NOT inside a2 itself: a2 is the builder shell and the pass/texture registries live in separate
+    // allocations pointed to from a2 (e.g. *(a2+0x378)+0x1168 grew 2->4 in the earlier diff). Scan a2 plus every
+    // allocation referenced from a2's first 0x1000 bytes (each 0x2000), like the earlier diff that worked.
+    constexpr bool LGUI_DIFF_BUILDER_EVERY_FRAME = true;
+    static uint32_t builder_diff_reports = 0;
+    struct BuilderArr { uintptr_t owner; uint32_t a2_off; uint32_t off; uintptr_t data; int32_t num; };
+    std::vector<BuilderArr> builder_arrs{};
+    const bool builder_diff_now = LGUI_DIFF_BUILDER_EVERY_FRAME && builder_diff_reports < 12 && n >= 600 && (n % 20) == 0 &&
+        a2 != nullptr && !IsBadReadPtr(a2, 0x1000);
+
+    if (builder_diff_now) {
+        builder_arrs.reserve(1024);
+        std::vector<std::tuple<uintptr_t, uint32_t, uint32_t>> owners{};
+        uint32_t a2_len = 0;
+        while (a2_len < 0x20000 && !IsBadReadPtr((void*)((uintptr_t)a2 + a2_len), 0x1000)) a2_len += 0x1000;
+        owners.emplace_back((uintptr_t)a2, 0xFFFFFFFF, a2_len);
+        for (uint32_t off = 0; off < 0x1000; off += 8) {
+            const auto p = *(uintptr_t*)((uintptr_t)a2 + off);
+            if (p > 0x10000 && (p & 7) == 0 && p != (uintptr_t)a2 && !IsBadReadPtr((void*)p, 0x2000)) owners.emplace_back(p, off, 0x2000);
+        }
+        for (const auto& [c, a2_off, len] : owners) {
+            for (uint32_t off = 0; off + 16 <= len; off += 8) {
+                const auto data = *(uintptr_t*)(c + off);
+                const auto num = *(int32_t*)(c + off + 8);
+                const auto max = *(int32_t*)(c + off + 12);
+                if (data < 0x10000 || (data & 7) != 0 || num < 0 || num > 16384 || max < num || max == 0 || max > 65536) continue;
+                builder_arrs.push_back({c, a2_off, off, data, num});
+            }
+        }
+    }
+
+    if (g_lgui_pass_execute_original == 0 && a2 != nullptr && !IsBadReadPtr((void*)((uintptr_t)a2 + LGUI_PASS_OWNER_OFF), 8)) {
+        const auto owner = *(uintptr_t*)((uintptr_t)a2 + LGUI_PASS_OWNER_OFF);
+        if (owner > 0x10000 && !IsBadReadPtr((void*)(owner + LGUI_PASS_ARR_OFF), 16)) {
+            pass_arr_snap = std::make_pair(owner + LGUI_PASS_ARR_OFF, *(int32_t*)(owner + LGUI_PASS_ARR_OFF + 8));
+            if (n % 600 == 0) SPDLOG_INFO("[LGUI_SWAP] pass registry snapshot: owner={:x} num={}", owner, pass_arr_snap->second);
+        } else if (n % 600 == 0) {
+            SPDLOG_INFO("[LGUI_SWAP] pass registry owner unreadable: a2+378={:x}", owner);
+        }
+    }
+
+    if (rdg_sample_now && a2 != nullptr && a3 != nullptr && !IsBadReadPtr(a2, 0x1000)) {
+        ++rdg_samples;
+        // a2 first: find how far it is readable (page-wise) so we cover the entire FRDGBuilder.
+        uint32_t a2_len = 0;
+        while (a2_len < 0x20000 && !IsBadReadPtr((void*)((uintptr_t)a2 + a2_len), 0x1000)) a2_len += 0x1000;
+        SPDLOG_INFO("[LGUI_RDG] a2={:x} readable={:x}", (uintptr_t)a2, a2_len);
+
+        std::vector<std::tuple<uintptr_t, uint32_t, uint32_t>> cands{{(uintptr_t)a2, 0xFFFFFFFF, a2_len}};
+
+        for (uint32_t off = 0; off < 0x1000; off += 8) {
+            const auto p = *(uintptr_t*)((uintptr_t)a2 + off);
+            if (p > 0x10000 && (p & 7) == 0 && p != (uintptr_t)a2 && !IsBadReadPtr((void*)p, 0x2000)) {
+                cands.emplace_back(p, off, 0x2000);
+            }
+        }
+
+        for (const auto& [c, a2_off, len] : cands) {
+            for (uint32_t off = 0; off + 16 <= len; off += 8) {
+                const auto data = *(uintptr_t*)(c + off);
+                const auto num = *(int32_t*)(c + off + 8);
+                const auto max = *(int32_t*)(c + off + 12);
+
+                if (data < 0x10000 || (data & 7) != 0 || num < 0 || num > 8192 || max < num || max > 65536 || max == 0 || IsBadReadPtr((void*)data, sizeof(uintptr_t) * max)) {
+                    continue;
+                }
+
+                bool has_a3 = false;
+                for (int32_t k = 0; k < num; ++k) {
+                    if (((uintptr_t*)data)[k] == (uintptr_t)a3) { has_a3 = true; break; }
+                }
+
+                if (has_a3) {
+                    SPDLOG_INFO("[LGUI_RDG] texture registry containing a3: owner={:x} (a2+{:x}) arr@+{:x} num={} max={}", c, a2_off, off, num, max);
+                }
+
+                arr_snaps.push_back({c, a2_off, off, num});
+            }
+        }
+
+        SPDLOG_INFO("[LGUI_RDG] {} candidate owners, {} pointer arrays snapshotted", cands.size(), arr_snaps.size());
+    }
+
+    const auto result = ((void*(*)(void*, void*, void*, void*, void*, void*))it->second)(self, a2, a3, a4, a5, a6);
+
+    if (builder_diff_now) {
+        bool reported = false;
+        for (const auto& s : builder_arrs) {
+            if (IsBadReadPtr((void*)(s.owner + s.off), 16)) continue;
+            const auto data = *(uintptr_t*)(s.owner + s.off);
+            const auto num = *(int32_t*)(s.owner + s.off + 8);
+            if (num <= s.num || num - s.num > 256 || data < 0x10000 || (data & 7) != 0 || IsBadReadPtr((void*)data, sizeof(uintptr_t) * num)) continue;
+
+            reported = true;
+            SPDLOG_INFO("[LGUI_PASS] owner={:x} (a2+{:x}) arr@+{:x}: {} -> {} (data {:x}{})", s.owner, s.a2_off, s.off, s.num, num, data, data != s.data ? " realloc" : "");
+
+            for (int32_t k = s.num; k < std::min(num, s.num + 12); ++k) {
+                const auto e = ((uintptr_t*)data)[k];
+                if (e < 0x10000 || (e & 7) != 0 || IsBadReadPtr((void*)e, 0x100)) {
+                    SPDLOG_INFO("[LGUI_PASS]   [{}]={:x}", k, e);
+                    continue;
+                }
+                const auto vt = *(uintptr_t*)e;
+                const auto m = utility::get_module_within((void*)vt);
+                std::string q{};
+                int nonzero = 0;
+                for (int j = 0; j < 32; ++j) {
+                    const auto v = ((uintptr_t*)e)[j];
+                    if (v != 0) ++nonzero;
+                    q += fmt::format("{:x},", v);
+                }
+                std::string tags{};
+                for (int j = 0; j < 32; ++j) {
+                    const auto v = ((uintptr_t*)e)[j];
+                    if (v == (uintptr_t)a3) tags += fmt::format("[{}]=a3 ", j);
+                    else if (v == (uintptr_t)a4) tags += fmt::format("[{}]=a4 ", j);
+                    else if (v == (uintptr_t)self) tags += fmt::format("[{}]=self ", j);
+                    else if (v == (uintptr_t)a2) tags += fmt::format("[{}]=a2 ", j);
+                }
+                SPDLOG_INFO("[LGUI_PASS]   [{}]={:x} vt_rva={:x} nonzero={} tags={} q=[{}]", k, e,
+                    m.has_value() ? vt - (uintptr_t)*m : 0, nonzero, tags.empty() ? "-" : tags, q);
+            }
+        }
+        if (reported) ++builder_diff_reports;
+        static uint32_t diff_runs = 0;
+        if ((diff_runs++ % 30) == 0) SPDLOG_INFO("[LGUI_PASS] diff run #{} arrays={} grew_any={}", diff_runs, builder_arrs.size(), reported);
+    }
+
+    if (pass_arr_snap.has_value() && g_lgui_pass_execute_original == 0) {
+        const auto [arr, old_num] = *pass_arr_snap;
+        if (!IsBadReadPtr((void*)arr, 16)) {
+            const auto data = *(uintptr_t*)arr;
+            const auto num = *(int32_t*)(arr + 8);
+            if (n % 600 == 0) SPDLOG_INFO("[LGUI_SWAP] pass registry after call: {} -> {}", old_num, num);
+            if (num > old_num && num - old_num <= 64 && data > 0x10000 && !IsBadReadPtr((void*)data, sizeof(uintptr_t) * num)) {
+                // Pick the first new entry whose vtable is in the game module (the registry also contains sentinel values).
+                for (int32_t k = old_num; k < num; ++k) {
+                    const auto e = ((uintptr_t*)data)[k];
+                    if (e > 0x10000 && !IsBadReadPtr((void*)e, 0x10) && utility::get_module_within((void*)*(uintptr_t*)e).has_value()) {
+                        SPDLOG_INFO("[LGUI_SWAP] pass registry grew {} -> {}, hooking entry [{}]={:x}", old_num, num, k, e);
+                        lgui_try_hook_pass_vtable(e);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    for (const auto& s : arr_snaps) {
+        if (IsBadReadPtr((void*)(s.owner + s.off), 16)) continue;
+        const auto data = *(uintptr_t*)(s.owner + s.off);
+        const auto num = *(int32_t*)(s.owner + s.off + 8);
+
+        if (num <= s.num || num - s.num > 512 || data < 0x10000 || IsBadReadPtr((void*)data, sizeof(uintptr_t) * num)) {
+            continue;
+        }
+
+        SPDLOG_INFO("[LGUI_RDG] array grew: owner={:x} (a2+{:x}) arr@+{:x} {} -> {}", s.owner, s.a2_off, s.off, s.num, num);
+
+        for (int32_t k = s.num; k < std::min(num, s.num + 8); ++k) {
+            const auto e = ((uintptr_t*)data)[k];
+            if (e < 0x10000 || IsBadReadPtr((void*)e, 0x80)) {
+                SPDLOG_INFO("[LGUI_RDG]   [{}]={:x} <unreadable>", k, e);
+                continue;
+            }
+
+            const auto vt = *(uintptr_t*)e;
+            const auto m = utility::get_module_within((void*)vt);
+            std::string slots{};
+            if (m.has_value() && !IsBadReadPtr((void*)vt, sizeof(uintptr_t) * 4)) {
+                for (int j = 0; j < 4; ++j) {
+                    const auto fn = ((uintptr_t*)vt)[j];
+                    const auto fm = utility::get_module_within((void*)fn);
+                    slots += fmt::format("{:x},", fm.has_value() ? fn - (uintptr_t)*fm : fn);
+                }
+            }
+
+            // FRDGPass: [0]=vtable, [1]=FRDGEventName (const TCHAR* in non-shipping, may be null/garbage in shipping)
+            std::string name{"<none>"};
+            const auto name_ptr = ((uintptr_t*)e)[1];
+            if (name_ptr > 0x10000 && !IsBadReadPtr((void*)name_ptr, 64)) {
+                const auto wn = (const wchar_t*)name_ptr;
+                const auto len = wcsnlen(wn, 32);
+                bool printable = len > 0;
+                for (size_t q = 0; q < len && printable; ++q) printable = wn[q] >= 0x20 && wn[q] < 0x7f;
+                if (printable) name = utility::narrow(std::wstring{wn, len});
+            }
+
+            SPDLOG_INFO("[LGUI_RDG]   [{}]={:x} vt_rva={:x} slots=[{}] name=\"{}\" q=[{}]", k, e,
+                m.has_value() ? vt - (uintptr_t)*m : vt, slots, name, dump_qwords_rdg((void*)e, 12));
+        }
+    }
+
+    for (auto& [p, v] : a2_patches) {
+        *p = v;
+    }
+
+    if (patched) {
+        ((uint32_t*)a3)[LGUI_EXTENT_X_DWORD] = saved_extent_x;
+    }
+
+    return result;
+}
+
 static void diag_dump_engine_view_extensions(sdk::FSceneViewFamily& view_family) {
     static uint32_t call_count = 0;
     static uint32_t dump_count = 0;
 
-    if (dump_count >= 5 || (call_count++ % 300) != 0) {
+    if (dump_count >= 20 || (call_count++ % 300) != 0) {
         return;
     }
 
@@ -3135,7 +4273,13 @@ static void diag_dump_engine_view_extensions(sdk::FSceneViewFamily& view_family)
             i, (uintptr_t)ext, vtable, module_name, rva, is_ours, fn_rvas);
 
         // One-time deep scan: list every virtual that isn't the shared default stub
-        if (dump_count == 1 && !is_ours && module.has_value()) {
+        // LGUI's FLGUIHudRenderer registers late (after dump #1); its vtables sit next to the
+        // "LGUIHudRenderer::AddHudPrimitive_RenderThread" string at rva 26ca09xx.
+        // 26ca0830 = main menu drawer (destroyed on world transition), 26ca0760 = interaction/canvas,
+        // 2769cd58 = in-game class that replaces [10] after loading (fully overridden virtuals).
+        const bool is_lgui_candidate = rva == 0x26ca0830 || rva == 0x26ca0760;
+
+        if (!is_ours && module.has_value() && (dump_count == 1 || is_lgui_candidate)) {
             // The default no-op virtuals all resolve to a single shared stub; detect it as the most frequent entry
             std::unordered_map<uintptr_t, int> freq{};
             for (auto j = 0; j < 40; ++j) {
@@ -3148,6 +4292,13 @@ static void diag_dump_engine_view_extensions(sdk::FSceneViewFamily& view_family)
             int stub_count = 0;
             for (const auto& [fn, n] : freq) {
                 if (n > stub_count) { stub = fn; stub_count = n; }
+            }
+
+            // Classes that override everything (e.g. 2769cd58) have no dominant stub; fall back to the
+            // engine's shared ISceneViewExtension no-op seen on every other extension.
+            if (stub_count < 3) {
+                stub = (uintptr_t)*module + 0x202d0120;
+                stub_count = 0;
             }
 
             std::string nontrivial{};
@@ -3182,12 +4333,56 @@ static void diag_dump_engine_view_extensions(sdk::FSceneViewFamily& view_family)
             // Already ruled out individually: 2:11, 1:12, 4:12.
             constexpr uint32_t suppress_ext_mask = 0; // bit i = extension index i
             constexpr int32_t suppress_slot_min = 1;
-            constexpr int32_t suppress_slot_max = 14;
+            constexpr int32_t suppress_slot_max = 39;
+            // LGUI drawer (vtable rva 26ca0830) confirmed: suppressing all of its overrides removed the UI.
+            // Slot 17 is IsActiveThisFrame so that run only proved the extension, not the draw slot.
+            // Its real overrides are 17 (is_active), 24 (205a6830), 25 (205ad5c0); bisect 24/25 one at a time.
+            // 24, 25, 24+25, 2+13 all ruled out (UI stayed). Only the original all-slot run removed it, so the
+            // draw must be in the slots we assumed were engine defaults (15,16,18,22,23) or gated purely by 17.
+            // {15,16,18,22,23} removed the UI. 18/22/23 share 202d0320 (one impl); 15=202d01c0, 16=202d01f0.
+            // {18,22,23} on [10] alone killed the MAIN MENU UI only; in-game HUD stayed. Vtable patches are per-class,
+            // so [9] (26ca0760, same 202d0320 at 18/22) is likely the HUD drawer. Suppress both classes now.
+            // In-game, [10] is replaced by class 2769cd58 (all virtuals overridden) which kept drawing the HUD.
+            // Run 2: 2769cd58 never appeared, only 26ca0830/26ca0760 exist in-game (both patched at 18/22/23),
+            // yet the HUD still draws. All bisects so far were at the main menu; in-game the HUD may go through
+            // a different slot (24/25 etc.). Suppress EVERY override (empty list = all) to test if it's these classes at all.
+            // Suppressing ALL overrides on both classes removed menu + in-game HUD. Now bisect in-game:
+            // menu = 18/22/23; HUD candidates = 24 (205a67a0/205a6830 per-class), 25 (205ad5c0 shared).
+            // {24,25} on 26ca0760+26ca0830 (+2769cd58) removed menu AND in-game HUD. Split: test 25 (shared 205ad5c0) alone,
+            // and leave 2769cd58 untouched (its layout doesn't look like ISceneViewExtension; slot 3 is unaligned).
+            // 25 alone on both classes: UI stayed. So slot 24 (per-class 205a67a0 / 205a6830) is the draw path. CONFIRMED.
+            // Now: pass-through hook on slot 24 to observe args/callers instead of stubbing it.
+            if (is_lgui_candidate && !g_lgui_slot24_originals.contains(vtable)) {
+                auto slot_ptr = &((uintptr_t*)vtable)[LGUI_DRAW_SLOT];
+                const auto fn = *slot_ptr;
+                DWORD old{};
 
-            if (((suppress_ext_mask >> i) & 1) != 0 && stub != 0) {
+                if (fn != 0 && fn != stub && VirtualProtect(slot_ptr, sizeof(uintptr_t), PAGE_READWRITE, &old)) {
+                    g_lgui_slot24_originals[vtable] = fn;
+                    *slot_ptr = (uintptr_t)&lgui_slot24_hook;
+                    VirtualProtect(slot_ptr, sizeof(uintptr_t), old, &old);
+                    SPDLOG_INFO("[LGUI_DRAW] hooked slot {} on vtable_rva={:x} (orig fn_rva={:x})", LGUI_DRAW_SLOT, rva, fn - (uintptr_t)*module);
+                } else {
+                    SPDLOG_ERROR("[LGUI_DRAW] failed to hook slot {} on vtable_rva={:x}", LGUI_DRAW_SLOT, rva);
+                }
+            }
+
+            constexpr std::array<int32_t, 0> lgui_suppress_slots{};
+            static std::unordered_set<uintptr_t> lgui_suppressed_vtables{};
+            const bool suppress_this = false;
+
+            if ((suppress_this || ((suppress_ext_mask >> i) & 1) != 0) && stub != 0) {
+                if (suppress_this) {
+                    lgui_suppressed_vtables.insert(rva);
+                }
+
                 std::string suppressed{};
 
                 for (auto s = suppress_slot_min; s <= suppress_slot_max && s < 40; ++s) {
+                    if (suppress_this && !lgui_suppress_slots.empty() && std::find(lgui_suppress_slots.begin(), lgui_suppress_slots.end(), s) == lgui_suppress_slots.end()) {
+                        continue;
+                    }
+
                     auto slot_ptr = &((uintptr_t*)vtable)[s];
                     const auto fn = *slot_ptr;
 
@@ -3275,15 +4470,26 @@ static inline std::vector<EyeField> eye_fields{};
 // init options' state pointer (already resolved) inside the live view after the real constructor ran.
 static inline std::optional<uint32_t> live_scene_state_offset{};
 
+static bool plausible(uintptr_t p);
+static bool has_module_vtable(uintptr_t p);
+
 static inline void resolve_live_scene_state(sdk::FSceneView* view, void* init_state) {
     if (live_scene_state_offset.has_value() || view == nullptr || init_state == nullptr) {
+        return;
+    }
+
+    // Reject non-canonical garbage (e.g. 0x100000000 read through a not-yet-corrected init_options
+    // offset) and anything that is not a vtable'd object; matching it would pin the wrong offset.
+    if (!has_module_vtable((uintptr_t)init_state)) {
+        SPDLOG_INFO_ONCE("[VR] sceneview_xref: ignoring implausible init scene state {:x} for offset resolution", (uintptr_t)init_state);
         return;
     }
 
     for (uint32_t off = 0; off + sizeof(void*) <= 0x400; off += sizeof(void*)) {
         if (*(void**)((uintptr_t)view + off) == init_state) {
             live_scene_state_offset = off;
-            SPDLOG_INFO("[VR] sceneview_xref: RESOLVED live scene state@{:x} (state={:x})", off, (uintptr_t)init_state);
+            SPDLOG_INFO("[VR] sceneview_xref: RESOLVED live scene state@{:x} (state={:x}) [view+0x0={:x} view+0x8={:x}]", off, (uintptr_t)init_state,
+                *(uintptr_t*)((uintptr_t)view + 0x0), *(uintptr_t*)((uintptr_t)view + 0x8));
             return;
         }
     }
@@ -3587,7 +4793,8 @@ sdk::FSceneView* FFakeStereoRenderingHook::sceneview_constructor(sdk::FSceneView
 
     // Validate pointer address range before using it as a map key
     const auto scene_state_addr = reinterpret_cast<uintptr_t>(init_options_scene_state);
-    const bool is_valid_scene_state = (scene_state_addr > 0x10000 && scene_state_addr < 0x7FFFFFFFFFFF && scene_state_addr % 8 == 0);
+    const bool is_valid_scene_state = (scene_state_addr > 0x10000 && scene_state_addr < 0x7FFFFFFFFFFF && scene_state_addr % 8 == 0 &&
+                                       !IsBadReadPtr(init_options_scene_state, sizeof(void*)));
 
     if (init_options_scene_state != nullptr && is_valid_scene_state) {
         if (is_ue5) {
@@ -3817,8 +5024,10 @@ sdk::FSceneView* FFakeStereoRenderingHook::sceneview_constructor(sdk::FSceneView
 
     auto result = g_hook->m_sceneview_data.constructor_hook.unsafe_call<sdk::FSceneView*>(view, init_options, a3, a4);
 
-    if (is_valid_scene_state) {
-        sceneview_xref::resolve_live_scene_state(view, init_options_scene_state);
+    // Only trust the init-options state pointer for live-offset discovery once sceneview_xref has
+    // corrected the init-options layout for this game; before that get_scene_state() reads garbage.
+    if (is_valid_scene_state && sceneview_xref::resolved) {
+        sceneview_xref::resolve_live_scene_state(view, init_options->get_scene_state());
     }
 
     // Reset the view count back to what it was.
@@ -4436,15 +5645,7 @@ void FFakeStereoRenderingHook::begin_render_viewfamily_real(
             }
         }
 
-        // DIAG (far-tree sway): optionally re-run KuroImposterUpdater::UpdateImposters so Pass 2 sees fresh impostor data.
-        CVarManager::rerun_imposter_update_for_pass2();
-
-        // DIAG (far-tree sway): optionally make Pass 2 look like a new frame to global per-frame gates (GFrameCounter etc.).
-        CVarManager::bump_frame_counters_for_pass2(true);
-
         g_hook->m_render_module_begin_render_viewfamily_hook.unsafe_call<void>(render_module, canvas, view_family_candidate);
-
-        CVarManager::bump_frame_counters_for_pass2(false);
 
         if (pass2_state_slot != nullptr) {
             *pass2_state_slot = pass2_state_saved;
@@ -5044,6 +6245,16 @@ bool FFakeStereoRenderingHook::setup_view_extensions() try {
             }
 
             SPDLOG_INFO("Encountered attempted dereference of null pointer at {:x}", exception_address);
+
+            {
+                const auto ctx = exception->ContextRecord;
+                const auto base_reg = op2.Info.Memory.Base;
+                const auto disp = op2.Info.Memory.HasDisp ? (int64_t)op2.Info.Memory.Disp : 0;
+                const auto ex_mod = utility::get_module_within((void*)exception_address);
+                SPDLOG_INFO("[Exception Handler]   rva={:x} base_reg={} disp={:#x} rax={:x} rcx={:x} rdx={:x} rbx={:x} rsi={:x} rdi={:x} r8={:x} r9={:x} r12={:x} r13={:x} r14={:x} r15={:x}",
+                    ex_mod.has_value() ? exception_address - (uintptr_t)*ex_mod : exception_address, (int)base_reg, disp,
+                    ctx->Rax, ctx->Rcx, ctx->Rdx, ctx->Rbx, ctx->Rsi, ctx->Rdi, ctx->R8, ctx->R9, ctx->R12, ctx->R13, ctx->R14, ctx->R15);
+            }
 
             // Get the start of the previous instruction
             const auto previous_instruction = utility::resolve_instruction(exception_address - 1);
