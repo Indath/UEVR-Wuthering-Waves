@@ -350,6 +350,17 @@ vr::EVRCompositorError D3D11Component::on_frame(VR* vr) {
 
         // Recreate UI texture if needed
         if (!vr->is_extreme_compatibility_mode_enabled()) {
+            // Force a UI target reallocation whenever the tall-UI mode changes (NSF on/off or the
+            // "Fit UI To Full Canvas" toggle), so the redirected UI target is re-sized to match the
+            // new desired dimensions dynamically without requiring a game restart.
+            static bool s_last_tall_ui = false;
+            const bool tall_ui_now = vr->is_native_stereo_fix_tall_ui_enabled();
+            if (tall_ui_now != s_last_tall_ui) {
+                SPDLOG_INFO("[VR] Tall-UI mode changed ({} -> {}), forcing UI target reallocation", s_last_tall_ui, tall_ui_now);
+                s_last_tall_ui = tall_ui_now;
+                ffsr->set_should_recreate_textures(true);
+            }
+
             const auto native = (ID3D11Texture2D*)ui_target->get_native_resource();
             const auto is_same_native = native == m_last_checked_native;
             m_last_checked_native = native;
@@ -1044,10 +1055,12 @@ void D3D11Component::on_reset(VR* vr) {
             }
         }
 
+        const auto ui_target_size = FFakeStereoRenderingHook::get_ui_target_size();
+
         if (m_openxr.last_resolution[0] != vr->get_hmd_width() || m_openxr.last_resolution[1] != vr->get_hmd_height() ||
             vr->m_openxr->swapchains.empty() ||
-            g_framework->get_d3d11_rt_size()[0] != vr->m_openxr->swapchains[(uint32_t)runtimes::OpenXR::SwapchainIndex::UI].width ||
-            g_framework->get_d3d11_rt_size()[1] != vr->m_openxr->swapchains[(uint32_t)runtimes::OpenXR::SwapchainIndex::UI].height ||
+            (uint32_t)ui_target_size.width != vr->m_openxr->swapchains[(uint32_t)runtimes::OpenXR::SwapchainIndex::UI].width ||
+            (uint32_t)ui_target_size.height != vr->m_openxr->swapchains[(uint32_t)runtimes::OpenXR::SwapchainIndex::UI].height ||
             m_last_afr_state != vr->is_using_afr() ||
             needs_depth_resize)
         {
@@ -1954,13 +1967,15 @@ std::optional<std::string> D3D11Component::OpenXR::create_swapchains() {
 
     auto desktop_rt_swapchain_create_info = standard_swapchain_create_info;
     desktop_rt_swapchain_create_info.format = DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
-    desktop_rt_swapchain_create_info.width = g_framework->get_d3d11_rt_size().x;
-    desktop_rt_swapchain_create_info.height = g_framework->get_d3d11_rt_size().y;
+    // The UI swapchain must match the (possibly taller) UI target so LGUI's full per-eye canvas is captured.
+    const auto ui_target_size = FFakeStereoRenderingHook::get_ui_target_size();
+    desktop_rt_swapchain_create_info.width = (uint32_t)ui_target_size.width;
+    desktop_rt_swapchain_create_info.height = (uint32_t)ui_target_size.height;
 
     auto desktop_rt_desc = backbuffer_desc;
     desktop_rt_desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
-    desktop_rt_desc.Width = g_framework->get_d3d11_rt_size().x;
-    desktop_rt_desc.Height = g_framework->get_d3d11_rt_size().y;
+    desktop_rt_desc.Width = (uint32_t)ui_target_size.width;
+    desktop_rt_desc.Height = (uint32_t)ui_target_size.height;
 
     // The UI texture
     if (auto err = create_swapchain((uint32_t)runtimes::OpenXR::SwapchainIndex::UI, desktop_rt_swapchain_create_info, desktop_rt_desc)) {

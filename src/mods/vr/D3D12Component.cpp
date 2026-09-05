@@ -237,6 +237,149 @@ static DiagPixelSample diag_sample_texture(ID3D12Device* device, ID3D12CommandQu
 
     return result;
 }
+
+// DIAG: full readback of a texture to find the bounding box of every pixel that has any color or alpha.
+// Used on the LGUI ui_target to measure exactly which sub-rectangle the redirected UI pass draws into,
+// instead of inferring it from view rects. Synchronous and heavy: callers must throttle it.
+struct DiagContentBounds {
+    bool succeeded{false};
+    uint32_t tex_w{0}, tex_h{0};
+    int32_t min_x{-1}, min_y{-1}, max_x{-1}, max_y{-1};
+    uint32_t nonzero_pixels{0};
+};
+
+static DiagContentBounds diag_content_bounds(ID3D12Device* device, ID3D12CommandQueue* command_queue, ID3D12Resource* src, D3D12_RESOURCE_STATES src_state) {
+    DiagContentBounds result{};
+
+    if (device == nullptr || command_queue == nullptr || src == nullptr) {
+        return result;
+    }
+
+    const auto desc = src->GetDesc();
+    if (desc.Width == 0 || desc.Height == 0 || desc.Format == DXGI_FORMAT_UNKNOWN || desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) {
+        return result;
+    }
+
+    result.tex_w = (uint32_t)desc.Width;
+    result.tex_h = desc.Height;
+
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
+    UINT num_rows{};
+    UINT64 row_size{};
+    UINT64 total_bytes{};
+    device->GetCopyableFootprints(&desc, 0, 1, 0, &footprint, &num_rows, &row_size, &total_bytes);
+
+    if (total_bytes == 0) {
+        return result;
+    }
+
+    Microsoft::WRL::ComPtr<ID3D12Resource> readback_buffer{};
+    D3D12_HEAP_PROPERTIES heap_props{};
+    heap_props.Type = D3D12_HEAP_TYPE_READBACK;
+
+    D3D12_RESOURCE_DESC buffer_desc{};
+    buffer_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    buffer_desc.Width = total_bytes;
+    buffer_desc.Height = 1;
+    buffer_desc.DepthOrArraySize = 1;
+    buffer_desc.MipLevels = 1;
+    buffer_desc.Format = DXGI_FORMAT_UNKNOWN;
+    buffer_desc.SampleDesc.Count = 1;
+    buffer_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+    if (FAILED(device->CreateCommittedResource(&heap_props, D3D12_HEAP_FLAG_NONE, &buffer_desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&readback_buffer)))) {
+        spdlog::error("[DIAG] Content bounds: failed to create readback buffer.");
+        return result;
+    }
+
+    Microsoft::WRL::ComPtr<ID3D12CommandAllocator> cmd_allocator{};
+    Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> cmd_list{};
+    Microsoft::WRL::ComPtr<ID3D12Fence> fence{};
+
+    if (FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&cmd_allocator))) ||
+        FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, cmd_allocator.Get(), nullptr, IID_PPV_ARGS(&cmd_list))) ||
+        FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)))) {
+        spdlog::error("[DIAG] Content bounds: failed to create command objects.");
+        return result;
+    }
+
+    D3D12_RESOURCE_BARRIER barrier{};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition.pResource = src;
+    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    barrier.Transition.StateBefore = src_state;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+
+    const bool needs_transition = src_state != D3D12_RESOURCE_STATE_COPY_SOURCE;
+    if (needs_transition) {
+        cmd_list->ResourceBarrier(1, &barrier);
+    }
+
+    D3D12_TEXTURE_COPY_LOCATION dst_loc{};
+    dst_loc.pResource = readback_buffer.Get();
+    dst_loc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    dst_loc.PlacedFootprint = footprint;
+
+    D3D12_TEXTURE_COPY_LOCATION src_loc{};
+    src_loc.pResource = src;
+    src_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    src_loc.SubresourceIndex = 0;
+
+    cmd_list->CopyTextureRegion(&dst_loc, 0, 0, 0, &src_loc, nullptr);
+
+    if (needs_transition) {
+        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        barrier.Transition.StateAfter = src_state;
+        cmd_list->ResourceBarrier(1, &barrier);
+    }
+
+    if (FAILED(cmd_list->Close())) {
+        return result;
+    }
+
+    ID3D12CommandList* const cmd_lists[] = {cmd_list.Get()};
+    command_queue->ExecuteCommandLists(1, cmd_lists);
+
+    HANDLE fence_event = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+    if (fence_event == nullptr) {
+        return result;
+    }
+
+    command_queue->Signal(fence.Get(), 1);
+    fence->SetEventOnCompletion(1, fence_event);
+    const auto wait_result = WaitForSingleObject(fence_event, 2000);
+    CloseHandle(fence_event);
+
+    if (wait_result != WAIT_OBJECT_0) {
+        spdlog::error("[DIAG] Content bounds: timed out waiting for GPU readback fence.");
+        return result;
+    }
+
+    void* mapped{nullptr};
+    D3D12_RANGE read_range{0, (SIZE_T)total_bytes};
+    if (FAILED(readback_buffer->Map(0, &read_range, &mapped))) {
+        return result;
+    }
+
+    const auto* bytes = (const uint8_t*)mapped;
+    constexpr uint32_t stride = 4; // sample every 4th pixel in both axes; bounds are accurate to +-4px
+
+    for (uint32_t y = 0; y < result.tex_h; y += stride) {
+        const auto* row = (const uint32_t*)(bytes + (size_t)footprint.Footprint.RowPitch * y);
+        for (uint32_t x = 0; x < result.tex_w; x += stride) {
+            if (row[x] == 0) continue;
+            ++result.nonzero_pixels;
+            if (result.min_x < 0 || (int32_t)x < result.min_x) result.min_x = (int32_t)x;
+            if (result.min_y < 0 || (int32_t)y < result.min_y) result.min_y = (int32_t)y;
+            if ((int32_t)x > result.max_x) result.max_x = (int32_t)x;
+            if ((int32_t)y > result.max_y) result.max_y = (int32_t)y;
+        }
+    }
+
+    readback_buffer->Unmap(0, nullptr);
+    result.succeeded = true;
+    return result;
+}
 } // namespace
 
 namespace vrmod {
@@ -706,6 +849,19 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
 
         // Recreate UI texture if needed
         if (!vr->is_extreme_compatibility_mode_enabled()) {
+            // Force a UI target reallocation whenever the tall-UI mode changes (NSF on/off or the
+            // "Fit UI To Full Canvas" toggle), so the redirected UI target is re-sized to match the
+            // new desired dimensions dynamically without requiring a game restart. Without this, the
+            // engine only reallocates on its own (resolution/menu changes), leaving a stale UI target
+            // that looks compressed/stretched until something else triggers a resize.
+            static bool s_last_tall_ui = false;
+            const bool tall_ui_now = vr->is_native_stereo_fix_tall_ui_enabled();
+            if (tall_ui_now != s_last_tall_ui) {
+                SPDLOG_INFO("[VR] Tall-UI mode changed ({} -> {}), forcing UI target reallocation", s_last_tall_ui, tall_ui_now);
+                s_last_tall_ui = tall_ui_now;
+                ffsr->set_should_recreate_textures(true);
+            }
+
             const auto native = (ID3D12Resource*)ui_target->get_native_resource();
             const auto is_same_native = native == m_last_checked_native;
             m_last_checked_native = native;
@@ -745,6 +901,31 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
     const float clear_color[] = { 0.0f, 0.0f, 0.0f, 0.0f };
     const auto is_2d_screen = vr->is_using_2d_screen();
 
+    // LGUI (redirected into ui_target) only paints the top-left hmd_w x hmd_h region when native stereo fix is on
+    // (measured via LGUI_BOUNDS). In 2D-screen mode the UI texture is composited over the 2D screen with a full-texture
+    // blit, so that region ended up in the top-left corner. Blit just the painted region, stretched over the screen.
+    std::optional<RECT> ui_src_rect{};
+    {
+        const auto ext = ffsr->get_ui_draw_extent();
+        if (m_game_ui_tex.texture.Get() != nullptr && ext.width > 0 && ext.height > 0) {
+            const auto ui_desc = m_game_ui_tex.texture->GetDesc();
+            if (ext.width < (int32_t)ui_desc.Width || ext.height < (int32_t)ui_desc.Height) {
+                ui_src_rect = RECT{0, 0, (LONG)ext.width, (LONG)ext.height};
+            }
+        }
+
+        static std::optional<RECT> last_rect{};
+        static bool have_last = false;
+        const bool changed = !have_last || ui_src_rect.has_value() != last_rect.has_value() ||
+            (ui_src_rect.has_value() && (ui_src_rect->right != last_rect->right || ui_src_rect->bottom != last_rect->bottom));
+        if (changed) {
+            have_last = true;
+            last_rect = ui_src_rect;
+            SPDLOG_INFO("[LGUI_BLIT] 2d-screen UI src rect = {} (2d_screen={} nsf={})",
+                ui_src_rect ? fmt::format("{}x{}", ui_src_rect->right, ui_src_rect->bottom) : std::string{"full"}, is_2d_screen, vr->is_native_stereo_fix_enabled());
+        }
+    }
+
     auto draw_2d_view = [&](d3d12::CommandContext& commands, ID3D12Resource* render_target) {
         if (ui_should_invert_alpha && m_game_ui_tex.texture.Get() != nullptr && m_game_ui_tex.srv_heap != nullptr) {
             d3d12::render_srv_to_rtv(m_ui_batch_alpha_invert.get(), commands.cmd_list.Get(), m_game_ui_tex, m_game_ui_tex, std::nullopt, ENGINE_SRC_COLOR, ENGINE_SRC_COLOR);
@@ -775,6 +956,7 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
                     commands.cmd_list.Get(),
                     m_game_ui_tex,
                     m_2d_screen_tex[0],
+                    ui_src_rect,
                     ENGINE_SRC_COLOR,
                     ENGINE_SRC_COLOR
                 );
@@ -809,12 +991,13 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
                         commands.cmd_list.Get(),
                         m_game_ui_tex,
                         m_2d_screen_tex[1],
+                        ui_src_rect,
                         ENGINE_SRC_COLOR,
                         ENGINE_SRC_COLOR
                     );
                 }
             } else {
-                // BUGFIX: previously the right 2D-mode screen (m_2d_screen_tex[1]) was only ever
+                // BUGFIX: previously the right 2D-mode screen
                 // cleared to black and never drawn to when is_afr is true, leaving it permanently
                 // black in 2D mode for AFR games (which is the common case). In AFR, m_game_tex is
                 // the shared double-wide backbuffer containing BOTH eyes side-by-side (this is the
@@ -836,6 +1019,7 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
                         commands.cmd_list.Get(),
                         m_game_ui_tex,
                         m_2d_screen_tex[1],
+                        ui_src_rect,
                         ENGINE_SRC_COLOR,
                         ENGINE_SRC_COLOR
                     );
@@ -879,6 +1063,57 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
         clear_rt(m_openvr.ui_tex.commands);
         m_openvr.ui_tex.commands.execute();
     } else if (runtime->is_openxr() && runtime->ready() && vr->m_openxr->frame_began) {
+        // DIAG: measure the actual painted bounds of the LGUI ui_target every ~5s (or on mode change) so we know
+        // exactly what sub-rect the redirected UI occupies in each NSF/2D/VR state, independent of any view rect guess.
+        // NOTE: diag_content_bounds does a BLOCKING full-target GPU readback; with retries this stalls the pipeline on
+        // many consecutive frames and causes noticeable lag. It has already established that the painted region tracks
+        // the per-eye view rect, so it is disabled by default. Flip LGUI_BOUNDS_DIAG to true only when re-measuring.
+        constexpr bool LGUI_BOUNDS_DIAG = false; // Option B validation: confirm paint height now fits within 2160; set false after.
+        if (LGUI_BOUNDS_DIAG && ui_target != nullptr) {
+            static uint32_t bounds_counter = 0;
+            static bool last_2d = false, last_nsf = false;
+            static uint32_t last_hmd_w = 0, last_hmd_h = 0;
+            // A resolution change trigger often lands a frame or two before LGUI actually paints at the new size
+            // (its first captured frame after a change is frequently empty: bbox=(-1,-1) nonzero_samples=0, wasting
+            // the sample). Keep retrying on every frame for a short window after a change/tick until we get real
+            // painted pixels, instead of giving up after a single empty capture.
+            static uint32_t retries_left = 0;
+            const bool nsf_now = vr->is_native_stereo_fix_enabled();
+            const auto hmd_w_now = vr->get_hmd_width();
+            const auto hmd_h_now = vr->get_hmd_height();
+            // Also trigger a sample immediately when the HMD/eye render resolution changes (not just 2D/NSF mode),
+            // since that's the value that actually varies when testing in-game resolution changes while in VR -
+            // the previous 300-frame-only tick missed most resolution changes during a quick test pass.
+            const bool mode_changed = is_2d_screen != last_2d || nsf_now != last_nsf || hmd_w_now != last_hmd_w || hmd_h_now != last_hmd_h;
+            const bool tick = (++bounds_counter % 300) == 0;
+            if (mode_changed) {
+                retries_left = 30; // ~0.5s at 60fps worth of retry frames
+            }
+            if (mode_changed || tick || retries_left > 0) {
+                last_2d = is_2d_screen;
+                last_nsf = nsf_now;
+                last_hmd_w = hmd_w_now;
+                last_hmd_h = hmd_h_now;
+                const auto native = (ID3D12Resource*)ui_target->get_native_resource();
+                const auto b = diag_content_bounds(device, command_queue, native, ENGINE_SRC_COLOR);
+                const auto ext = ffsr->get_ui_draw_extent();
+                if (b.succeeded) {
+                    if (b.nonzero_pixels > 0) {
+                        retries_left = 0;
+                    } else if (retries_left > 0) {
+                        --retries_left;
+                    }
+                    SPDLOG_INFO("[LGUI_BOUNDS] ui_target {}x{} painted bbox=({},{})-({},{}) size={}x{} nonzero_samples={} | reported_extent={}x{} 2d_screen={} nsf={} hmd={}x{}",
+                        b.tex_w, b.tex_h, b.min_x, b.min_y, b.max_x, b.max_y,
+                        b.max_x >= 0 ? b.max_x - b.min_x + 4 : 0, b.max_y >= 0 ? b.max_y - b.min_y + 4 : 0, b.nonzero_pixels,
+                        ext.width, ext.height, is_2d_screen, nsf_now, vr->get_hmd_width(), vr->get_hmd_height());
+                } else {
+                    if (retries_left > 0) --retries_left;
+                    SPDLOG_INFO("[LGUI_BOUNDS] readback failed for ui_target {:x}", (uintptr_t)native);
+                }
+            }
+        }
+
         if (is_right_eye_frame) {
             if (is_2d_screen) {
                 if (is_afr) {
@@ -888,10 +1123,66 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
                     m_openxr.copy((uint32_t)runtimes::OpenXR::SwapchainIndex::UI_RIGHT, m_2d_screen_tex[1].texture.Get(), std::nullopt, clear_rt, ENGINE_SRC_COLOR);
                 }
             } else if (ui_target != nullptr) {
-                m_openxr.copy((uint32_t)runtimes::OpenXR::SwapchainIndex::UI, (ID3D12Resource*)ui_target->get_native_resource(), draw_2d_view, clear_rt, ENGINE_SRC_COLOR);
+                // PERF (Option A): the redirected LGUI ui_target is sized to the full per-eye canvas (e.g.
+                // 3557x4209 with NSF tall-UI), but LGUI only paints a top-left sub-rect (get_ui_draw_extent),
+                // and the quad only presents that same sub-rect. Copying the WHOLE target every frame blits
+                // tens of MB of dead pixels - a major steady-state cost. Crop the copy to just the painted
+                // region via a src box. CopyTextureRegion writes to dst (0,0), matching the quad's top-left
+                // crop, so this is visually identical while moving far fewer bytes.
+                const auto ext = ffsr->get_ui_draw_extent();
+                const auto native_ui = (ID3D12Resource*)ui_target->get_native_resource();
+                const auto ui_desc = native_ui->GetDesc();
+                D3D12_BOX ui_box{};
+                D3D12_BOX* ui_box_ptr = nullptr;
+                if (ext.width > 0 && ext.height > 0 &&
+                    (UINT)ext.width <= ui_desc.Width && (UINT)ext.height <= ui_desc.Height &&
+                    ((UINT)ext.width < ui_desc.Width || (UINT)ext.height < ui_desc.Height)) {
+                    ui_box.left = 0;
+                    ui_box.top = 0;
+                    ui_box.front = 0;
+                    ui_box.right = (UINT)ext.width;
+                    ui_box.bottom = (UINT)ext.height;
+                    ui_box.back = 1;
+                    ui_box_ptr = &ui_box;
+                }
+                m_openxr.copy((uint32_t)runtimes::OpenXR::SwapchainIndex::UI, native_ui, draw_2d_view, clear_rt, ENGINE_SRC_COLOR, ui_box_ptr);
             }
 
             auto fw_rt = g_framework->get_rendertarget_d3d12();
+
+            // DIAG: measure what actually got composited for the UI layer this frame (post-blit), same cadence as LGUI_BOUNDS.
+            // If this bbox is still hmd-sized top-left, our blit/crop is not what is being displayed.
+            // NOTE: also a BLOCKING GPU readback - gated behind LGUI_BOUNDS_DIAG so it does not cause lag in normal use.
+            if (LGUI_BOUNDS_DIAG) {
+                static uint32_t out_counter = 0;
+                static bool out_last_2d = false, out_last_nsf = false;
+                const bool nsf_now = vr->is_native_stereo_fix_enabled();
+                const bool changed = is_2d_screen != out_last_2d || nsf_now != out_last_nsf;
+                if (changed || (++out_counter % 300) == 0) {
+                    out_last_2d = is_2d_screen;
+                    out_last_nsf = nsf_now;
+                    ID3D12Resource* dst = nullptr;
+                    const char* what = "none";
+                    if (is_2d_screen && m_2d_screen_tex[0].texture.Get() != nullptr) {
+                        dst = m_2d_screen_tex[0].texture.Get();
+                        what = "2d_screen_tex[0]";
+                    } else if (!is_2d_screen) {
+                        if (auto it = m_openxr.contexts.find((uint32_t)runtimes::OpenXR::SwapchainIndex::UI); it != m_openxr.contexts.end() && !it->second.textures.empty()) {
+                            const auto idx = std::min<size_t>(it->second.last_acquired_texture, it->second.textures.size() - 1);
+                            dst = it->second.textures[idx].texture;
+                            what = "ui_swapchain";
+                        }
+                    }
+                    if (dst != nullptr) {
+                        const auto b = diag_content_bounds(device, command_queue, dst, is_2d_screen ? ENGINE_SRC_COLOR : D3D12_RESOURCE_STATE_RENDER_TARGET);
+                        SPDLOG_INFO("[LGUI_OUT] {} {}x{} painted bbox=({},{})-({},{}) nonzero_samples={} | src_rect={} 2d_screen={} nsf={}",
+                            what, b.tex_w, b.tex_h, b.min_x, b.min_y, b.max_x, b.max_y, b.nonzero_pixels,
+                            ui_src_rect ? fmt::format("{}x{}", ui_src_rect->right, ui_src_rect->bottom) : std::string{"full"}, is_2d_screen, nsf_now);
+                    } else {
+                        SPDLOG_INFO("[LGUI_OUT] no destination texture available (2d_screen={})", is_2d_screen);
+                    }
+                }
+            }
 
             if (fw_rt && g_framework->is_drawing_anything()) {
                 m_openxr.copy((uint32_t)runtimes::OpenXR::SwapchainIndex::FRAMEWORK_UI, g_framework->get_rendertarget_d3d12().Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
@@ -1727,10 +2018,12 @@ void D3D12Component::on_reset(VR* vr) {
         }
 
 
+        const auto ui_target_size = FFakeStereoRenderingHook::get_ui_target_size();
+
         if (m_openxr.last_resolution[0] != vr->get_hmd_width() || m_openxr.last_resolution[1] != vr->get_hmd_height() ||
             vr->m_openxr->swapchains.empty() ||
-            g_framework->get_d3d12_rt_size()[0] != vr->m_openxr->swapchains[(uint32_t)runtimes::OpenXR::SwapchainIndex::UI].width ||
-            g_framework->get_d3d12_rt_size()[1] != vr->m_openxr->swapchains[(uint32_t)runtimes::OpenXR::SwapchainIndex::UI].height ||
+            (uint32_t)ui_target_size.width != vr->m_openxr->swapchains[(uint32_t)runtimes::OpenXR::SwapchainIndex::UI].width ||
+            (uint32_t)ui_target_size.height != vr->m_openxr->swapchains[(uint32_t)runtimes::OpenXR::SwapchainIndex::UI].height ||
             m_last_afr_state != vr->is_using_afr() ||
             needs_depth_resize)
         {
@@ -1863,10 +2156,11 @@ bool D3D12Component::setup() {
             }
         }
 
-        // Set up the UI texture. it's the desktop resolution.
+        // Set up the UI texture. It matches the (possibly taller) UI target so the full LGUI canvas is captured.
         auto ui_desc = backbuffer_desc;
-        ui_desc.Width = (uint32_t)g_framework->get_d3d12_rt_size().x;
-        ui_desc.Height = (uint32_t)g_framework->get_d3d12_rt_size().y;
+        const auto ui_target_size = FFakeStereoRenderingHook::get_ui_target_size();
+        ui_desc.Width = (uint32_t)ui_target_size.width;
+        ui_desc.Height = (uint32_t)ui_target_size.height;
 
         ComPtr<ID3D12Resource> ui_tex{};
         if (FAILED(device->CreateCommittedResource(&heap_props, D3D12_HEAP_FLAG_NONE, &ui_desc, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr,
@@ -2148,13 +2442,15 @@ std::optional<std::string> D3D12Component::OpenXR::create_swapchains() {
 
     auto desktop_rt_swapchain_create_info = standard_swapchain_create_info;
     desktop_rt_swapchain_create_info.format = DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
-    desktop_rt_swapchain_create_info.width = g_framework->get_d3d12_rt_size().x;
-    desktop_rt_swapchain_create_info.height = g_framework->get_d3d12_rt_size().y;
+    // The UI swapchain must match the (possibly taller) UI target so LGUI's full per-eye canvas is captured.
+    const auto ui_target_size = FFakeStereoRenderingHook::get_ui_target_size();
+    desktop_rt_swapchain_create_info.width = (uint32_t)ui_target_size.width;
+    desktop_rt_swapchain_create_info.height = (uint32_t)ui_target_size.height;
 
     auto desktop_rt_desc = backbuffer_desc;
     desktop_rt_desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
-    desktop_rt_desc.Width = g_framework->get_d3d12_rt_size().x;
-    desktop_rt_desc.Height = g_framework->get_d3d12_rt_size().y;
+    desktop_rt_desc.Width = (uint32_t)ui_target_size.width;
+    desktop_rt_desc.Height = (uint32_t)ui_target_size.height;
 
     desktop_rt_desc.Flags |= D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
     desktop_rt_desc.Flags &= ~D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE;

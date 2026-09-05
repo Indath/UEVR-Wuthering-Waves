@@ -2502,6 +2502,10 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
             if (ImGui::IsItemHovered()) {
                 ImGui::SetTooltip("Skips spawning the scene-capture actor entirely. The right eye is\njust a flat mirror of the left/game view (no stereoscopic depth).\nUse this as a stable fallback if the scene capture is causing\nstuck loading screens during level transitions.");
             }
+            m_native_stereo_fix_tall_ui->draw("Fit UI To Full Canvas (Fix Bottom Cutoff)");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("With Native Stereo Fix on, LGUI lays its UI canvas out at the per-eye view\nrect height, which is taller than the scene render target, so the bottom of\nthe UI is clipped. This grows the UI render target to the full canvas height\nso the whole UI is captured, then presents it cropped/stretched back to 16:9.\nOnly applies while Native Stereo Fix is active - in AFR / NSF Off the canvas\nis not tall, so growing the target would distort the UI. Requires a texture\nrecreation (toggle NSF off/on or reload) to take effect.");
+            }
             m_native_stereo_fix_allow_with_afr->draw("Allow While Using AFR/Synchronized Sequential");
             if (ImGui::IsItemHovered()) {
                 ImGui::SetTooltip("Normally Native Stereo Fix only runs when NOT using AFR/Synchronized\nSequential rendering. Enabling this allows it to also run in those modes.\nFixes 2D-screen UI being scaled to HMD resolution instead of the desktop\nresolution, and the resulting loss of native gamepad UI confirm/navigation\ninput, in Synchronized Sequential mode.");

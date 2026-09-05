@@ -9,6 +9,7 @@
 #include <filesystem>
 #include <unordered_map>
 #include <thread>
+#include <mutex>
 
 #include <spdlog/spdlog.h>
 #include <utility/Memory.hpp>
@@ -2401,6 +2402,17 @@ FRHITexture2D** FFakeStereoRenderingHook::viewport_get_render_target_texture_hoo
     return og(viewport);
 }
 
+// OPTION B (UI canvas fit): LGUI lays its UI canvas out in pixel space at the game-thread FViewport::GetSizeXY size
+// (per-eye hmd_w x hmd_h with NSF, e.g. 2699x3193) and paints it top-left into the fixed 3840x2160 ui_target. When the
+// per-eye height (3193) exceeds the target height (2160), the bottom of the UI is clipped - this is the NSF-ON bottom
+// cutoff. Proven by [LGUI_D3D] (viewport always full-target) + [LGUI_BOUNDS] (paint height tracks hmd_h, not ui_target).
+// Fix: for the DURATION of the UI draw only, overwrite the FViewport SizeX/SizeY that LGUI reads with a size that fits
+// inside the ui_target (same aspect, scaled so height <= ui_h), then RESTORE the real values immediately after so the
+// 3D scene renderer - which reads the same FViewport later - is never affected. Scoped, synchronous, and toggle-gated.
+static constexpr bool LGUI_FIT_UI_CANVAS = true;
+// FViewport::SizeX/SizeY byte offset, resolved once by the size scan below and reused at the patch site.
+static std::optional<uint32_t> g_fviewport_size_off{};
+
 void FFakeStereoRenderingHook::game_viewport_client_draw_hook(sdk::UGameViewportClient* viewport_client, sdk::FViewport* viewport, sdk::FCanvas* canvas, void* a4) {
     ZoneScopedN(__FUNCTION__);
 
@@ -2433,6 +2445,84 @@ void FFakeStereoRenderingHook::game_viewport_client_draw_hook(sdk::UGameViewport
     g_hook->m_in_viewport_client_draw = true;
     g_hook->m_was_in_viewport_client_draw = false;
     g_hook->get_render_target_manager()->set_viewport(viewport);
+
+    // Sample the game-thread viewport size LGUI uses for its canvas layout (see lgui_slot24_hook).
+    // The SDK's GetViewportSizeXY vtable scan fails on this engine build, so fall back to locating FViewport::SizeX/SizeY
+    // in the object: the int pair equal to the window client size (2D mode) pins the offset, which is then reused in VR.
+    if (viewport != nullptr && !IsBadReadPtr(viewport, 0x200)) {
+        static std::optional<uint32_t> size_off{};
+        static bool logged_candidates = false;
+        auto vr = VR::get();
+
+        SPDLOG_INFO_ONCE("[LGUI_VP] viewport sampling active (viewport={:x} sdk_index={})", (uintptr_t)viewport, sdk::FViewport::get_viewport_size_xy_index().has_value());
+
+        sdk::FViewport::IntPoint sz{};
+        if (sdk::FViewport::get_viewport_size_xy_index().has_value()) {
+            sz = viewport->get_viewport_size_xy();
+        }
+
+        if (sz.x <= 0 || sz.y <= 0) {
+            RECT rc{};
+            const auto have_rc = g_framework->get_window() != nullptr && GetClientRect(g_framework->get_window(), &rc) != FALSE;
+            const int32_t win_w = have_rc ? rc.right - rc.left : 0;
+            const int32_t win_h = have_rc ? rc.bottom - rc.top : 0;
+
+            // NOTE: this scan used to be gated behind flat_view (2D/non-HMD only), so in real VR sessions (HMD
+            // active, not 2D screen) it never ran and size_off was never resolved - meaning the whole
+            // [LGUI_VP] game viewport size log below never fired during VR testing. Run the scan regardless of
+            // mode; win_w/win_h (desktop mirror window) and alt_w/alt_h (hmd size) are both valid candidates to
+            // match against in VR too.
+            if (!size_off.has_value()) {
+                const int32_t alt_w = (int32_t)vr->get_hmd_width();
+                const int32_t alt_h = (int32_t)vr->get_hmd_height();
+                std::string cands{};
+                for (uint32_t off = 0x8; off + 8 <= 0x200; off += 4) {
+                    const auto x = *(int32_t*)((uintptr_t)viewport + off);
+                    const auto y = *(int32_t*)((uintptr_t)viewport + off + 4);
+                    if (x >= 64 && x <= 16384 && y >= 64 && y <= 16384) {
+                        cands += fmt::format("{:x}=({},{}) ", off, x, y);
+                        if (!size_off.has_value() && ((win_w > 0 && x == win_w && y == win_h) || (alt_w > 0 && x == alt_w && y == alt_h))) {
+                            size_off = off;
+                        }
+                    }
+                }
+                if (!logged_candidates || size_off.has_value()) {
+                    logged_candidates = true;
+                    SPDLOG_INFO("[LGUI_VP] FViewport size scan: window client={}x{} hmd2d={}x{} 2d_screen={} hmd_active={} candidates: {} -> SizeXY offset {}", win_w, win_h, alt_w, alt_h,
+                        vr->is_using_2d_screen(), vr->is_hmd_active(), cands.empty() ? "<none>" : cands, size_off.has_value() ? fmt::format("{:x}", *size_off) : "not found");
+                }
+            }
+
+            if (size_off.has_value()) {
+                sz.x = *(int32_t*)((uintptr_t)viewport + *size_off);
+                sz.y = *(int32_t*)((uintptr_t)viewport + *size_off + 4);
+                g_fviewport_size_off = size_off; // share with the Option B fit patch at the call_orig() site
+            }
+        }
+
+        // Option B needs the BYTE offset of FViewport::SizeX/SizeY inside the object so it can patch it around the UI draw.
+        // The fallback scan above only runs when the SDK's get_viewport_size_xy() fails; when the SDK path succeeds we have
+        // the size value (sz) but not the offset. Resolve the offset independently by scanning for the int pair that equals
+        // the known-good sz, so g_fviewport_size_off is populated regardless of which path produced sz.
+        if (!g_fviewport_size_off.has_value() && sz.x > 0 && sz.y > 0) {
+            for (uint32_t off = 0x8; off + 8 <= 0x200; off += 4) {
+                const auto x = *(int32_t*)((uintptr_t)viewport + off);
+                const auto y = *(int32_t*)((uintptr_t)viewport + off + 4);
+                if (x == sz.x && y == sz.y) {
+                    g_fviewport_size_off = off;
+                    SPDLOG_INFO("[LGUI_VP] resolved FViewport SizeXY offset {:x} from sz={}x{} (sdk path)", off, sz.x, sz.y);
+                    break;
+                }
+            }
+        }
+
+        const auto prev = g_hook->get_game_viewport_size();
+        if (sz.x > 0 && sz.y > 0 && (sz.x != prev.width || sz.y != prev.height)) {
+            g_hook->set_game_viewport_size(sz.x, sz.y);
+            SPDLOG_INFO("[LGUI_VP] game viewport size {}x{} (hmd_active={} nsf={} hmd={}x{})", sz.x, sz.y,
+                vr->is_hmd_active(), vr->is_native_stereo_fix_enabled(), vr->get_hmd_width(), vr->get_hmd_height());
+        }
+    }
 
     utility::ScopeGuard _{ 
         []() { 
@@ -2498,7 +2588,49 @@ void FFakeStereoRenderingHook::game_viewport_client_draw_hook(sdk::UGameViewport
         mod->on_pre_viewport_client_draw(viewport_client, viewport, canvas);
     }
 
+    // OPTION B: temporarily shrink the FViewport SizeX/SizeY that LGUI reads for its canvas layout so the UI fits inside
+    // the ui_target (no bottom clip), then restore before the scene renderer reads the same FViewport. Same-aspect scale
+    // so height <= ui_h; only touches the two ints at the resolved offset, only while HMD is active, fully restored below.
+    bool fit_patched = false;
+    int32_t fit_saved_x = 0, fit_saved_y = 0;
+    if (LGUI_FIT_UI_CANVAS && vr->is_hmd_active() && g_fviewport_size_off.has_value() &&
+        viewport != nullptr && !IsBadReadPtr(viewport, 0x200) &&
+        g_hook->get_render_target_manager() != nullptr) {
+        const auto ui_target = g_hook->get_render_target_manager()->get_ui_target();
+        if (ui_target != nullptr && !IsBadReadPtr(ui_target, 0x60)) {
+            const auto ui_w = *(int32_t*)((uintptr_t)ui_target + 0x54);
+            const auto ui_h = *(int32_t*)((uintptr_t)ui_target + 0x58);
+            auto px = (int32_t*)((uintptr_t)viewport + *g_fviewport_size_off);
+            auto py = (int32_t*)((uintptr_t)viewport + *g_fviewport_size_off + 4);
+            const int32_t cur_x = *px, cur_y = *py;
+            if (ui_w >= 64 && ui_h >= 64 && cur_x >= 64 && cur_y >= 64 && (cur_x > ui_w || cur_y > ui_h)) {
+                const float aspect = (float)cur_x / (float)cur_y;
+                int32_t new_h = ui_h;
+                int32_t new_w = (int32_t)((float)new_h * aspect + 0.5f);
+                if (new_w > ui_w) { new_w = ui_w; new_h = (int32_t)((float)new_w / aspect + 0.5f); }
+                fit_saved_x = cur_x;
+                fit_saved_y = cur_y;
+                *px = new_w;
+                *py = new_h;
+                fit_patched = true;
+                static int32_t last_x = 0, last_y = 0;
+                if (cur_x != last_x || cur_y != last_y) {
+                    last_x = cur_x; last_y = cur_y;
+                    SPDLOG_INFO("[LGUI_FIT] viewport SizeXY {}x{} -> {}x{} for UI draw (ui_target={}x{}, aspect={:.4f})",
+                        cur_x, cur_y, new_w, new_h, ui_w, ui_h, aspect);
+                }
+            }
+        }
+    }
+
     call_orig();
+
+    if (fit_patched) {
+        auto px = (int32_t*)((uintptr_t)viewport + *g_fviewport_size_off);
+        auto py = (int32_t*)((uintptr_t)viewport + *g_fviewport_size_off + 4);
+        *px = fit_saved_x;
+        *py = fit_saved_y;
+    }
 
     // Perform synced eye rendering (synced AFR)
     if (in_engine_tick && vr->is_using_synchronized_afr()) {
@@ -3157,11 +3289,599 @@ struct SceneViewExtensionAnalyzer {
 static std::unordered_map<uintptr_t, uintptr_t> g_lgui_slot24_originals{}; // vtable -> original fn
 static constexpr int32_t LGUI_DRAW_SLOT = 24;
 
+// Game-thread ISceneViewExtension callbacks on the LGUI classes. The canvas layout (the rect LGUI paints into, measured by
+// LGUI_BOUNDS as exactly hmd_w x hmd_h) is fixed before the render-thread draw, so it must be read from the FSceneView /
+// FSceneViewFamily in one of these. Stock layout: 2 = SetupView(Family, View), 13 = BeginRenderViewFamily(Family).
+// While LGUI runs inside the callback, present every (0,0,hmd_w,hmd_h) rect in the view as (0,0,ui_w,ui_h) so its ortho
+// canvas is laid out 16:9 for ui_target; restore afterwards so the scene keeps the real eye rect.
+static constexpr int32_t LGUI_SETUP_VIEW_SLOT = 2;
+static constexpr int32_t LGUI_BEGIN_FAMILY_SLOT = 13;
+static std::unordered_map<uintptr_t, uintptr_t> g_lgui_setup_view_originals{};
+static std::unordered_map<uintptr_t, uintptr_t> g_lgui_begin_family_originals{};
+
+struct LguiRectPatch {
+    int32_t* p{};
+    int32_t saved[4]{};
+};
+
+static void lgui_patch_view_rects(uintptr_t obj, uint32_t len, const char* tag, std::vector<LguiRectPatch>& patches, std::string& where) {
+    if (obj < 0x10000 || IsBadReadPtr((void*)obj, len)) return;
+
+    const auto hw = (int32_t)VR::get()->get_hmd_width();
+    const auto hh = (int32_t)VR::get()->get_hmd_height();
+    if (hw <= 0 || hh <= 0 || g_hook == nullptr || g_hook->get_render_target_manager() == nullptr) return;
+
+    const auto ui_target = g_hook->get_render_target_manager()->get_ui_target();
+    if (ui_target == nullptr || IsBadReadPtr(ui_target, 0x60)) return;
+    const auto ui_w = *(int32_t*)((uintptr_t)ui_target + 0x54);
+    const auto ui_h = *(int32_t*)((uintptr_t)ui_target + 0x58);
+    if (ui_w < 64 || ui_h < 64 || ui_w > 16384 || ui_h > 16384) return;
+
+    for (uint32_t off = 0; off + 16 <= len; off += 4) {
+        auto r = (int32_t*)(obj + off);
+        // FIntRect {Min.X, Min.Y, Max.X, Max.Y}: any rect that is exactly one eye (hw x hh) or the family (2hw x hh) tall/wide.
+        // With NSF off the right eye sits at Min.X == hw; patch it too (only LGUI sees it, the scene is restored right after).
+        const int32_t w = r[2] - r[0];
+        const int32_t h = r[3] - r[1];
+        const bool eye = r[1] == 0 && h == hh && w == hw && (r[0] == 0 || r[0] == hw);
+        const bool wide = r[0] == 0 && r[1] == 0 && w == hw * 2 && h == hh;
+        if (!eye && !wide) continue;
+
+        LguiRectPatch pt{r, {r[0], r[1], r[2], r[3]}};
+        patches.push_back(pt);
+        r[0] = 0; r[1] = 0; r[2] = ui_w; r[3] = ui_h;
+        where += fmt::format("{}+{:x}{} ", tag, off, wide ? "(2w)" : (pt.saved[0] != 0 ? "(R)" : ""));
+        off += 12;
+    }
+
+    // Also look for bare (hw, hh) size pairs (e.g. FIntPoint ViewSize / BufferSize) that are not part of a rect we just patched.
+    for (uint32_t off = 0; off + 8 <= len; off += 4) {
+        auto p = (int32_t*)(obj + off);
+        if (!((p[0] == hw || p[0] == hw * 2) && p[1] == hh)) continue;
+        bool already = false;
+        for (const auto& pt : patches) {
+            const auto b = (uintptr_t)pt.p;
+            if ((uintptr_t)p >= b && (uintptr_t)p < b + 16) { already = true; break; }
+        }
+        if (already) continue;
+        LguiRectPatch pt{p, {p[0], p[1], 0, 0}};
+        pt.p = p;
+        patches.push_back(pt);
+        p[0] = ui_w; p[1] = ui_h;
+        where += fmt::format("{}+{:x}(sz) ", tag, off);
+        off += 4;
+    }
+}
+
+static void lgui_restore_view_rects(std::vector<LguiRectPatch>& patches) {
+    for (auto& pt : patches) {
+        pt.p[0] = pt.saved[0]; pt.p[1] = pt.saved[1];
+        // size-pair entries have saved[2]==saved[3]==0 and must not touch the following 8 bytes
+        if (pt.saved[2] != 0 || pt.saved[3] != 0) { pt.p[2] = pt.saved[2]; pt.p[3] = pt.saved[3]; }
+    }
+}
+
+// ==== EXPERIMENT: render-thread-scoped real FSceneView::ViewRect swap ==============================
+// Tests the user's hypothesis directly: hook LGUI's render pass, temporarily overwrite the REAL
+// FSceneView::ViewRect (and any per-eye/family rect it carries) to the ui_target size for the DURATION
+// of LGUI's draw ONLY, then restore synchronously the instant LGUI returns. Because a3 here is the
+// actual render-thread FSceneView/FSceneViewFamily the LGUI pass consumes, this is exactly "swap
+// during LGUI's pass, restore immediately after" - not the earlier persistent/game-thread mutations.
+// If LGUI's painted extent (measured by [LGUI_BOUNDS] in D3D12Component) grows to the full ui_target
+// height with this on, the view-rect IS LGUI's layout source; if it stays clipped, the theory is
+// disproven and the target-sizing fix remains the only lever. LEAVE FALSE for normal play; the swap
+// touches the live scene view and must only run while actively measuring (enable LGUI_BOUNDS_DIAG too).
+// RESULT (2026-09-05): DISPROVEN. Swap fired (a3view+a88 -> 3840x2683) but [LGUI_BOUNDS] painted width
+// stayed at hmd_w (2268), never 3840 -> LGUI does NOT read FSceneView::ViewRect for its raster extent;
+// it clips to the render-target/HMD size. The ui_target sizing fix remains the only working lever.
+constexpr bool LGUI_PROBE_VIEWRECT_SWAP = false;
+
+// Collect the real FSceneView object(s) reachable from a3 (either a3 IS an FSceneView, or a3 is an
+// FSceneViewFamily whose views[] we walk) and patch their per-eye/family view rects to ui_target size.
+// Patches are recorded so the caller restores them synchronously right after LGUI's draw returns.
+static void lgui_probe_swap_view_rects(void* a3, std::vector<LguiRectPatch>& patches, std::string& where) {
+    if (a3 == nullptr || IsBadReadPtr(a3, 0x100)) return;
+
+    // The FSceneView layout is large; ViewRect / UnconstrainedViewRect live within the first ~0xB00 bytes.
+    constexpr uint32_t VIEW_SCAN_LEN = 0xB00;
+
+    // Hypothesis A: a3 is an FSceneViewFamily. Its views resolve back to a3 (view->Family == a3).
+    const auto fam = (sdk::FSceneViewFamily*)a3;
+    const auto views = fam->get_views();
+    bool patched_family = false;
+    if (views != nullptr && !IsBadReadPtr(views, sizeof(*views)) && views->count > 0 && views->count <= 4 &&
+        views->data != nullptr && !IsBadReadPtr(views->data, sizeof(void*) * views->count))
+    {
+        for (int32_t k = 0; k < views->count; ++k) {
+            const auto v = (uintptr_t)views->data[k];
+            if (v == 0 || IsBadReadPtr((void*)v, VIEW_SCAN_LEN) || *(uintptr_t*)v != (uintptr_t)a3) { patched_family = false; break; }
+            lgui_patch_view_rects(v, VIEW_SCAN_LEN, "view", patches, where);
+            patched_family = true;
+        }
+    }
+
+    // Hypothesis B: a3 is itself an FSceneView. Patch it directly.
+    if (!patched_family) {
+        lgui_patch_view_rects((uintptr_t)a3, VIEW_SCAN_LEN, "a3view", patches, where);
+    }
+}
+
+// Cap the HEIGHT of any eye/family view rect to ui_h so LGUI's canvas never exceeds the capture target's height.
+// With NSF ON the per-eye render height (e.g. 3193) is taller than ui_target (2160); LGUI lays its canvas out at that
+// height and paints top-left, so the bottom is clipped off the target. Clamping only Max.Y (never enlarging, never
+// touching width/X) keeps the canvas within 2160 so the full UI fits. Patches are recorded so the caller restores them
+// synchronously right after LGUI captures its layout - they never persist into a later scene render.
+static void lgui_cap_view_rect_height(uintptr_t obj, uint32_t len, const char* tag, std::vector<LguiRectPatch>& patches, std::string& where) {
+    if (obj < 0x10000 || IsBadReadPtr((void*)obj, len)) return;
+
+    const auto hw = (int32_t)VR::get()->get_hmd_width();
+    const auto hh = (int32_t)VR::get()->get_hmd_height();
+    if (hw <= 0 || hh <= 0 || g_hook == nullptr || g_hook->get_render_target_manager() == nullptr) return;
+
+    const auto ui_target = g_hook->get_render_target_manager()->get_ui_target();
+    if (ui_target == nullptr || IsBadReadPtr(ui_target, 0x60)) return;
+    const auto ui_h = *(int32_t*)((uintptr_t)ui_target + 0x58);
+    if (ui_h < 64 || ui_h > 16384) return;
+    if (hh <= ui_h) return; // eye already fits, nothing to cap
+
+    for (uint32_t off = 0; off + 16 <= len; off += 4) {
+        auto r = (int32_t*)(obj + off);
+        const int32_t w = r[2] - r[0];
+        const int32_t h = r[3] - r[1];
+        // FIntRect {Min.X, Min.Y, Max.X, Max.Y}: an eye (hw x hh) or family (2hw x hh) rect at Min.Y == 0.
+        const bool eye = r[1] == 0 && h == hh && w == hw && (r[0] == 0 || r[0] == hw);
+        const bool wide = r[0] == 0 && r[1] == 0 && w == hw * 2 && h == hh;
+        if (!eye && !wide) continue;
+
+        LguiRectPatch pt{r, {r[0], r[1], r[2], r[3]}};
+        patches.push_back(pt);
+        r[3] = r[1] + ui_h; // clamp Max.Y so height == ui_h; leave X/width/Min.Y untouched
+        where += fmt::format("{}+{:x}(capH) ", tag, off);
+        off += 12;
+    }
+}
+
+
+// RE-ENABLED (attempt #5): feed LGUI a fixed ui_target-sized (3840x2160) view/family rect during its OWN SetupView so
+// its canvas lays out at the capture-target resolution instead of the per-eye stereo rect (e.g. 2699x3193). This isolates
+// the UI's layout resolution from the stereo/eye resolution and fixes the NSF ON bottom cutoff (canvas no longer 3193 tall).
+// The patch is applied and RESTORED synchronously around the original SetupView call, so the real 3D scene render for that
+// eye - which reads its own live FSceneView rect - is never affected. The earlier suspected "lag" was actually the global
+// D3D12 viewport/scissor vtable hook (now disabled), not this patch. Quad aspect is still corrected at presentation.
+// SUPERSEDED by Option 2 (game-thread FSceneView clone, LGUI_CLONE_VIEW below): this in-place patch mutates the REAL shared
+// view rect (even if restored synchronously) and must NOT run alongside the clone path, or LGUI reads a doubly-modified view.
+// Disabled so only the clone (pristine-copy) route feeds LGUI its ui_target-sized rects.
+constexpr bool LGUI_PATCH_GAME_THREAD_RECTS = false;
+
+// Master debug toggle for the steady-state UI/LGUI investigation diagnostics that would otherwise emit
+// every frame (game-thread [LGUI_GT] SetupView dumps + dimension/float scans, the [VIEWEXT_DIAG] engine
+// view-extension vtable walk, and the [DIAG] AdjustViewRect trace). These do module lookups, IsBadReadPtr
+// walks and fmt::format string building on hot threads, so they are a confirmed steady-state cost. Leave
+// FALSE for normal play; flip to TRUE only when actively re-probing the UI size sources.
+constexpr bool LGUI_DIAG_STEADY_STATE = false;
+
+// SEH wrapper (no C++ objects) for calling the LGUI draw with a possibly-null depth texture.
+static bool lgui_call_draw_seh(void* (*fn)(void*, void*, void*, void*, void*, void*), void* self, void* a2, void* a3, void* a4, void* a5, void* a6, void** out) {
+    __try {
+        *out = fn(self, a2, a3, a4, a5, a6);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+// SEH wrapper (no unwinding C++ objects) for calling SetupView with cloned view/family args. Returns false on fault.
+static bool lgui_call_setup_view_seh(void (*fn)(void*, void*, void*), void* self, void* family, void* view) {
+    __try {
+        fn(self, family, view);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+static void lgui_setup_view_hook(void* self, void* family, void* view) {
+    const auto vtable = *(uintptr_t*)self;
+    const auto it = g_lgui_setup_view_originals.find(vtable);
+    if (it == g_lgui_setup_view_originals.end()) return;
+
+    static uint32_t n = 0;
+    const auto k = n++;
+    // REVERTED: deferring restoration of view/family rects across the frame boundary (previous attempt) corrupted
+    // the REAL FSceneView/FSceneViewFamily rects (ViewRect/UnconstrainedViewRect) that the actual 3D scene render
+    // for that eye also reads - not just LGUI. This produced a new regression (right eye pushed up with a black
+    // bar = its real view rect was patched to ui_target size while the scene rendered). These are live engine
+    // objects shared with the renderer, so the patch must be applied and restored within the SAME call, synchronously
+    // around the original function, exactly as before. LGUI's actual render-thread read is instead handled correctly-
+    // timed in lgui_slot24_hook (patches a2/refs there, at render-thread execute time) - do not try to solve LGUI
+    // timing by holding the game-thread view/family patch open across frames.
+    std::vector<LguiRectPatch> patches{};
+    std::string where{};
+
+    if (LGUI_PATCH_GAME_THREAD_RECTS && VR::get()->is_hmd_active()) {
+        lgui_patch_view_rects((uintptr_t)view, 0x1800, "view", patches, where);
+        lgui_patch_view_rects((uintptr_t)family, 0x400, "family", patches, where);
+    }
+
+    // Height cap: independent of the (disabled) full-rect patch above. Clamp only the view rect HEIGHT to ui_h so
+    // LGUI's canvas fits inside the 2160-tall capture target and its bottom is no longer clipped when the per-eye
+    // render height exceeds 2160 (NSF ON at higher HMD resolutions). Restored synchronously below.
+    // Redundant when LGUI_PATCH_GAME_THREAD_RECTS is on (the full-rect patch already sets height to ui_h). Kept for
+    // fallback use if the full-rect patch is ever disabled again.
+    constexpr bool LGUI_CAP_VIEW_HEIGHT = false;
+    if (LGUI_CAP_VIEW_HEIGHT && VR::get()->is_hmd_active()) {
+        lgui_cap_view_rect_height((uintptr_t)view, 0x1800, "view", patches, where);
+        lgui_cap_view_rect_height((uintptr_t)family, 0x400, "family", patches, where);
+    }
+
+    // OPTION 1 (spatial UI/scene separation): patch LGUI's OWN canvas fields BEFORE calling the original SetupView, so
+    // LGUI computes its ortho canvas / projection from the ui_target size (3840x2160, 16:9) instead of recomputing it
+    // from the shared per-eye FSceneView rect (e.g. 2699x3193, ~0.85 aspect). These are LGUI-private members - NOT the
+    // shared FSceneView/FSceneViewFamily rects the 3D scene renderer reads - so unlike the reverted deferred-restore
+    // experiment this can never corrupt the stereo scene render. Fields (confirmed via [LGUI_GT] diagnostics):
+    //   self+0xb4, self+0x104 : canvas aspect ratio (== eye/wide aspect); set to ui aspect
+    //   self+0x264, self+0x268 : canvas width/height ints (== hmd_w/hmd_h); set to ui_w/ui_h
+    // NOTE: the existing LGUI_PATCH_SELF_ASPECT / LGUI_PATCH_SELF_TREE_SIZES blocks below run AFTER the original call and
+    // were being overridden because SetupView recomputes these from the view rect during the call. Doing it BEFORE lets
+    // SetupView's own math consume the ui-target size. Kept behind a clearly-labelled toggle so it can be reverted instantly.
+    // These fields belong to the persistent LGUI object, so they must be RESTORED after the original call (below) to avoid
+    // permanently mutating engine state between frames.
+    // CONFIRMED NO-OP (2026-09-05): [LGUI_BOUNDS] stayed at 2700x2160 with these fields patched, so LGUI ignores its
+    // own aspect/size members for the raster extent and reads the shared FSceneView view rect directly. Disabled; the
+    // FSceneView view rect is instead handled render-thread-locally in lgui_slot24_hook (Option 3). Code kept for record.
+    constexpr bool LGUI_PATCH_SELF_PRECALL = false;
+    constexpr uint32_t LGUI_SELF_ASPECT_OFFS_PRE[] = {0xb4, 0x104};
+    constexpr uint32_t LGUI_SELF_SIZE_OFFS_PRE[] = {0x264, 0x268}; // {width, height}
+    struct SelfFieldSave { void* addr; uint32_t raw; };
+    std::vector<SelfFieldSave> self_pre_saved{};
+    if (LGUI_PATCH_SELF_PRECALL && VR::get()->is_hmd_active() && self != nullptr && !IsBadReadPtr(self, 0x300) &&
+        g_hook != nullptr && g_hook->get_render_target_manager() != nullptr)
+    {
+        const auto ui_target = g_hook->get_render_target_manager()->get_ui_target();
+        const auto hw = (int32_t)VR::get()->get_hmd_width();
+        const auto hh = (int32_t)VR::get()->get_hmd_height();
+        if (ui_target != nullptr && !IsBadReadPtr(ui_target, 0x60) && hw > 0 && hh > 0) {
+            const auto ui_w = *(int32_t*)((uintptr_t)ui_target + 0x54);
+            const auto ui_h = *(int32_t*)((uintptr_t)ui_target + 0x58);
+            if (ui_w >= 64 && ui_h >= 64) {
+                const float eye_aspect = (float)hw / (float)hh;
+                const float wide_aspect = (hw * 2.0f) / (float)hh;
+                const float ui_aspect = (float)ui_w / (float)ui_h;
+                for (auto off : LGUI_SELF_ASPECT_OFFS_PRE) {
+                    auto p = (float*)((uintptr_t)self + off);
+                    if (std::fabs(*p - eye_aspect) <= eye_aspect * 1e-4f || std::fabs(*p - wide_aspect) <= wide_aspect * 1e-4f) {
+                        SelfFieldSave s{}; s.addr = p; memcpy(&s.raw, p, 4); self_pre_saved.push_back(s);
+                        *p = ui_aspect;
+                    }
+                }
+                for (auto off : LGUI_SELF_SIZE_OFFS_PRE) {
+                    auto p = (int32_t*)((uintptr_t)self + off);
+                    const int32_t want = (off == LGUI_SELF_SIZE_OFFS_PRE[0]) ? ui_w : ui_h;
+                    if (*p == hw || *p == hh || *p == hw * 2) {
+                        SelfFieldSave s{}; s.addr = p; memcpy(&s.raw, p, 4); self_pre_saved.push_back(s);
+                        *p = want;
+                    }
+                }
+                static size_t last_pre = SIZE_MAX;
+                if (self_pre_saved.size() != last_pre) {
+                    last_pre = self_pre_saved.size();
+                    SPDLOG_INFO("[LGUI_GT] self pre-call patched {} fields (eye_aspect={:.4f} -> ui_aspect={:.4f}, {}x{} -> {}x{})",
+                        self_pre_saved.size(), eye_aspect, ui_aspect, hw, hh, ui_w, ui_h);
+                }
+            }
+        }
+    }
+
+    // One-shot: dump every int in the view that looks like a dimension (64..16384) so remaining size fields can be found.
+    static bool dumped = false;
+    if (!dumped && !patches.empty() && view != nullptr && !IsBadReadPtr(view, 0x1800)) {
+        dumped = true;
+        std::string dims{};
+        for (uint32_t off = 0; off + 4 <= 0x1800; off += 4) {
+            const auto v = *(int32_t*)((uintptr_t)view + off);
+            if (v >= 64 && v <= 16384) dims += fmt::format("{:x}={} ", off, v);
+        }
+        SPDLOG_INFO("[LGUI_GT] view dimension-like ints (post-patch): {}", dims);
+
+        // Projection matrices: a perspective projection has [0][0] = 1/tan(fovx/2), [1][1] = 1/tan(fovy/2) with
+        // [1][1]/[0][0] == aspect (w/h). Log every 4x4 float block whose diagonal ratio equals the eye or wide aspect.
+        const float hw = (float)VR::get()->get_hmd_width();
+        const float hh = (float)VR::get()->get_hmd_height();
+        const float eye = hw / hh, wide = 2.0f * hw / hh;
+        std::string mats{};
+        for (uint32_t off = 0; off + 64 <= 0x1800; off += 16) {
+            const auto m = (const float*)((uintptr_t)view + off);
+            const float a = m[0], b = m[5];
+            if (!(std::fabs(a) > 1e-3f && std::fabs(a) < 100.0f && std::fabs(b) > 1e-3f && std::fabs(b) < 100.0f)) continue;
+            const float ratio = b / a;
+            if (std::fabs(ratio - eye) < eye * 2e-3f || std::fabs(ratio - wide) < wide * 2e-3f || std::fabs(ratio - 1.0f / eye) < 2e-3f) {
+                mats += fmt::format("{:x}(m00={:.4f} m11={:.4f} r={:.4f}) ", off, a, b, ratio);
+            }
+        }
+        SPDLOG_INFO("[LGUI_GT] view matrices with eye/wide aspect diagonal: {}", mats.empty() ? "<none>" : mats);
+    }
+
+    static size_t last_count = SIZE_MAX;
+    if (LGUI_DIAG_STEADY_STATE && (k < 5 || patches.size() != last_count || (k % 600) == 0)) {
+        last_count = patches.size();
+        SPDLOG_INFO("[LGUI_GT] SetupView #{} self={:x} family={:x} view={:x} rects patched={} at [{}] (hmd={}x{} nsf={})",
+            k, (uintptr_t)self, (uintptr_t)family, (uintptr_t)view, patches.size(), where.empty() ? "-" : where,
+            VR::get()->get_hmd_width(), VR::get()->get_hmd_height(), VR::get()->is_native_stereo_fix_enabled());
+    }
+
+    // OPTION 2 (game-thread FSceneView clone): the FSceneView/FSceneViewFamily passed here are the SAME objects the 3D
+    // scene renderer reads, so we cannot patch their rects in place without corrupting stereo. Instead, hand LGUI's
+    // SetupView deep-enough COPIES of view/family whose rects are overwritten to the ui_target size (3840x2160, 16:9),
+    // while the real objects stay pristine for the scene render. The clones must OUTLIVE this call because LGUI stores
+    // the pointer and the render thread reads it later in the frame - use static ring buffers. SEH-guarded because
+    // SetupView may dereference a member pointer we copied that now points at freed/relative data. Behind a toggle so it
+    // reverts instantly; on any fault we fall back to the real objects for the rest of the session.
+    // CONFIRMED INERT (2026-09-05): the clone fired cleanly with no stereo corruption, but [LGUI_BOUNDS] still showed the
+    // paint capped at 2700x2160 (== per-eye hmd width). LGUI does NOT read the FSceneView view rect for its raster extent;
+    // it sizes its pass from the FViewport/render-target size instead. Disabled to avoid the per-call memcpy overhead.
+    // The real lever is the LGUI pass viewport width (handled elsewhere), not this view/family clone.
+    constexpr bool LGUI_CLONE_VIEW = false;
+    void* view_arg = view;
+    void* family_arg = family;
+    static bool clone_faulted = false;
+    if (LGUI_CLONE_VIEW && !clone_faulted && VR::get()->is_hmd_active() &&
+        view != nullptr && !IsBadReadPtr(view, 0x1800) && family != nullptr && !IsBadReadPtr(family, 0x400) &&
+        g_hook != nullptr && g_hook->get_render_target_manager() != nullptr)
+    {
+        const auto ui_target = g_hook->get_render_target_manager()->get_ui_target();
+        const auto hw = (int32_t)VR::get()->get_hmd_width();
+        const auto hh = (int32_t)VR::get()->get_hmd_height();
+        if (ui_target != nullptr && !IsBadReadPtr(ui_target, 0x60) && hw > 0 && hh > 0) {
+            const auto ui_w = *(int32_t*)((uintptr_t)ui_target + 0x54);
+            const auto ui_h = *(int32_t*)((uintptr_t)ui_target + 0x58);
+            if (ui_w >= 64 && ui_h >= 64) {
+                constexpr size_t VIEW_COPY = 0x1800;
+                constexpr size_t FAMILY_COPY = 0x400;
+                constexpr size_t RING = 4; // one per in-flight frame/eye
+                static uint8_t view_ring[RING][VIEW_COPY]{};
+                static uint8_t family_ring[RING][FAMILY_COPY]{};
+                static uint32_t ring_idx = 0;
+                const auto slot = ring_idx++ % RING;
+                auto vc = view_ring[slot];
+                auto fc = family_ring[slot];
+                memcpy(vc, view, VIEW_COPY);
+                memcpy(fc, family, FAMILY_COPY);
+
+                // Overwrite any eye/family (0,0,hw,hh)/(0,0,2hw,hh) FIntRect in the CLONES with the ui_target rect.
+                auto rewrite_rects = [&](uint8_t* base, size_t len) {
+                    for (size_t off = 0; off + 16 <= len; off += 4) {
+                        auto r = (int32_t*)(base + off);
+                        const int32_t w = r[2] - r[0];
+                        const int32_t h = r[3] - r[1];
+                        const bool eye = r[1] == 0 && h == hh && w == hw && (r[0] == 0 || r[0] == hw);
+                        const bool wide = r[0] == 0 && r[1] == 0 && w == hw * 2 && h == hh;
+                        if (eye || wide) {
+                            r[0] = 0; r[1] = 0; r[2] = ui_w; r[3] = ui_h;
+                            off += 12;
+                        }
+                    }
+                };
+                rewrite_rects(vc, VIEW_COPY);
+                rewrite_rects(fc, FAMILY_COPY);
+
+                view_arg = vc;
+                family_arg = fc;
+
+                static bool logged_clone = false;
+                if (!logged_clone) {
+                    logged_clone = true;
+                    SPDLOG_INFO("[LGUI_GT] Option 2 clone active: passing cloned view/family with rects -> {}x{} (real objects untouched)", ui_w, ui_h);
+                }
+            }
+        }
+    }
+
+    // Call the original with the (possibly cloned) arguments. SEH-guarded: if LGUI faults on a cloned pointer member,
+    // fall back to the real objects permanently for this session so the game keeps running.
+    if (view_arg != view || family_arg != family) {
+        if (!lgui_call_setup_view_seh((void(*)(void*, void*, void*))it->second, self, family_arg, view_arg)) {
+            clone_faulted = true;
+            SPDLOG_ERROR("[LGUI_GT] Option 2 clone faulted in SetupView; reverting to real view/family for the rest of the session");
+            ((void(*)(void*, void*, void*))it->second)(self, family, view);
+        }
+    } else {
+        ((void(*)(void*, void*, void*))it->second)(self, family, view);
+    }
+
+    // Restore the pre-call LGUI-private field patches: SetupView has now consumed the ui-target size for its canvas
+    // math, and we must not leave the persistent LGUI object mutated between frames.
+    for (auto& s : self_pre_saved) {
+        memcpy(s.addr, &s.raw, 4);
+    }
+    // LGUI stores the canvas aspect ratio in its own object (self+0xb4 and self+0x104 == hmd_w/hmd_h, found via the diff
+    // below). It stays at the eye aspect even when every rect in the view reads 3840x2160 during the call, so it comes from
+    // elsewhere (projection / render target). Overwrite it with the ui_target aspect after the call; the render-thread draw
+    // reads it from here.
+    constexpr bool LGUI_PATCH_SELF_ASPECT = true;
+    constexpr uint32_t LGUI_SELF_ASPECT_OFFS[] = {0xb4, 0x104};
+    if (LGUI_PATCH_SELF_ASPECT && VR::get()->is_hmd_active() && self != nullptr && !IsBadReadPtr(self, 0x200) &&
+        g_hook != nullptr && g_hook->get_render_target_manager() != nullptr)
+    {
+        const auto ui_target = g_hook->get_render_target_manager()->get_ui_target();
+        const auto hw = (float)VR::get()->get_hmd_width();
+        const auto hh = (float)VR::get()->get_hmd_height();
+        if (ui_target != nullptr && !IsBadReadPtr(ui_target, 0x60) && hw > 0.0f && hh > 0.0f) {
+            const auto ui_w = *(int32_t*)((uintptr_t)ui_target + 0x54);
+            const auto ui_h = *(int32_t*)((uintptr_t)ui_target + 0x58);
+            if (ui_w >= 64 && ui_h >= 64) {
+                const float eye_aspect = hw / hh;
+                const float wide_aspect = (hw * 2.0f) / hh;
+                const float ui_aspect = (float)ui_w / (float)ui_h;
+                std::string done{};
+                for (auto off : LGUI_SELF_ASPECT_OFFS) {
+                    auto& f = *(float*)((uintptr_t)self + off);
+                    if (std::fabs(f - eye_aspect) <= eye_aspect * 1e-4f || std::fabs(f - wide_aspect) <= wide_aspect * 1e-4f) {
+                        f = ui_aspect;
+                        done += fmt::format("{:x} ", off);
+                    }
+                }
+                static std::string last_done{"?"};
+                if (done != last_done) {
+                    last_done = done;
+                    SPDLOG_INFO("[LGUI_GT] self aspect patched at [{}] eye={:.4f} -> ui={:.4f}", done.empty() ? "-" : done, eye_aspect, ui_aspect);
+                }
+            }
+        }
+    }
+
+    // Diff self before/after: whatever LGUI stores from this call (canvas size, ortho matrix, viewport) lives here and is what
+    // the render thread later reads. Log ints/floats that changed and any dimension-like ints / hmd-derived floats present.
+    // Also: the sibling LGUI object self[1] (vtable 26ca0760, the canvas/interaction class) held hmd_w at 0x118/0x128/0x158/
+    // 0x168/0x178/0x198 in an earlier dump. Scan self and every object self points to (one hop) for hw/hh ints and patch them.
+    constexpr bool LGUI_PATCH_SELF_TREE_SIZES = true;
+    if (LGUI_PATCH_SELF_TREE_SIZES && VR::get()->is_hmd_active() && self != nullptr && !IsBadReadPtr(self, 0x800) &&
+        g_hook != nullptr && g_hook->get_render_target_manager() != nullptr)
+    {
+        const auto ui_target = g_hook->get_render_target_manager()->get_ui_target();
+        const auto hw = (int32_t)VR::get()->get_hmd_width();
+        const auto hh = (int32_t)VR::get()->get_hmd_height();
+        if (ui_target != nullptr && !IsBadReadPtr(ui_target, 0x60) && hw > 0 && hh > 0) {
+            const auto ui_w = *(int32_t*)((uintptr_t)ui_target + 0x54);
+            const auto ui_h = *(int32_t*)((uintptr_t)ui_target + 0x58);
+            if (ui_w >= 64 && ui_h >= 64) {
+                std::string done{};
+                auto patch_obj = [&](uintptr_t obj, uint32_t len, const std::string& tag) {
+                    if (obj < 0x10000 || IsBadReadPtr((void*)obj, len)) return;
+                    for (uint32_t off = 0; off + 4 <= len; off += 4) {
+                        auto p = (int32_t*)(obj + off);
+                        if (*p == hw) { *p = ui_w; done += fmt::format("{}+{:x}=w ", tag, off); }
+                        else if (*p == hh) { *p = ui_h; done += fmt::format("{}+{:x}=h ", tag, off); }
+                        else if (*p == hw * 2) { *p = ui_w; done += fmt::format("{}+{:x}=2w ", tag, off); }
+                    }
+                };
+                patch_obj((uintptr_t)self, 0x800, "self");
+                for (int j = 1; j < 64; ++j) {
+                    const auto q = ((uintptr_t*)self)[j];
+                    if (q < 0x10000 || (q & 7) != 0 || q == (uintptr_t)self || IsBadReadPtr((void*)q, 0x400)) continue;
+                    patch_obj(q, 0x400, fmt::format("self[{}]", j));
+                }
+                static std::string last_done{"?"};
+                if (done != last_done) {
+                    last_done = done;
+                    SPDLOG_INFO("[LGUI_GT] self-tree hw/hh ints patched: [{}] (hmd={}x{} -> {}x{})", done.empty() ? "-" : done, hw, hh, ui_w, ui_h);
+                }
+            }
+        }
+
+        // Targeted raw dump of self[1] (LGUI canvas/interaction object, vtable 26ca0760) at the specific offsets an
+        // earlier dump found holding hmd_w (0x118/0x128/0x158/0x168/0x178/0x198). The generic hw/hh-int scanner above
+        // never reports these as patched, meaning they don't currently hold exact hw/hh ints - dump their raw
+        // int/float interpretation every time the values change so we can see what they actually hold (design
+        // resolution, scale factor, or a derived/scaled value) and find the real field(s) to pin.
+        constexpr bool LGUI_DUMP_SELF1_CANVAS = true;
+        constexpr uint32_t LGUI_SELF1_CANVAS_OFFS[] = {0x118, 0x128, 0x158, 0x168, 0x178, 0x198};
+        if (LGUI_DUMP_SELF1_CANVAS && self != nullptr && !IsBadReadPtr(self, 0x10)) {
+            const auto self1 = ((uintptr_t*)self)[1];
+            if (self1 > 0x10000 && (self1 & 7) == 0 && !IsBadReadPtr((void*)self1, 0x200)) {
+                std::string dump{};
+                for (auto off : LGUI_SELF1_CANVAS_OFFS) {
+                    const auto iv = *(int32_t*)(self1 + off);
+                    const auto fv = *(float*)(self1 + off);
+                    dump += fmt::format("{:x}=[i={} f={:.4f}] ", off, iv, fv);
+                }
+                // Log whenever the HMD resolution changes (not just when the dump values change) so we can tell
+                // apart "field never changes across resolution" from "field changed but we deduped the log line".
+                static int32_t last_hw = -1, last_hh = -1;
+                if ((int32_t)hw != last_hw || (int32_t)hh != last_hh) {
+                    last_hw = (int32_t)hw;
+                    last_hh = (int32_t)hh;
+                    SPDLOG_INFO("[LGUI_GT] self[1] canvas raw ({:x}): {} (hmd={}x{})", self1, dump, hw, hh);
+
+                    // Full dimension-like-int scan every time resolution changes too, so we can see which fields
+                    // in self[1] track the new hmd size versus which stay fixed.
+                    std::string dims{};
+                    for (uint32_t off = 0; off + 4 <= 0x200; off += 4) {
+                        const auto v = *(int32_t*)(self1 + off);
+                        if (v >= 64 && v <= 16384) dims += fmt::format("{:x}={} ", off, v);
+                    }
+                    SPDLOG_INFO("[LGUI_GT] self[1] dimension-like ints (hmd={}x{}): {}", hw, hh, dims);
+                }
+            }
+        }
+    }
+
+    if (LGUI_DIAG_STEADY_STATE && (k < 3 || (k % 1200) == 0)) {
+        if (self != nullptr && !IsBadReadPtr(self, 0x800)) {
+            static uint32_t before[0x200]{};
+            // snapshot taken lazily: compare against the previous call's post-state (self is persistent)
+            std::string changed{}, dims{}, fl{};
+            const auto hw = (float)VR::get()->get_hmd_width();
+            const auto hh = (float)VR::get()->get_hmd_height();
+            const float cands[] = {hw, hh, hw / hh, hh / hw, 1.0f / hw, 1.0f / hh, 2.0f / hw, 2.0f / hh, 3840.0f, 2160.0f, 3840.0f / 2160.0f, 2.0f / 3840.0f, 2.0f / 2160.0f};
+            const char* names[] = {"hw", "hh", "hw/hh", "hh/hw", "1/hw", "1/hh", "2/hw", "2/hh", "UW", "UH", "UW/UH", "2/UW", "2/UH"};
+            for (uint32_t off = 0; off < 0x800; off += 4) {
+                const auto u = *(uint32_t*)((uintptr_t)self + off);
+                const auto iv = (int32_t)u;
+                const auto fv = *(float*)&u;
+                if (before[off / 4] != u) changed += fmt::format("{:x} ", off);
+                before[off / 4] = u;
+                if (iv >= 64 && iv <= 16384) dims += fmt::format("{:x}={} ", off, iv);
+                for (int c = 0; c < 13; ++c) {
+                    if (std::fabs(fv - cands[c]) <= std::fabs(cands[c]) * 1e-4f && cands[c] != 0.0f) { fl += fmt::format("{:x}={} ", off, names[c]); break; }
+                }
+            }
+            SPDLOG_INFO("[LGUI_GT] self after SetupView #{}: changed=[{}] dims=[{}] floats=[{}]", k, changed, dims, fl);
+        }
+    }
+
+    // Restore immediately - these are the real engine view/family rects (see comment above patches).
+    lgui_restore_view_rects(patches);
+}
+
+static void lgui_begin_family_hook(void* self, void* family) {
+    const auto vtable = *(uintptr_t*)self;
+    const auto it = g_lgui_begin_family_originals.find(vtable);
+    if (it == g_lgui_begin_family_originals.end()) return;
+
+    static uint32_t n = 0;
+    const auto k = n++;
+
+    // Patch/restore synchronously within this call - family is the real FSceneViewFamily also used by the actual
+    // 3D scene render (see comment in lgui_setup_view_hook for why deferring this across frames was reverted).
+    std::vector<LguiRectPatch> patches{};
+    std::string where{};
+
+    if (LGUI_PATCH_GAME_THREAD_RECTS && VR::get()->is_hmd_active() && family != nullptr && !IsBadReadPtr(family, 0x400)) {
+        lgui_patch_view_rects((uintptr_t)family, 0x400, "family", patches, where);
+
+        // Views array: TArray<const FSceneView*> at family+0x0 in stock UE (data, count, max)
+        const auto views = ((sdk::FSceneViewFamily*)family)->get_views();
+        if (views != nullptr && !IsBadReadPtr(views, sizeof(*views)) && views->count > 0 && views->count <= 4 && views->data != nullptr && !IsBadReadPtr(views->data, sizeof(void*) * views->count)) {
+            for (int32_t i = 0; i < views->count; ++i) {
+                lgui_patch_view_rects((uintptr_t)views->data[i], 0x1000, fmt::format("view{}", i).c_str(), patches, where);
+            }
+        }
+    }
+
+    static size_t last_count = SIZE_MAX;
+    if (k < 5 || patches.size() != last_count || (k % 600) == 0) {
+        last_count = patches.size();
+        SPDLOG_INFO("[LGUI_GT] BeginRenderViewFamily #{} self={:x} family={:x} rects patched={} at [{}] (hmd={}x{} nsf={})",
+            k, (uintptr_t)self, (uintptr_t)family, patches.size(), where.empty() ? "-" : where,
+            VR::get()->get_hmd_width(), VR::get()->get_hmd_height(), VR::get()->is_native_stereo_fix_enabled());
+    }
+
+    ((void(*)(void*, void*))it->second)(self, family);
+
+    lgui_restore_view_rects(patches);
+}
+
 // LGUI's screen-space draw is a TRDGLambdaPass (vtable rva 276032d0, found by diffing the FRDGBuilder pass registry at
 // a2+0x378 / arr+0x1168 across the slot-24 call). Slot 1 of that vtable is Execute(FRHIComputeCommandList&).
 // We hook it so the RHI swap on the ViewFamilyTexture FRDGTexture can be undone right after LGUI has drawn.
-static uintptr_t g_lgui_pass_vtable = 0;
-static uintptr_t g_lgui_pass_execute_original = 0;
+// NOTE: multiple distinct TRDGLambdaPass closures (distinct C++ lambda types -> distinct vtables) can exist; the
+// hardcoded static guess at 0x276032d0 turned out to be a generic/decoy lambda pass with no captured state, not
+// LGUI's real UI draw. Track hooked vtables in a map (not a single global) so hooking the decoy does not
+// permanently block discovering and hooking the real pass vtable via the pass-registry-growth diagnostic below.
+static std::unordered_map<uintptr_t, uintptr_t> g_lgui_pass_originals{};
+static std::mutex g_lgui_pass_originals_mutex{};
+static uintptr_t g_lgui_pass_vtable = 0; // last vtable hooked, diagnostic only
+static uintptr_t g_lgui_pass_execute_original = 0; // set when the FIRST (decoy) vtable hooks; kept for existing gates
 static constexpr int32_t LGUI_PASS_EXECUTE_SLOT = 1;
 
 struct LguiSwapState {
@@ -3220,31 +3940,346 @@ static void lgui_dump_pass_seh(void* pass, std::string& raw, std::string& hits) 
     }
 }
 
+// D3D12 command list viewport/scissor interception, active only while LGUI's pass Execute runs.
+// NOTE: UE's RHI command list translation can run on a worker thread pool spawned from within Execute and joined
+// before it returns, so a thread_local flag set on the calling thread would never be visible to the thread that
+// actually issues RSSetViewports (this was tried first and never fired). Use a process-wide atomic counter instead;
+// it is safe as long as the translation work is joined before lgui_pass_execute_hook's call to Execute returns,
+// which is the standard synchronous-translation model.
+static std::atomic<int32_t> g_lgui_in_execute_count{0};
+static uintptr_t g_d3d12_cmdlist_vtable = 0;
+static void (STDMETHODCALLTYPE* g_orig_rs_set_viewports)(ID3D12GraphicsCommandList*, UINT, const D3D12_VIEWPORT*) = nullptr;
+static void (STDMETHODCALLTYPE* g_orig_rs_set_scissor)(ID3D12GraphicsCommandList*, UINT, const D3D12_RECT*) = nullptr;
+static constexpr bool LGUI_WIDEN_D3D12_VIEWPORT = true;
+
+// Master switch for the whole D3D12 viewport/scissor interception experiment. It hooks the SHARED
+// ID3D12GraphicsCommandList vtable, so its hook functions run for EVERY RSSetViewports/RSSetScissorRects call in the
+// entire renderer (main scene, shadows, post, UI) on every frame - a per-draw-call cost that lowers framerate
+// independent of resolution. The experiment already established (via [LGUI_BOUNDS]) that LGUI's viewport is always the
+// full 3840x2160 target and rewriting it never moved the painted region, so it is pure overhead now. Disabled by
+// default; only flip this true when actively re-measuring the viewport LGUI submits.
+// PROBE CONCLUDED (2026-09-05): every [LGUI_D3D] RSSetViewports was vp=(0,0 3840x2160) and gated=false - LGUI always
+// submits the FULL target viewport (never eye-sized), and the execute-window gate never overlapped a viewport call, so
+// LGUI_WIDEN_D3D12_VIEWPORT never fired. The viewport is NOT the clip: LGUI lays its canvas out at the game-thread
+// per-eye view size (hmd_w x hmd_h) and paints top-left into the 3840x2160 target, so when hmd_h > 2160 the bottom is
+// clipped. Disabled again - this shared-vtable hook is pure per-draw overhead with no benefit for this cause.
+static constexpr bool LGUI_ENABLE_D3D12_VIEWPORT_HOOK = false;
+
+static bool lgui_ui_target_size(int32_t& w, int32_t& h) {
+    if (g_hook == nullptr || g_hook->get_render_target_manager() == nullptr) return false;
+    const auto ui_target = g_hook->get_render_target_manager()->get_ui_target();
+    if (ui_target == nullptr || IsBadReadPtr(ui_target, 0x60)) return false;
+    w = *(int32_t*)((uintptr_t)ui_target + 0x54);
+    h = *(int32_t*)((uintptr_t)ui_target + 0x58);
+    return w >= 64 && h >= 64 && w <= 16384 && h <= 16384;
+}
+
+static std::atomic<uint64_t> g_rsviewport_total_calls{0};
+static std::atomic<uint64_t> g_rsscissor_total_calls{0};
+
+// DIAG: unconditional, low-rate heartbeat proving whether this hooked vtable receives ANY calls at all
+// (from LGUI or plain 3D scene rendering, which calls RSSetViewports every view every frame). If this
+// never increments across a whole play session, the hooked vtable is not the one the engine actually uses
+// (e.g. a debug-layer wrapper, a different device/adapter, or a distinct command-list pool), independent of
+// any LGUI-specific timing/gating question.
+static void lgui_d3d12_heartbeat() {
+    static auto last = std::chrono::steady_clock::now();
+    const auto now = std::chrono::steady_clock::now();
+    if (std::chrono::duration_cast<std::chrono::seconds>(now - last).count() >= 3) {
+        last = now;
+        SPDLOG_INFO("[LGUI_D3D] heartbeat: total RSSetViewports={} total RSSetScissorRects={} (since hook install)",
+            g_rsviewport_total_calls.load(std::memory_order_relaxed), g_rsscissor_total_calls.load(std::memory_order_relaxed));
+    }
+}
+
+static void STDMETHODCALLTYPE lgui_rs_set_viewports_hook(ID3D12GraphicsCommandList* self, UINT count, const D3D12_VIEWPORT* vps) {
+    const bool gated = g_lgui_in_execute_count.load(std::memory_order_relaxed) > 0;
+    g_rsviewport_total_calls.fetch_add(1, std::memory_order_relaxed);
+    lgui_d3d12_heartbeat();
+    // DIAG: log the first N calls regardless of the gate, so we can tell whether RSSetViewports is called at all
+    // and, separately, whether the execute-window gate lines up with it.
+    static uint32_t total_n = 0;
+    if (total_n++ < 20 && vps != nullptr && count >= 1) {
+        SPDLOG_INFO("[LGUI_D3D] (ungated) RSSetViewports #{}: gated={} vp=({},{} {}x{})", total_n, gated, vps[0].TopLeftX, vps[0].TopLeftY, vps[0].Width, vps[0].Height);
+    }
+
+    if (gated && vps != nullptr && count >= 1) {
+        static uint32_t n = 0;
+        const auto k = n++;
+        const auto hw = (float)VR::get()->get_hmd_width();
+        const auto hh = (float)VR::get()->get_hmd_height();
+        int32_t ui_w = 0, ui_h = 0;
+        const bool have_ui = lgui_ui_target_size(ui_w, ui_h);
+
+        static float last_w = -1.0f, last_h = -1.0f;
+        if (k < 5 || vps[0].Width != last_w || vps[0].Height != last_h) {
+            last_w = vps[0].Width;
+            last_h = vps[0].Height;
+            SPDLOG_INFO("[LGUI_D3D] RSSetViewports in LGUI Execute: n={} vp=({},{} {}x{}) hmd={}x{} ui={}x{}", count, vps[0].TopLeftX, vps[0].TopLeftY, vps[0].Width, vps[0].Height, hw, hh, ui_w, ui_h);
+        }
+
+        if (LGUI_WIDEN_D3D12_VIEWPORT && have_ui && count == 1) {
+            const bool eye = std::fabs(vps[0].Width - hw) < 1.0f || std::fabs(vps[0].Width - hw * 2.0f) < 1.0f;
+            if (eye) {
+                D3D12_VIEWPORT vp = vps[0];
+                vp.TopLeftX = 0.0f;
+                vp.TopLeftY = 0.0f;
+                vp.Width = (float)ui_w;
+                vp.Height = (float)ui_h;
+                g_orig_rs_set_viewports(self, 1, &vp);
+                return;
+            }
+        }
+    }
+    g_orig_rs_set_viewports(self, count, vps);
+}
+
+static void STDMETHODCALLTYPE lgui_rs_set_scissor_hook(ID3D12GraphicsCommandList* self, UINT count, const D3D12_RECT* rects) {
+    const bool gated = g_lgui_in_execute_count.load(std::memory_order_relaxed) > 0;
+    g_rsscissor_total_calls.fetch_add(1, std::memory_order_relaxed);
+    if (gated && rects != nullptr && count >= 1) {
+        static uint32_t n = 0;
+        const auto k = n++;
+        const auto hw = (LONG)VR::get()->get_hmd_width();
+        const auto hh = (LONG)VR::get()->get_hmd_height();
+        int32_t ui_w = 0, ui_h = 0;
+        const bool have_ui = lgui_ui_target_size(ui_w, ui_h);
+
+        static LONG last_r = -1, last_b = -1;
+        if (k < 5 || rects[0].right != last_r || rects[0].bottom != last_b) {
+            last_r = rects[0].right;
+            last_b = rects[0].bottom;
+            SPDLOG_INFO("[LGUI_D3D] RSSetScissorRects in LGUI Execute: n={} rect=({},{})-({},{}) hmd={}x{} ui={}x{}", count, rects[0].left, rects[0].top, rects[0].right, rects[0].bottom, hw, hh, ui_w, ui_h);
+        }
+
+        if (LGUI_WIDEN_D3D12_VIEWPORT && have_ui && count == 1) {
+            const LONG w = rects[0].right - rects[0].left;
+            if (w == hw || w == hw * 2) {
+                D3D12_RECT r{0, 0, (LONG)ui_w, (LONG)ui_h};
+                g_orig_rs_set_scissor(self, 1, &r);
+                return;
+            }
+        }
+    }
+    g_orig_rs_set_scissor(self, count, rects);
+}
+
+static void lgui_try_hook_d3d12_cmdlist() {
+    if (!LGUI_ENABLE_D3D12_VIEWPORT_HOOK) return;
+    if (g_d3d12_cmdlist_vtable != 0) return;
+    static bool logged_once = false;
+    if (g_framework == nullptr || g_framework->is_dx11()) {
+        if (!logged_once) { logged_once = true; SPDLOG_INFO("[LGUI_D3D] skip: framework_null={} is_dx11={}", g_framework == nullptr, g_framework != nullptr && g_framework->is_dx11()); }
+        return;
+    }
+
+    auto& hook = g_framework->get_d3d12_hook();
+    if (hook == nullptr) {
+        if (!logged_once) { logged_once = true; SPDLOG_INFO("[LGUI_D3D] skip: d3d12_hook is null"); }
+        return;
+    }
+    auto device = hook->get_device();
+    if (device == nullptr) {
+        if (!logged_once) { logged_once = true; SPDLOG_INFO("[LGUI_D3D] skip: device is null"); }
+        return;
+    }
+
+    // Create a throwaway list to obtain the vtable (shared by every ID3D12GraphicsCommandList on this device).
+    Microsoft::WRL::ComPtr<ID3D12CommandAllocator> alloc{};
+    Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> list{};
+    HRESULT hr_alloc{}, hr_list{};
+    if (FAILED(hr_alloc = device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&alloc)))) {
+        if (!logged_once) { logged_once = true; SPDLOG_INFO("[LGUI_D3D] skip: CreateCommandAllocator failed hr={:x}", (uint32_t)hr_alloc); }
+        return;
+    }
+    if (FAILED(hr_list = device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc.Get(), nullptr, IID_PPV_ARGS(&list)))) {
+        if (!logged_once) { logged_once = true; SPDLOG_INFO("[LGUI_D3D] skip: CreateCommandList failed hr={:x}", (uint32_t)hr_list); }
+        return;
+    }
+    list->Close();
+
+    const auto vt = *(uintptr_t*)list.Get();
+    // ID3D12GraphicsCommandList: IUnknown(3) + ID3D12Object(4) + ID3D12DeviceChild(1) + ID3D12CommandList(1) = 9,
+    // then Close(9) Reset(10) ClearState(11) DrawInstanced(12) DrawIndexedInstanced(13) Dispatch(14) CopyBufferRegion(15)
+    // CopyTextureRegion(16) CopyResource(17) CopyTiles(18) ResolveSubresource(19) IASetPrimitiveTopology(20)
+    // RSSetViewports(21) RSSetScissorRects(22)
+    constexpr int RS_SET_VIEWPORTS = 21;
+    constexpr int RS_SET_SCISSOR = 22;
+
+    auto vp_slot = (uintptr_t*)(vt + sizeof(uintptr_t) * RS_SET_VIEWPORTS);
+    auto sc_slot = (uintptr_t*)(vt + sizeof(uintptr_t) * RS_SET_SCISSOR);
+    DWORD old{};
+    if (VirtualProtect(vp_slot, sizeof(uintptr_t) * 2, PAGE_READWRITE, &old)) {
+        g_orig_rs_set_viewports = (decltype(g_orig_rs_set_viewports))*vp_slot;
+        g_orig_rs_set_scissor = (decltype(g_orig_rs_set_scissor))*sc_slot;
+        *vp_slot = (uintptr_t)&lgui_rs_set_viewports_hook;
+        *sc_slot = (uintptr_t)&lgui_rs_set_scissor_hook;
+        VirtualProtect(vp_slot, sizeof(uintptr_t) * 2, old, &old);
+        g_d3d12_cmdlist_vtable = vt;
+        SPDLOG_INFO("[LGUI_D3D] hooked ID3D12GraphicsCommandList RSSetViewports/RSSetScissorRects (vtable={:x})", vt);
+    }
+}
+
 static void lgui_pass_execute_hook(void* pass, void* rhi_cmd_list) {
     static uint32_t exec_count = 0;
     const auto n = exec_count++;
 
-    const auto og = (void(*)(void*, void*))g_lgui_pass_execute_original;
+    // Look up the original function for THIS pass's specific vtable (multiple distinct closure types share this
+    // trampoline once each is hooked; using the global "first hooked" original would call the wrong function for
+    // every vtable except the first one).
+    uintptr_t orig_fn = 0;
+    const auto this_vt = (pass != nullptr && !IsBadReadPtr(pass, sizeof(uintptr_t))) ? *(uintptr_t*)pass : 0;
+    if (this_vt != 0) {
+        std::scoped_lock lock{g_lgui_pass_originals_mutex};
+        const auto it = g_lgui_pass_originals.find(this_vt);
+        if (it != g_lgui_pass_originals.end()) {
+            orig_fn = it->second;
+        }
+    }
+    if (orig_fn == 0) {
+        orig_fn = g_lgui_pass_execute_original; // fallback, should not normally happen
+    }
+    const auto og = (void(*)(void*, void*))orig_fn;
 
     if (n < 6 || (n % 1200) == 0) {
         std::string raw{}, hits{};
         lgui_dump_pass_seh(pass, raw, hits);
-        SPDLOG_INFO("[LGUI_SWAP] execute: pass={:x} real={:x} copy={:x} orig_rhi={:x} refs: {}", (uintptr_t)pass,
+        SPDLOG_INFO("[LGUI_SWAP] execute: pass={:x} vt={:x} real={:x} copy={:x} orig_rhi={:x} refs: {}", (uintptr_t)pass, this_vt,
             (uintptr_t)g_lgui_swap.rdg_texture, (uintptr_t)g_lgui_swap.shadow_copy, (uintptr_t)g_lgui_swap.original_rhi, hits.empty() ? "<none>" : hits);
         SPDLOG_INFO("[LGUI_SWAP]   pass raw=[{}]", raw);
     }
 
+    // LGUI_BOUNDS readback: the UI is painted into exactly (0,0)-(hmd_w,hmd_h) of ui_target regardless of every a2 patch
+    // made at record time, so the viewport rect LGUI passes to RHISetViewport is captured by the pass lambda (by value or
+    // through the FViewInfo pointer). Patch it here, right before Execute records the RHI commands, and restore afterwards.
+    //   level 0: int32 (hw,hh) / (2hw,hh) pairs and (0,0,hw,hh) rects stored inline in the pass object
+    //   level 1: the same patterns inside any object the pass points to (FViewInfo::UnscaledViewRect / ViewRect etc.)
+    // RESULT: LGUI_BOUNDS bbox unchanged with these patches active -> the viewport is not reachable from the pass. Disabled.
+    constexpr bool LGUI_PATCH_EXECUTE_RECTS = false;
+
+    // Every int in the FViewInfo and FSceneView now reads 3840x2160 (residue scan empty) yet the paint stays hmd_w wide.
+    // The one eye-sized object still reachable is the REAL ViewFamilyTexture (a3, Desc.Extent = hmd_w x hmd_h) through the
+    // 11 a2 refs we leave on it (0x3d0+). If LGUI's Execute takes its RHISetViewport size from that texture's extent, patching
+    // it for the duration of this Execute only (restored right after) gives it the ui_target size without touching any
+    // other pass. The shadow copy already carries 3840x2160.
+    // RESULT: by Execute time g_lgui_swap.rdg_texture is already freed (read back 0 x 0x01010101) -> unsafe, disabled.
+    // The extent is patched at record time in lgui_slot24_hook instead.
+    constexpr bool LGUI_PATCH_REAL_A3_EXTENT_DURING_EXECUTE = false;
+    int32_t saved_ext[2]{};
+    int32_t* real_ext = nullptr;
+
+    if (LGUI_PATCH_REAL_A3_EXTENT_DURING_EXECUTE && g_lgui_swap.rdg_texture != nullptr && g_lgui_swap.ui_target != nullptr &&
+        !IsBadReadPtr(g_lgui_swap.rdg_texture, 0x60) && !IsBadReadPtr(g_lgui_swap.ui_target, 0x60))
+    {
+        real_ext = (int32_t*)((uintptr_t)g_lgui_swap.rdg_texture + 0x54);
+        const auto ui_w = *(int32_t*)((uintptr_t)g_lgui_swap.ui_target + 0x54);
+        const auto ui_h = *(int32_t*)((uintptr_t)g_lgui_swap.ui_target + 0x58);
+        if (ui_w >= 64 && ui_h >= 64 && ui_w <= 16384 && ui_h <= 16384) {
+            saved_ext[0] = real_ext[0];
+            saved_ext[1] = real_ext[1];
+            real_ext[0] = ui_w;
+            real_ext[1] = ui_h;
+            static int32_t last_w = -1, last_h = -1;
+            if (saved_ext[0] != last_w || saved_ext[1] != last_h) {
+                last_w = saved_ext[0];
+                last_h = saved_ext[1];
+                SPDLOG_INFO("[LGUI_EXEC] real a3 extent {}x{} -> {}x{} for this Execute", saved_ext[0], saved_ext[1], ui_w, ui_h);
+            }
+        } else {
+            real_ext = nullptr;
+        }
+    }
+    std::vector<std::pair<int32_t*, int32_t>> saved{};
+    std::string where{};
+
+    // Ground truth: hook ID3D12GraphicsCommandList::RSSetViewports / RSSetScissorRects (vtable slots 21 / 22) for the
+    // duration of LGUI's Execute. Whatever viewport LGUI sets is what clips the draw; log it and, if it is eye-sized,
+    // widen it to the ui_target (the render target bound at that moment is our 3840x2160 copy).
+    // Use an atomic counter, not a thread_local flag: UE can translate RHI commands into real D3D12 calls on a worker
+    // thread pool that is not the thread calling Execute, so a thread_local gate would never see those calls.
+    // Only maintain the gate/install the hook when the (disabled-by-default) viewport experiment is enabled - the
+    // shared-vtable hook is otherwise pure per-draw-call overhead across the whole renderer.
+    if (LGUI_ENABLE_D3D12_VIEWPORT_HOOK) {
+        g_lgui_in_execute_count.fetch_add(1, std::memory_order_relaxed);
+        lgui_try_hook_d3d12_cmdlist();
+    }
+
     og(pass, rhi_cmd_list);
+
+    if (LGUI_ENABLE_D3D12_VIEWPORT_HOOK) {
+        g_lgui_in_execute_count.fetch_sub(1, std::memory_order_relaxed);
+    }
+
+    if (LGUI_PATCH_EXECUTE_RECTS && g_hook != nullptr && g_hook->get_render_target_manager() != nullptr && pass != nullptr && !IsBadReadPtr(pass, 0x300)) {
+        const auto ui_target = g_hook->get_render_target_manager()->get_ui_target();
+        const auto hw = (int32_t)VR::get()->get_hmd_width();
+        const auto hh = (int32_t)VR::get()->get_hmd_height();
+
+        if (ui_target != nullptr && !IsBadReadPtr(ui_target, 0x60) && hw > 0 && hh > 0) {
+            const auto ui_w = *(int32_t*)((uintptr_t)ui_target + 0x54);
+            const auto ui_h = *(int32_t*)((uintptr_t)ui_target + 0x58);
+
+            if (ui_w >= 64 && ui_w <= 16384 && ui_h >= 64 && ui_h <= 16384) {
+                auto patch_block = [&](uintptr_t base, uint32_t len, const char* tag) {
+                    for (uint32_t off = 0; off + 8 <= len; off += 4) {
+                        auto p = (int32_t*)(base + off);
+                        const bool pair = (p[0] == hw || p[0] == hw * 2) && p[1] == hh;
+                        if (!pair) continue;
+
+                        // Rect form: (0,0,w,h) -> patch max only. Size form: (w,h).
+                        saved.emplace_back(p, p[0]);
+                        saved.emplace_back(p + 1, p[1]);
+                        p[0] = ui_w;
+                        p[1] = ui_h;
+                        where += fmt::format("{}+{:x}{} ", tag, off, off >= 8 && p[-1] == 0 && p[-2] == 0 ? "(rect)" : "");
+                        off += 4;
+                    }
+                };
+
+                patch_block((uintptr_t)pass, 0x300, "pass");
+
+                for (int k = 0; k < 96; ++k) {
+                    const auto v = ((uintptr_t*)pass)[k];
+                    if (v < 0x10000 || (v & 7) != 0 || v == (uintptr_t)pass || IsBadReadPtr((void*)v, 0x1000)) continue;
+                    if (v == (uintptr_t)g_lgui_swap.rdg_texture || v == (uintptr_t)g_lgui_swap.shadow_copy) continue;
+                    patch_block(v, 0x1000, fmt::format("[{}]", k).c_str());
+                }
+
+                static size_t last_count = SIZE_MAX;
+                static int32_t last_hw = 0, last_hh = 0;
+                if (n < 6 || saved.size() / 2 != last_count || hw != last_hw || hh != last_hh) {
+                    last_count = saved.size() / 2;
+                    last_hw = hw;
+                    last_hh = hh;
+                    SPDLOG_INFO("[LGUI_EXEC] patched {} size/rect entries (hmd={}x{} -> {}x{}) at [{}]", saved.size() / 2, hw, hh, ui_w, ui_h, where.empty() ? "-" : where);
+                }
+            }
+        }
+    }
+
+    if (real_ext != nullptr) {
+        real_ext[0] = saved_ext[0];
+        real_ext[1] = saved_ext[1];
+    }
+
+    for (auto& [p, v] : saved) *p = v;
 }
 
 static void lgui_try_hook_pass_vtable(uintptr_t pass) {
-    if (g_lgui_pass_execute_original != 0 || pass < 0x10000 || IsBadReadPtr((void*)pass, sizeof(uintptr_t))) {
+    if (pass < 0x10000 || IsBadReadPtr((void*)pass, sizeof(uintptr_t))) {
         return;
     }
 
     const auto vt = *(uintptr_t*)pass;
     if (IsBadReadPtr((void*)vt, sizeof(uintptr_t) * (LGUI_PASS_EXECUTE_SLOT + 1))) {
         return;
+    }
+
+    {
+        std::scoped_lock lock{g_lgui_pass_originals_mutex};
+        if (g_lgui_pass_originals.find(vt) != g_lgui_pass_originals.end()) {
+            return; // this specific vtable is already hooked
+        }
     }
 
     const auto m = utility::get_module_within((void*)vt);
@@ -3260,11 +4295,15 @@ static void lgui_try_hook_pass_vtable(uintptr_t pass) {
 
     DWORD old{};
     if (VirtualProtect(slot_ptr, sizeof(uintptr_t), PAGE_READWRITE, &old)) {
+        {
+            std::scoped_lock lock{g_lgui_pass_originals_mutex};
+            g_lgui_pass_originals[vt] = fn;
+        }
         g_lgui_pass_vtable = vt;
         g_lgui_pass_execute_original = fn;
         *slot_ptr = (uintptr_t)&lgui_pass_execute_hook;
         VirtualProtect(slot_ptr, sizeof(uintptr_t), old, &old);
-        SPDLOG_INFO("[LGUI_SWAP] hooked pass Execute: vtable rva={:x} slot{} fn rva={:x}", vt - (uintptr_t)*m, LGUI_PASS_EXECUTE_SLOT, fn - (uintptr_t)*m);
+        SPDLOG_INFO("[LGUI_SWAP] hooked pass Execute: vtable rva={:x} slot{} fn rva={:x} (total hooked vtables={})", vt - (uintptr_t)*m, LGUI_PASS_EXECUTE_SLOT, fn - (uintptr_t)*m, g_lgui_pass_originals.size());
     }
 }
 
@@ -3278,6 +4317,31 @@ static void* lgui_slot24_hook(void* self, void* a2, void* a3, void* a4, void* a5
 
     static uint32_t call_count = 0;
     const auto n = call_count++;
+
+    // ==== LGUI DIAGNOSTIC TOGGLE ====================================================================
+    // Master switch for the EXPENSIVE per-draw LGUI diagnostics on the render thread: the a2 eye-size
+    // "residue" scan (walks up to 0x2000 bytes every qualifying draw building a big std::string) and the
+    // verbose [LGUI_REFS] summary logging. These are investigation-only and are a confirmed lag source
+    // (string formatting + scans on the render thread). Leave FALSE for normal play; flip to TRUE only
+    // when actively re-probing LGUI's size sources. The functional ref redirect/patch logic below is NOT
+    // gated by this - only the logging/scanning is.
+    constexpr bool LGUI_DIAG_VERBOSE = false;
+
+    // NOTE: earlier speculative "pass registry" hunting at a2+0x378 -> owner+0x1168 was removed. Confirmed dead
+    // end: real diagnostics mapped a2's actual layout (see below) and it is not an FRDGBuilder / pass array at
+    // that offset - the "num" values read there were garbage (huge/negative), never valid TArray counts.
+    // Ground-truth layout of a2 (per-view render-thread state block, ~0x8000 bytes, NOT FRDGBuilder/FSceneView):
+    //   +0/+4         packed (1/w, 1/h) floats of the eye view (same as a5)
+    //   +0x3e0/+0x410/+0x4a0/+0x4f8  eye view rects (0,0,hw,hh); patching changes layout but not bound texture
+    //   +0x778/+0xe08 further (hw,hh) pairs; +0x66c lone hw; patching these changed nothing visible
+    //   +0x270/+0x348/+0x3a0  pointers to a3 - these ARE what LGUI's Execute pass dereferences to find its
+    //                         render target. This is the real, working redirect point (used below).
+    //   +0x3d0/+0x400/+0x4e8  also pointers to a3, read by another pass (menu background blur); redirecting
+    //                         these crashes when a menu opens - leave them on the real texture.
+    //   +0x12d0..+0x2b38      8 more a3 refs, not needed for the redirect, left alone.
+    // a3 is the FRDGTexture for ViewFamilyTexture (shared stereo scene output); +0x10 RHI resource, +0x54/+0x58
+    // Desc.Extent. Swapping a3's RHI pointer redirects the whole scene (too broad); passing a copy as a3 does
+    // nothing (LGUI doesn't use the argument itself, only the a2 refs above).
 
     // Hook the LGUI TRDGLambdaPass::Execute up front (vtable exe+276032d0, slots 228bc610/228bde10 observed in the
     // registry diff log) so the execute-time diagnostics run regardless of which record-time path returns below.
@@ -3300,7 +4364,11 @@ static void* lgui_slot24_hook(void* self, void* a2, void* a3, void* a4, void* a5
         }
     }
 
-    if (n < 40 || (n % 600) == 0) {
+    // PERF: this large per-draw decode/dump block (module lookups, IsBadReadPtr walks, fmt::format string
+    // building) is investigation-only. It was running unconditionally every 600 draws (and the first 40),
+    // adding steady-state render-thread cost even in normal play. Gate it behind LGUI_DIAG_VERBOSE so it is
+    // fully compiled out of the hot path unless actively re-probing.
+    if (LGUI_DIAG_VERBOSE && (n < 40 || (n % 600) == 0)) {
         const auto module = utility::get_module_within((void*)vtable);
         const auto vrva = module.has_value() ? vtable - (uintptr_t)*module : vtable;
         const auto ret = (uintptr_t)_ReturnAddress();
@@ -3612,25 +4680,104 @@ static void* lgui_slot24_hook(void* self, void* a2, void* a3, void* a4, void* a5
                 memset(copy, 0, COPY_STRIDE);
                 memcpy(copy, a3, COPY_SIZE);
                 *(void**)(copy + RDG_RESOURCE_RHI_OFF) = ui_target;
+                g_lgui_swap.rdg_texture = a3;
+                g_lgui_swap.shadow_copy = copy;
+                g_lgui_swap.ui_target = ui_target;
+                g_lgui_swap.rdg_texture_vtable = *(uintptr_t*)a3;
+                g_lgui_swap.original_rhi = *(void**)((uintptr_t)a3 + RDG_RESOURCE_RHI_OFF);
 
-                // LGUI sets its viewport from Desc.Extent of the target (not from any rect in a2) and its ortho projection from
-                // the game-thread viewport size: 2*hw x hh normally, hw x hh with the native stereo fix. Give the copy an extent
-                // with that aspect fitted inside ui_target so the layout is drawn undistorted (top-left aligned).
+                // LGUI sets its raster viewport from Desc.Extent of the target (top-left aligned, not from any rect in a2) and its
+                // canvas layout / ortho projection from the game-thread viewport size (FViewport::GetSizeXY, sampled in
+                // game_viewport_client_draw_hook). Every observed distortion is a mismatch between those two, so give the copy
+                // exactly the game viewport size (scaled to fit ui_target if it is larger). Until V has been sampled, fall
+                // back to the old per-mode aspect estimate.
                 {
                     const auto hw0 = (int32_t)VR::get()->get_hmd_width();
                     const auto hh0 = (int32_t)VR::get()->get_hmd_height();
                     const bool nsf = VR::get()->is_native_stereo_fix_enabled();
-                    const float vp_aspect = (hw0 > 0 && hh0 > 0) ? (float)(nsf ? hw0 : hw0 * 2) / (float)hh0 : (float)ui_w / (float)ui_h;
+                    const auto vp = g_hook->get_game_viewport_size();
                     int32_t ext_w = ui_w, ext_h = ui_h;
-                    if (vp_aspect > 0.0f) {
+                    float vp_aspect = 0.0f;
+                    const char* src = "none";
+
+                    if (vp.width > 0 && vp.height > 0) {
+                        src = "game_viewport";
+                        vp_aspect = (float)vp.width / (float)vp.height;
+                        ext_w = vp.width;
+                        ext_h = vp.height;
+                        if (ext_w > ui_w || ext_h > ui_h) {
+                            ext_h = ui_h;
+                            ext_w = (int32_t)((float)ui_h * vp_aspect + 0.5f);
+                            if (ext_w > ui_w) { ext_w = ui_w; ext_h = (int32_t)((float)ui_w / vp_aspect + 0.5f); }
+                        }
+                    } else if (hw0 > 0 && hh0 > 0) {
+                        src = "hmd_estimate";
+                        vp_aspect = (float)(nsf ? hw0 : hw0 * 2) / (float)hh0;
                         ext_h = ui_h;
                         ext_w = (int32_t)((float)ui_h * vp_aspect + 0.5f);
                         if (ext_w > ui_w) { ext_w = ui_w; ext_h = (int32_t)((float)ui_w / vp_aspect + 0.5f); }
                     }
+
+                    // Measured across NSF on/off x 2D/VR: the patched extent and a2 rects are identical in every mode
+                    // (7680x2160 / 3840x2160) yet the visible result differs per mode, so none of them size the UI. The
+                    // symptoms all match LGUI laying its canvas out in pixel space at the game-thread stereo view size and
+                    // drawing it top-left aligned into whatever target it gets:
+                    //   NSF on  2D: 1985x1116 px in 3840x2160 -> correct aspect, top-left quarter only
+                    //   NSF on  VR: 2229x2637 px in 3840x2160 -> tall/thin on the left, clipped at the bottom
+                    //   NSF off VR: 4458x2637 px (double-wide family) -> overflows both axes
+                    //   NSF off 2D: 3970x1116 px -> fills the width
+                    // That size is the per-eye view rect with NSF (AdjustViewRect keeps x=0, one eye per family) and the
+                    // full double-wide family extent without it. Rescaling the copy is a no-op for layout (see the
+                    // LGUI_PATCH_EXTENT result above), so keep the copy at the real ui_target size and instead report the
+                    // drawn region so the quad layer crops exactly what LGUI produced.
+                    const auto fam_w = *(int32_t*)((uintptr_t)a3 + TEX_EXTENT_OFF);
+                    const auto fam_h = *(int32_t*)((uintptr_t)a3 + TEX_EXTENT_OFF + 4);
+                    int32_t rect_vw = 0, rect_vh = 0;
+                    if (*(uintptr_t*)((uintptr_t)a2 + 0x3d0) == (uintptr_t)a3) { // a2 already validated readable for 0x1000
+                        const auto r = (int32_t*)((uintptr_t)a2 + 0x3d8);
+                        rect_vw = r[2] - r[0];
+                        rect_vh = r[3] - r[1];
+                    }
+
+                    int32_t region_w = ext_w, region_h = ext_h;
+                    const char* region_src = src;
+                    // LGUI still lays its canvas out at the pre-patch per-eye/family view rect size (hw x hh with NSF,
+                    // 2*hw x hh without) and paints top-left aligned into ui_target, regardless of the rect patches
+                    // above (confirmed by [LGUI_BOUNDS]: painted bbox size tracks hmd_w x hmd_h, not ui_target).
+                    // Reporting the full ui_target size here (as before) told the quad to show the WHOLE 3840x2160
+                    // canvas although only that small top-left sub-rect has real content -> squished-looking UI with
+                    // no visible scale-up. Report the real painted region instead so the quad crops tightly to it.
+                    // With LGUI_LETTERBOX_RECT enabled below, the a2 FScreenPassTexture rects (which drive LGUI's canvas
+                    // layout) are patched to a centered 16:9 rect instead of the raw eye-shaped view_rect, so report that
+                    // rect here too - it is what LGUI will actually paint into this frame.
+                    if (rect_vw > 0 && rect_vh > 0) {
+                        region_w = rect_vw;
+                        region_h = rect_vh;
+                        region_src = "view_rect";
+                    } else {
+                        region_w = ui_w;
+                        region_h = ui_h;
+                        region_src = "ui_target";
+                    }
+                    region_w = std::min(region_w, ui_w);
+                    region_h = std::min(region_h, ui_h);
+
+                    ext_w = ui_w;
+                    ext_h = ui_h;
+
                     *(int32_t*)(copy + TEX_EXTENT_OFF) = ext_w;
                     *(int32_t*)(copy + TEX_EXTENT_OFF + 4) = ext_h;
-                    g_hook->set_ui_draw_extent(ext_w, ext_h);
-                    if (n < 3 || (n % 600) == 0) SPDLOG_INFO("[LGUI_REFS]   copy extent {}x{} (vp_aspect={:.3f} nsf={})", ext_w, ext_h, vp_aspect, nsf);
+                    g_hook->set_ui_draw_extent(region_w, region_h);
+
+                    static int32_t last_region_w = -1, last_region_h = -1;
+                    static bool last_nsf = false;
+                    if (LGUI_DIAG_STEADY_STATE && (n < 3 || (n % 600) == 0 || region_w != last_region_w || region_h != last_region_h || nsf != last_nsf)) {
+                        last_region_w = region_w;
+                        last_region_h = region_h;
+                        last_nsf = nsf;
+                        SPDLOG_INFO("[LGUI_REFS]   copy extent {}x{} region {}x{} (region_src={} vp_src={} game_vp={}x{} family={}x{} view_rect={}x{} nsf={} hmd={}x{} ui_target={}x{})",
+                            ext_w, ext_h, region_w, region_h, region_src, src, vp.width, vp.height, fam_w, fam_h, rect_vw, rect_vh, nsf, hw0, hh0, ui_w, ui_h);
+                    }
                 }
 
                 uint32_t a2_len = 0;
@@ -3641,16 +4788,27 @@ static void* lgui_slot24_hook(void* self, void* a2, void* a3, void* a4, void* a5
                 // LGUI_REF_MAX_OFF (the view-parameter group 0x270..0x4e8) first; the 0x12d0+ group is left on the real texture.
                 // RESULT: with only 3d0/400/4e8 the UI went back into the scene (no crash) -> the draw target comes from
                 // 270/348/3a0. Flip the bisect: patch only that group, the exception handler now logs registers for the crash.
+                // 0x3d0/0x400/0x4e8: redirecting them crashed again (render thread null deref at +0xd0 into the shadow copy from
+                // another pass). Keep them on the real texture.
                 constexpr uint32_t LGUI_REF_MAX_OFF = 0x3d0;
                 constexpr uint32_t LGUI_REF_MIN_OFF = 0x0;
 
                 std::vector<uintptr_t*> refs{};
                 std::string where{};
-                uint32_t skipped = 0;
-                for (uint32_t off = 0; off + 8 <= a2_len; off += 8) {
+                const uint32_t skipped = 0; // no longer counted; scan is capped to the functional range below
+                // PERF: only offsets in [LGUI_REF_MIN_OFF, LGUI_REF_MAX_OFF) are ever used functionally, so cap the
+                // scan there instead of walking the whole ~0x8000 a2 buffer. The old full walk called IsBadReadPtr on
+                // every 8-byte slot (thousands of costly checks per UI draw) - a confirmed steady-state lag source on
+                // the render thread. The functional redirect group lives entirely below 0x3d0.
+                const uint32_t ref_scan_end = std::min<uint32_t>(a2_len, LGUI_REF_MAX_OFF);
+                for (uint32_t off = LGUI_REF_MIN_OFF; off + 8 <= ref_scan_end; off += 8) {
                     auto p = (uintptr_t*)((uintptr_t)a2 + off);
+                    // The a2_len page-readability scan above only validates readability once, before this loop
+                    // runs. During a live resolution change the engine can resize/free parts of this buffer
+                    // between that check and here (observed crash: EXCEPTION_ACCESS_VIOLATION reading a stale
+                    // pointer at this line). Re-validate each 8-byte slot immediately before dereferencing it.
+                    if (IsBadReadPtr(p, sizeof(uintptr_t))) break;
                     if (*p != (uintptr_t)a3) continue;
-                    if (off < LGUI_REF_MIN_OFF || off >= LGUI_REF_MAX_OFF) { ++skipped; continue; }
                     refs.push_back(p);
                     where += fmt::format("a2+{:x} ", off);
                 }
@@ -3658,18 +4816,28 @@ static void* lgui_slot24_hook(void* self, void* a2, void* a3, void* a4, void* a5
                 // Stretch persists with every int (hw,hh) pair patched -> the ortho projection is built from a size we do not see as
                 // ints (float aspect / 1/w / matrix) or from game-thread canvas data. Two-pronged:
                 //  (a) diagnostics: log any float in a2 that equals hw, hh, hw/hh, hh/hw, 1/hw, 1/hh, 2/hw, 2/hh;
-                //  (b) fallback: instead of stretching a portrait (hw x hh) layout over 3840x2160, give LGUI a viewport rect with the
-                //      eye's aspect letterboxed inside ui_target so proportions are right even if the projection stays eye-sized.
+                //  (b) fallback: LGUI lays its canvas out at the FScreenPassTexture rects patched below (a2+0x3e0/0x410/0x4a0/0x4f8),
+                //      which stock code sets to (0,0,hw,hh) - the narrow per-eye aspect. Patching those rects to a wider/letterboxed
+                //      shape was measured to be a NO-OP: [LGUI_BOUNDS] painted region stayed at the per-eye size regardless, because
+                //      LGUI builds its ortho canvas from the shared FSceneView view rect (which we cannot touch without breaking the
+                //      real stereo scene render), not from these per-draw scratch rects. Disabled: it changes nothing and only adds
+                //      per-frame cost. The narrow-aspect look is instead corrected purely at presentation time on the OpenXR quad
+                //      (OverlayComponent::generate_slate_quad), which is independent of the scene render.
                 constexpr bool LGUI_LETTERBOX_RECT = false;
+                constexpr float LGUI_LETTERBOX_ASPECT = 16.0f / 9.0f;
                 int32_t rect_x0 = 0, rect_y0 = 0, rect_w = ui_w, rect_h = ui_h;
 
                 if (LGUI_LETTERBOX_RECT && hw > 0 && hh > 0) {
-                    const float eye_aspect = (float)hw / (float)hh;
                     rect_h = ui_h;
-                    rect_w = (int32_t)((float)ui_h * eye_aspect);
-                    if (rect_w > ui_w) { rect_w = ui_w; rect_h = (int32_t)((float)ui_w / eye_aspect); }
+                    rect_w = (int32_t)((float)ui_h * LGUI_LETTERBOX_ASPECT);
+                    if (rect_w > ui_w) { rect_w = ui_w; rect_h = (int32_t)((float)ui_w / LGUI_LETTERBOX_ASPECT); }
                     rect_x0 = (ui_w - rect_w) / 2;
                     rect_y0 = (ui_h - rect_h) / 2;
+
+                    // The letterbox rect patched into a2 below is what LGUI actually lays its canvas out at this
+                    // frame, superseding the raw view_rect/ui_target guess reported above - update the draw extent
+                    // (used by the OpenXR quad crop) to match it exactly.
+                    g_hook->set_ui_draw_extent(rect_w, rect_h);
                 }
 
                 if (n < 3) {
@@ -3683,6 +4851,49 @@ static void* lgui_slot24_hook(void* self, void* a2, void* a3, void* a4, void* a5
                         }
                     }
                     SPDLOG_INFO("[LGUI_REFS]   float size candidates: {} | letterbox rect=({},{} {}x{})", fl.empty() ? "<none>" : fl, rect_x0, rect_y0, rect_w, rect_h);
+
+                    // a2 appears to hold FScreenPassTexture entries {FRDGTexture* Texture; FIntRect ViewRect} (e.g. 0x3d0 -> rect at
+                    // 0x3d8..0x3e4 = (0,0,hw,hh)). Dump every such entry whose pointer shares a3's vtable so the table is on record.
+                    std::string spt{};
+                    const auto a3_vt = *(uintptr_t*)a3;
+                    const uint32_t spt_end = std::min<uint32_t>(a2_len, 0x1400);
+                    for (uint32_t off = 0; off + 0x18 <= spt_end; off += 8) {
+                        const auto p = *(uintptr_t*)((uintptr_t)a2 + off);
+                        if (p < 0x10000 || (p & 7) != 0 || IsBadReadPtr((void*)p, 0x60) || *(uintptr_t*)p != a3_vt) continue;
+                        const auto r = (int32_t*)((uintptr_t)a2 + off + 8);
+                        spt += fmt::format("{:x}:{}{}({},{},{},{}) ", off, p == (uintptr_t)a3 ? "A3" : "tex", p == (uintptr_t)a3 ? "" : fmt::format("[{}x{}]", *(int32_t*)(p + TEX_EXTENT_OFF), *(int32_t*)(p + TEX_EXTENT_OFF + 4)), r[0], r[1], r[2], r[3]);
+                    }
+                    SPDLOG_INFO("[LGUI_REFS]   a2 screen-pass entries: {}", spt.empty() ? "<none>" : spt);
+                }
+
+                // OPTION 3 PROBE: find the a2 slot(s) that point at the FSceneView object LGUI reads for its canvas
+                // extent. Distinct from the FScreenPassTexture scratch rects (LGUI_RECT_MAX_OFFS_UI, proven no-op) and
+                // the a3-vtable texture refs: here we look for pointers to an object that CONTAINS a (0,0,hw,hh) FIntRect
+                // but is NOT an a3-vtable texture. That object is the candidate FSceneView whose ViewRect actually drives
+                // the paint. Probe only (no patching yet) so we can confirm the field exists and its exact offset before
+                // risking a write. Gated behind LGUI_DIAG_VERBOSE plus a one-shot so it never adds steady-state cost.
+                {
+                    static bool sv_probed = false;
+                    if (LGUI_DIAG_VERBOSE && !sv_probed && hw > 0 && hh > 0) {
+                        const auto a3_vt = (a3 != nullptr && !IsBadReadPtr(a3, sizeof(uintptr_t))) ? *(uintptr_t*)a3 : 0;
+                        std::string cand{};
+                        const uint32_t scan_end = std::min<uint32_t>(a2_len, 0x2000);
+                        for (uint32_t off = 0; off + 8 <= scan_end; off += 8) {
+                            const auto p = *(uintptr_t*)((uintptr_t)a2 + off);
+                            if (p < 0x10000 || (p & 7) != 0 || IsBadReadPtr((void*)p, 0x800)) continue;
+                            if (a3_vt != 0 && *(uintptr_t*)p == a3_vt) continue; // skip texture objects
+                            for (uint32_t ioff = 0; ioff + 16 <= 0x800; ioff += 4) {
+                                const auto r = (int32_t*)(p + ioff);
+                                if (r[0] == 0 && r[1] == 0 && r[2] == hw && r[3] == hh) {
+                                    cand += fmt::format("a2+{:x}->obj+{:x} ", off, ioff);
+                                    break;
+                                }
+                            }
+                            if (cand.size() > 400) break;
+                        }
+                        sv_probed = true;
+                        SPDLOG_INFO("[LGUI_SVPROBE] FSceneView-candidate ptrs holding (0,0,{},{}) rect: {}", hw, hh, cand.empty() ? "<none>" : cand);
+                    }
                 }
 
                 std::vector<std::pair<int32_t*, int32_t>> saved{};
@@ -3706,34 +4917,51 @@ static void* lgui_slot24_hook(void* self, void* a2, void* a3, void* a4, void* a5
                 // Stretch: UI fills the quad but is laid out for the portrait eye (2229x2637) -> projection/canvas size still comes
                 // from an eye-sized field we have not patched. The a2 dump shows further (hw,hh) pairs at 0x778/0x77c, 0xe08/0xe0c
                 // and a lone hw at 0x66c. Patch every remaining (hw,hh) pair (and lone hw/hh next to zero) in a2 to (ui_w, ui_h).
+                // Re-enabled: LGUI_BOUNDS readback proves the UI is painted at exactly hmd_w x hmd_h top-left in ui_target,
+                // so the layout size comes from an (hw,hh) field in a2. Earlier "no effect" verdicts were by eye; the bbox log
+                // now measures whether these patches move the painted region.
+                // Re-enabled together with the game-thread SetupView rect patch: the ortho projection (game thread) and the
+                // raster viewport (render thread, from these a2 fields) must BOTH be 3840x2160. Alone, either one leaves the
+                // paint clamped to the other's hmd rect, which is why each looked like a no-op in isolation.
+                // Disabled: rewriting a dozen eye-size pairs up to 3840x2160 every draw is a proven no-op for the visible
+                // painted region and is a suspected 4K-work lag source. Aspect is fixed at presentation on the quad instead.
                 constexpr bool LGUI_PATCH_ALL_SIZE_PAIRS = false;
                 uint32_t extra_patched = 0;
                 std::string extra_where{};
 
                 if (LGUI_PATCH_ALL_SIZE_PAIRS) {
-                    for (uint32_t off = 0x60; off + 8 <= 0x1000; off += 4) {
+                    // Residue scan showed (hw,hh) pairs beyond 0x1000 (0x11b0..0x1bf4) and a lone hw at 0x66c; cover the whole view.
+                    const uint32_t patch_len = std::min<uint32_t>(a2_len, 0x2000);
+                    for (uint32_t off = 0x60; off + 8 <= patch_len; off += 4) {
                         auto x = (int32_t*)((uintptr_t)a2 + off);
                         if (x[0] == hw && x[1] == hh) {
                             x[0] = rect_w;
                             x[1] = rect_h;
                             ++extra_patched;
-                            if (n < 5) extra_where += fmt::format("{:x} ", off);
+                            extra_where += fmt::format("{:x} ", off);
                             off += 4;
                         } else if (x[0] == hw * 2 && x[1] == hh) {
                             x[0] = rect_w;
                             x[1] = rect_h;
                             ++extra_patched;
-                            if (n < 5) extra_where += fmt::format("{:x}(2w) ", off);
+                            extra_where += fmt::format("{:x}(2w) ", off);
                             off += 4;
+                        } else if (x[0] == hw && off == 0x66c) {
+                            x[0] = rect_w;
+                            ++extra_patched;
+                            extra_where += fmt::format("{:x}(lone) ", off);
                         }
                     }
-                    if (n < 5) SPDLOG_INFO("[LGUI_REFS]   extra size pairs patched={} at [{}]", extra_patched, extra_where.empty() ? "-" : extra_where);
+                    if (n < 5 || (n % 600) == 0) SPDLOG_INFO("[LGUI_REFS]   extra size pairs patched={} at [{}] -> {}x{} (hmd={}x{})", extra_patched, extra_where.empty() ? "-" : extra_where, rect_w, rect_h, hw, hh);
                 }
+
 
                 // Stretch fix: a5 (and a2+0/+4, same values) is a packed (1/w, 1/h) float pair describing the eye view, which
                 // LGUI uses for its ortho canvas layout. Present the UI target's inverse size instead so the canvas fills 3840x2160.
+                // Disabled: no-op for the visible layout, part of the same 4K-forcing patch set suspected of causing lag.
                 constexpr bool LGUI_PATCH_INV_SIZE = false;
                 void* a5_patched = a5;
+                bool a2_inv_patched = false;
 
                 if (LGUI_PATCH_INV_SIZE) {
                     const float inv[2] = {1.0f / (float)rect_w, 1.0f / (float)rect_h};
@@ -3746,15 +4974,97 @@ static void* lgui_slot24_hook(void* self, void* a2, void* a3, void* a4, void* a5
                     if (old_inv == (uint64_t)a5 && a2_inv[0] > 0.0f && a2_inv[0] < 0.1f && a2_inv[1] > 0.0f && a2_inv[1] < 0.1f) {
                         a2_inv[0] = inv[0];
                         a2_inv[1] = inv[1];
+                        a2_inv_patched = true;
                     }
                 }
 
-                if (n < 5 || (n % 300) == 0) {
+                // After every int/float patch: what in a2 (the FViewInfo) still encodes the eye size? This is what LGUI must be
+                // reading for the canvas width, since LGUI_BOUNDS stays at hmd_w wide with everything above active.
+                if (LGUI_DIAG_VERBOSE && (n < 3 || (n % 600) == 0)) {
+                    const float fhw = (float)hw, fhh = (float)hh;
+                    const float cands[] = {fhw, fhh, fhw / fhh, fhh / fhw, 1.0f / fhw, 1.0f / fhh, 2.0f / fhw, 2.0f / fhh, fhw * 2.0f, 2.0f * fhw / fhh, 0.5f / fhw};
+                    const char* names[] = {"hw", "hh", "hw/hh", "hh/hw", "1/hw", "1/hh", "2/hw", "2/hh", "2hw", "2hw/hh", "0.5/hw"};
+                    std::string fl{}, ints{};
+                    const uint32_t scan_len = std::min<uint32_t>(a2_len, 0x2000);
+                    for (uint32_t off = 0; off + 4 <= scan_len; off += 4) {
+                        const auto u = *(uint32_t*)((uintptr_t)a2 + off);
+                        const auto iv = (int32_t)u;
+                        const auto fv = *(float*)&u;
+                        if (iv == hw || iv == hh || iv == hw * 2) ints += fmt::format("{:x}={} ", off, iv);
+                        for (int c = 0; c < 11; ++c) {
+                            if (std::fabs(fv - cands[c]) <= std::fabs(cands[c]) * 1e-4f) { fl += fmt::format("{:x}={} ", off, names[c]); break; }
+                        }
+                    }
+                    SPDLOG_INFO("[LGUI_REFS]   a2 post-patch eye-size residue: ints=[{}] floats=[{}] (a5={:x} a2+0 patched={})", ints.empty() ? "-" : ints, fl.empty() ? "-" : fl, (uintptr_t)a5, a2_inv_patched);
+                }
+
+                if (LGUI_DIAG_VERBOSE && (n < 5 || (n % 300) == 0)) {
                     SPDLOG_INFO("[LGUI_REFS] a3={:x} a2_len={:x} refs={} (skipped {}) at [{}] -> copy={:x} (ui_target={:x} {}x{}), rects patched={}",
                         (uintptr_t)a3, a2_len, refs.size(), skipped, where.empty() ? "-" : where, (uintptr_t)copy, (uintptr_t)ui_target, ui_w, ui_h, saved.size() / 3);
                 }
 
-                const auto result = ((void*(*)(void*, void*, void*, void*, void*, void*))it->second)(self, a2, copy, a4, a5_patched, a6);
+                // Present the REAL family texture at ui_target size while LGUI records its pass (its lambda may capture the
+                // viewport from Texture->Desc.Extent at record time through one of the 0x12d0+ refs we do not redirect).
+                // Restored right after the call so every other pass still sees the true extent.
+                constexpr bool LGUI_PATCH_REAL_A3_EXTENT_DURING_RECORD = true;
+                int32_t saved_real_ext[2]{};
+                int32_t* real_ext = nullptr;
+                if (LGUI_PATCH_REAL_A3_EXTENT_DURING_RECORD) {
+                    real_ext = (int32_t*)((uintptr_t)a3 + TEX_EXTENT_OFF);
+                    saved_real_ext[0] = real_ext[0];
+                    saved_real_ext[1] = real_ext[1];
+                    real_ext[0] = ui_w;
+                    real_ext[1] = ui_h;
+                }
+
+                // a4 is SceneDepthZ (eye-sized: hmd_w x hmd_h with NSF, 2*hmd_w x hmd_h without). Binding it as the depth
+                // attachment alongside the 3840x2160 colour target clips the drawable area to the depth extent -> exactly the
+                // measured LGUI_BOUNDS in every mode (2580x2160 / 2020x1084 / 3840x2160). Screen-space UI needs no scene depth.
+                // RESULT: null depth accepted by LGUI (no fault) but LGUI_BOUNDS unchanged, and the depth was 1720x2036 while the
+                // paint was 2020 wide -> depth attachment does not clip the draw. Disabled.
+                constexpr bool LGUI_NULL_DEPTH = false;
+                void* a4_patched = LGUI_NULL_DEPTH ? nullptr : a4;
+                if (n < 3 && a4 != nullptr && !IsBadReadPtr(a4, TEX_EXTENT_OFF + 8)) {
+                    SPDLOG_INFO("[LGUI_REFS]   a4 (depth) extent {}x{} -> passing {}", *(int32_t*)((uintptr_t)a4 + TEX_EXTENT_OFF), *(int32_t*)((uintptr_t)a4 + TEX_EXTENT_OFF + 4), LGUI_NULL_DEPTH ? "nullptr" : "as-is");
+                }
+
+                static bool null_depth_faulted = false;
+                void* result = nullptr;
+                const auto call_orig = (void*(*)(void*, void*, void*, void*, void*, void*))it->second;
+
+                // EXPERIMENT: swap the REAL FSceneView::ViewRect to ui_target size for the duration of LGUI's
+                // draw only, then restore synchronously below. See LGUI_PROBE_VIEWRECT_SWAP notes. Combined
+                // with [LGUI_BOUNDS] this proves whether LGUI's paint extent follows the live view rect.
+                std::vector<LguiRectPatch> probe_patches{};
+                std::string probe_where{};
+                if (LGUI_PROBE_VIEWRECT_SWAP && VR::get()->is_hmd_active()) {
+                    lgui_probe_swap_view_rects(a3, probe_patches, probe_where);
+                    if (!probe_patches.empty() && (n < 5 || (n % 300) == 0)) {
+                        SPDLOG_INFO("[LGUI_VRPROBE] swapped {} real view rect field(s) to {}x{} for LGUI draw [{}]",
+                            probe_patches.size(), ui_w, ui_h, probe_where.empty() ? "-" : probe_where);
+                    }
+                }
+
+                if (a4_patched == nullptr && !null_depth_faulted) {
+                    if (!lgui_call_draw_seh(call_orig, self, a2, copy, nullptr, a5_patched, a6, &result)) {
+                        null_depth_faulted = true;
+                        SPDLOG_ERROR("[LGUI_REFS] LGUI faulted with null depth; falling back to real depth from now on");
+                        result = call_orig(self, a2, copy, a4, a5_patched, a6);
+                    }
+                } else {
+                    result = call_orig(self, a2, copy, null_depth_faulted ? a4 : a4_patched, a5_patched, a6);
+                }
+
+                // Restore the real view rect(s) immediately so the actual 3D scene render is never affected.
+                if (!probe_patches.empty()) {
+                    lgui_restore_view_rects(probe_patches);
+                }
+
+                if (real_ext != nullptr) {
+                    real_ext[0] = saved_real_ext[0];
+                    real_ext[1] = saved_real_ext[1];
+                    if (n < 3) SPDLOG_INFO("[LGUI_REFS]   real a3 extent presented as {}x{} during record (was {}x{})", ui_w, ui_h, saved_real_ext[0], saved_real_ext[1]);
+                }
 
                 // EXPERIMENT 11: restoring the refs immediately had no effect
                 // swap of the real object did redirect. => the pass reads the field at RDG execute time, i.e. after we return.
@@ -4008,7 +5318,7 @@ static void* lgui_slot24_hook(void* self, void* a2, void* a3, void* a4, void* a5
     static uint32_t builder_diff_reports = 0;
     struct BuilderArr { uintptr_t owner; uint32_t a2_off; uint32_t off; uintptr_t data; int32_t num; };
     std::vector<BuilderArr> builder_arrs{};
-    const bool builder_diff_now = LGUI_DIFF_BUILDER_EVERY_FRAME && builder_diff_reports < 12 && n >= 600 && (n % 20) == 0 &&
+    const bool builder_diff_now = LGUI_DIFF_BUILDER_EVERY_FRAME && builder_diff_reports < 12 && n >= 20 && (n % 20) == 0 &&
         a2 != nullptr && !IsBadReadPtr(a2, 0x1000);
 
     if (builder_diff_now) {
@@ -4032,12 +5342,12 @@ static void* lgui_slot24_hook(void* self, void* a2, void* a3, void* a4, void* a5
         }
     }
 
-    if (g_lgui_pass_execute_original == 0 && a2 != nullptr && !IsBadReadPtr((void*)((uintptr_t)a2 + LGUI_PASS_OWNER_OFF), 8)) {
+    if (a2 != nullptr && !IsBadReadPtr((void*)((uintptr_t)a2 + LGUI_PASS_OWNER_OFF), 8)) {
         const auto owner = *(uintptr_t*)((uintptr_t)a2 + LGUI_PASS_OWNER_OFF);
         if (owner > 0x10000 && !IsBadReadPtr((void*)(owner + LGUI_PASS_ARR_OFF), 16)) {
             pass_arr_snap = std::make_pair(owner + LGUI_PASS_ARR_OFF, *(int32_t*)(owner + LGUI_PASS_ARR_OFF + 8));
-            if (n % 600 == 0) SPDLOG_INFO("[LGUI_SWAP] pass registry snapshot: owner={:x} num={}", owner, pass_arr_snap->second);
-        } else if (n % 600 == 0) {
+            if (n < 20 || n % 20 == 0) SPDLOG_INFO("[LGUI_SWAP] pass registry snapshot: owner={:x} num={}", owner, pass_arr_snap->second);
+        } else if (n < 20 || n % 20 == 0) {
             SPDLOG_INFO("[LGUI_SWAP] pass registry owner unreadable: a2+378={:x}", owner);
         }
     }
@@ -4129,12 +5439,12 @@ static void* lgui_slot24_hook(void* self, void* a2, void* a3, void* a4, void* a5
         if ((diff_runs++ % 30) == 0) SPDLOG_INFO("[LGUI_PASS] diff run #{} arrays={} grew_any={}", diff_runs, builder_arrs.size(), reported);
     }
 
-    if (pass_arr_snap.has_value() && g_lgui_pass_execute_original == 0) {
+    if (pass_arr_snap.has_value()) {
         const auto [arr, old_num] = *pass_arr_snap;
         if (!IsBadReadPtr((void*)arr, 16)) {
             const auto data = *(uintptr_t*)arr;
             const auto num = *(int32_t*)(arr + 8);
-            if (n % 600 == 0) SPDLOG_INFO("[LGUI_SWAP] pass registry after call: {} -> {}", old_num, num);
+            if (n < 20 || n % 20 == 0) SPDLOG_INFO("[LGUI_SWAP] pass registry after call: {} -> {}", old_num, num);
             if (num > old_num && num - old_num <= 64 && data > 0x10000 && !IsBadReadPtr((void*)data, sizeof(uintptr_t) * num)) {
                 // Pick the first new entry whose vtable is in the game module (the registry also contains sentinel values).
                 for (int32_t k = old_num; k < num; ++k) {
@@ -4209,6 +5519,10 @@ static void diag_dump_engine_view_extensions(sdk::FSceneViewFamily& view_family)
     static uint32_t call_count = 0;
     static uint32_t dump_count = 0;
 
+    // NOTE: despite the name, this function has a CRITICAL side effect - it installs the LGUI redirect
+    // hooks (slot-24 draw hook + game-thread SetupView/BeginRenderViewFamily hooks) below. It must keep
+    // running every qualifying call. Only the verbose [VIEWEXT_DIAG] logging is gated by
+    // LGUI_DIAG_STEADY_STATE; the hook-installation path is NOT gated.
     if (dump_count >= 20 || (call_count++ % 300) != 0) {
         return;
     }
@@ -4225,10 +5539,12 @@ static void diag_dump_engine_view_extensions(sdk::FSceneViewFamily& view_family)
     const auto views = view_family.get_views();
     const auto rt = view_family.get_render_target();
 
-    SPDLOG_INFO("[VIEWEXT_DIAG] dump #{}: family={:x} rt={:x} views={} exts.data={:x} count={} capacity={} our_vtable={:x} idx(is_active={} begin_render={} pre_render_rt={})",
-        dump_count, (uintptr_t)&view_family, (uintptr_t)rt, views != nullptr ? views->count : -1,
-        (uintptr_t)exts->extensions.data, exts->extensions.count, exts->extensions.capacity, (uintptr_t)g_view_extension_vtable.data(),
-        SceneViewExtensionAnalyzer::is_active_this_frame_index, SceneViewExtensionAnalyzer::begin_render_viewfamily_index, SceneViewExtensionAnalyzer::pre_render_viewfamily_renderthread_index);
+    if (LGUI_DIAG_STEADY_STATE) {
+        SPDLOG_INFO("[VIEWEXT_DIAG] dump #{}: family={:x} rt={:x} views={} exts.data={:x} count={} capacity={} our_vtable={:x} idx(is_active={} begin_render={} pre_render_rt={})",
+            dump_count, (uintptr_t)&view_family, (uintptr_t)rt, views != nullptr ? views->count : -1,
+            (uintptr_t)exts->extensions.data, exts->extensions.count, exts->extensions.capacity, (uintptr_t)g_view_extension_vtable.data(),
+            SceneViewExtensionAnalyzer::is_active_this_frame_index, SceneViewExtensionAnalyzer::begin_render_viewfamily_index, SceneViewExtensionAnalyzer::pre_render_viewfamily_renderthread_index);
+    }
 
     if (exts->extensions.data == nullptr || exts->extensions.count <= 0 || exts->extensions.count > 64) {
         return;
@@ -4269,9 +5585,10 @@ static void diag_dump_engine_view_extensions(sdk::FSceneViewFamily& view_family)
             fn_rvas += fmt::format("{:x},", fn_module.has_value() ? fn - (uintptr_t)*fn_module : fn);
         }
 
-        SPDLOG_INFO("[VIEWEXT_DIAG]   [{}] ext={:x} vtable={:x} module={} vtable_rva={:x} ours={} fn_rvas=[{}]",
-            i, (uintptr_t)ext, vtable, module_name, rva, is_ours, fn_rvas);
-
+        if (LGUI_DIAG_STEADY_STATE) {
+            SPDLOG_INFO("[VIEWEXT_DIAG]   [{}] ext={:x} vtable={:x} module={} vtable_rva={:x} ours={} fn_rvas=[{}]",
+                i, (uintptr_t)ext, vtable, module_name, rva, is_ours, fn_rvas);
+        }
         // One-time deep scan: list every virtual that isn't the shared default stub
         // LGUI's FLGUIHudRenderer registers late (after dump #1); its vtables sit next to the
         // "LGUIHudRenderer::AddHudPrimitive_RenderThread" string at rva 26ca09xx.
@@ -4325,7 +5642,9 @@ static void diag_dump_engine_view_extensions(sdk::FSceneViewFamily& view_family)
                 nontrivial += fmt::format("{}:{:x},", j, fn - (uintptr_t)*module);
             }
 
-            SPDLOG_INFO("[VIEWEXT_DIAG]     [{}] stub_rva={:x} (x{}) nontrivial_virtuals=[{}]", i, stub - (uintptr_t)*module, stub_count, nontrivial);
+            if (LGUI_DIAG_STEADY_STATE) {
+                SPDLOG_INFO("[VIEWEXT_DIAG]     [{}] stub_rva={:x} (x{}) nontrivial_virtuals=[{}]", i, stub - (uintptr_t)*module, stub_count, nontrivial);
+            }
 
             // Experiment: replace virtuals with the extension's own no-op stub to confirm which
             // extension/slot draws the UI (it should vanish). Bisect mode: suppress every overridden
@@ -4365,6 +5684,28 @@ static void diag_dump_engine_view_extensions(sdk::FSceneViewFamily& view_family)
                 } else {
                     SPDLOG_ERROR("[LGUI_DRAW] failed to hook slot {} on vtable_rva={:x}", LGUI_DRAW_SLOT, rva);
                 }
+
+                // Game-thread callbacks: hook whatever this class overrides (the shared engine stub is skipped).
+                auto hook_gt_slot = [&](int32_t slot, uintptr_t hook_fn, std::unordered_map<uintptr_t, uintptr_t>& originals, const char* name) {
+                    if (originals.contains(vtable)) return;
+                    auto sp = &((uintptr_t*)vtable)[slot];
+                    const auto f = *sp;
+                    if (f == 0 || f == stub || IsBadReadPtr((void*)f, sizeof(void*))) {
+                        SPDLOG_INFO("[LGUI_GT] slot {} ({}) on vtable_rva={:x} is stub/empty, not hooked", slot, name, rva);
+                        return;
+                    }
+                    const auto fm = utility::get_module_within((void*)f);
+                    if (!fm.has_value() || *fm != *module) return;
+                    DWORD o{};
+                    if (VirtualProtect(sp, sizeof(uintptr_t), PAGE_READWRITE, &o)) {
+                        originals[vtable] = f;
+                        *sp = hook_fn;
+                        VirtualProtect(sp, sizeof(uintptr_t), o, &o);
+                        SPDLOG_INFO("[LGUI_GT] hooked slot {} ({}) on vtable_rva={:x} (orig fn_rva={:x})", slot, name, rva, f - (uintptr_t)*module);
+                    }
+                };
+                hook_gt_slot(LGUI_SETUP_VIEW_SLOT, (uintptr_t)&lgui_setup_view_hook, g_lgui_setup_view_originals, "SetupView");
+                hook_gt_slot(LGUI_BEGIN_FAMILY_SLOT, (uintptr_t)&lgui_begin_family_hook, g_lgui_begin_family_originals, "BeginRenderViewFamily");
             }
 
             constexpr std::array<int32_t, 0> lgui_suppress_slots{};
@@ -7078,7 +8419,7 @@ void FFakeStereoRenderingHook::adjust_view_rect(FFakeStereoRendering* stereo, in
 
         auto vr = VR::get();
 
-        if (diag_adjust_view_rect_count <= 20 || diag_adjust_view_rect_count % 301 == 1) {
+        if (LGUI_DIAG_STEADY_STATE && (diag_adjust_view_rect_count <= 20 || diag_adjust_view_rect_count % 301 == 1)) {
             SPDLOG_INFO("[DIAG] AdjustViewRect (#{}): index={} true_index={} index_starts_from_one={} x={} y={} w={} h={} native_stereo_fix={} vr_frame_count={} vr_left_interval={} vr_right_interval={} is_using_afr={}",
                 diag_adjust_view_rect_count, index, true_index, index_starts_from_one, *x, *y, *w, *h,
                 vr->is_native_stereo_fix_enabled(), vr->m_render_frame_count, vr->m_left_eye_interval, vr->m_right_eye_interval, vr->is_using_afr());
@@ -7377,10 +8718,12 @@ __forceinline void FFakeStereoRenderingHook::calculate_stereo_view_offset(
         // DIAGNOSTIC: confirm whether this hook (and the is_2d_screen guard around
         // head_offset/eye_separation) is actually reached, and with what values, when
         // testing 2D-screen-mode UI interaction. Rate-limited to avoid log spam.
-        SPDLOG_INFO_EVERY_N_SEC(2, "[VR][diag] calculate_stereo_view_offset: is_2d_screen={} is_using_afr={} true_index={} eye_separation=({:.3f},{:.3f},{:.3f}) head_offset=({:.3f},{:.3f},{:.3f})",
-            is_2d_screen, vr->is_using_afr(), true_index,
-            eye_separation.x, eye_separation.y, eye_separation.z,
-            head_offset.x, head_offset.y, head_offset.z);
+        if (LGUI_DIAG_STEADY_STATE) {
+            SPDLOG_INFO_EVERY_N_SEC(2, "[VR][diag] calculate_stereo_view_offset: is_2d_screen={} is_using_afr={} true_index={} eye_separation=({:.3f},{:.3f},{:.3f}) head_offset=({:.3f},{:.3f},{:.3f})",
+                is_2d_screen, vr->is_using_afr(), true_index,
+                eye_separation.x, eye_separation.y, eye_separation.z,
+                head_offset.x, head_offset.y, head_offset.z);
+        }
 
         if (!has_double_precision) {
             if (!is_2d_screen) {
@@ -8826,6 +10169,30 @@ bool VRRenderTargetManager_Base::need_reallocate_depth_texture(const void* Depth
     return false;
 }
 
+FFakeStereoRenderingHook::UIDrawExtent FFakeStereoRenderingHook::get_ui_target_size() {
+    // Default to the shared scene RT size so behavior is unchanged if VR is unavailable.
+    const auto rt = g_framework->is_dx11() ? g_framework->get_d3d11_rt_size() : g_framework->get_d3d12_rt_size();
+    int32_t w = (int32_t)rt.x;
+    int32_t h = (int32_t)rt.y;
+
+    auto vr = VR::get();
+    if (vr != nullptr && vr->is_native_stereo_fix_tall_ui_enabled()) {
+        // LGUI lays its canvas out at the per-eye view rect (hmd_width x hmd_height). When NSF is on this per-eye
+        // height (e.g. 3377) exceeds the scene RT height (2160), so the bottom of the UI is clipped. Grow the UI
+        // target to hold the full canvas; it is cropped/stretched back to 16:9 at presentation. Gated to NSF ON
+        // via the toggle - in AFR / NSF OFF the canvas is not tall, so growing the target would distort the UI.
+        const int32_t canvas_w = (int32_t)vr->get_hmd_width();
+        const int32_t canvas_h = (int32_t)vr->get_hmd_height();
+
+        if (canvas_w > 0 && canvas_h > 0) {
+            w = std::max(w, canvas_w);
+            h = std::max(h, canvas_h);
+        }
+    }
+
+    return UIDrawExtent{w, h};
+}
+
 void VRRenderTargetManager_Base::pre_texture_hook_callback(safetyhook::Context& ctx, bool from_second) {
     SPDLOG_INFO("PreTextureHook called! {}", ctx.r8);
 
@@ -9128,7 +10495,11 @@ void VRRenderTargetManager_Base::pre_texture_hook_callback(safetyhook::Context& 
     static FTexture2DRHIRef out{};
     static FTexture2DRHIRef shader_out{};
 
-    const auto size = g_framework->is_dx11() ? g_framework->get_d3d11_rt_size() : g_framework->get_d3d12_rt_size();
+    // Use the dedicated (taller) UI-target size instead of the shared scene RT size so LGUI's full per-eye canvas
+    // fits without clipping the bottom. This callback allocates ONLY the UI target (rtm->ui_target), so the scene
+    // RT is unaffected.
+    const auto ui_size = FFakeStereoRenderingHook::get_ui_target_size();
+    const auto size = Vector2f{(float)ui_size.width, (float)ui_size.height};
     const auto stack_args = (uintptr_t*)(ctx.rsp + 0x20);
 
     SPDLOG_INFO("About to call the original!");

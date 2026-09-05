@@ -839,9 +839,22 @@ std::optional<std::reference_wrapper<XrCompositionLayerQuad>> OverlayComponent::
     // Show just that region so the UI keeps its native proportions instead of being stretched over the full quad.
     if (auto& hook = vr->get_fake_stereo_hook(); hook != nullptr) {
         const auto ext = hook->get_ui_draw_extent();
-        if (ext.width > 0 && ext.height > 0 && ext.width <= (int32_t)ui_swapchain.width && ext.height <= (int32_t)ui_swapchain.height) {
+        // In 2D-screen mode D3D12Component already stretches the painted region over the full screen texture.
+        const bool applied = !vr->is_using_2d_screen() && ext.width > 0 && ext.height > 0 && ext.width <= (int32_t)ui_swapchain.width && ext.height <= (int32_t)ui_swapchain.height;
+        if (applied) {
             layer.subImage.imageRect.extent.width = ext.width;
             layer.subImage.imageRect.extent.height = ext.height;
+        }
+
+        static int32_t last_w = -1, last_h = -1;
+        static bool last_applied = false;
+        if (is_left_eye && (ext.width != last_w || ext.height != last_h || applied != last_applied)) {
+            last_w = ext.width;
+            last_h = ext.height;
+            last_applied = applied;
+            SPDLOG_INFO("[LGUI_QUAD] imageRect {}x{} of swapchain {}x{} (draw_extent={}x{} applied={} 2d_screen={} swapchain_idx={})",
+                layer.subImage.imageRect.extent.width, layer.subImage.imageRect.extent.height, ui_swapchain.width, ui_swapchain.height,
+                ext.width, ext.height, applied, vr->is_using_2d_screen(), (uint32_t)swapchain);
         }
     }
 
@@ -868,7 +881,22 @@ std::optional<std::reference_wrapper<XrCompositionLayerQuad>> OverlayComponent::
     }
 
     const auto size_meters = m_parent->m_slate_size->value();
-    const auto meters_w = (float)layer.subImage.imageRect.extent.width / (float)layer.subImage.imageRect.extent.height * size_meters;
+    // LGUI's UI canvas is built from the per-eye FSceneView view rect (inseparable from the stereo scene render),
+    // so with NSF ON the painted region is a tall/thin per-eye shape (e.g. ~1536x1852). Deriving the quad's physical
+    // aspect from that region makes the UI look stretched tall and pushes its lower portion out of comfortable view.
+    // The painted pixels are correct, only the presented aspect is wrong - so present the cropped region on a quad
+    // with a fixed, comfortable aspect ratio instead of inheriting the narrow eye shape. This is purely OpenXR layer
+    // geometry and has no effect on the stereo scene render.
+    const float img_w = (float)layer.subImage.imageRect.extent.width;
+    const float img_h = (float)layer.subImage.imageRect.extent.height;
+    const float img_aspect = (img_h > 0.0f) ? (img_w / img_h) : (16.0f / 9.0f);
+
+    // Only override the aspect when the painted region is noticeably narrower than a normal widescreen UI
+    // (i.e. the NSF-ON tall/thin case). When it already looks wide (2D screen / NSF off), keep the native aspect.
+    constexpr float k_target_ui_aspect = 16.0f / 9.0f;
+    const float present_aspect = (img_aspect < k_target_ui_aspect) ? k_target_ui_aspect : img_aspect;
+
+    const auto meters_w = present_aspect * size_meters;
     const auto meters_h = size_meters;
     layer.size = {meters_w, meters_h};
 

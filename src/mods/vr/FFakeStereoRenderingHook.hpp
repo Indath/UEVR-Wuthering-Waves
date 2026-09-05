@@ -345,6 +345,17 @@ public:
     UIDrawExtent get_ui_draw_extent() const { return m_ui_draw_extent; }
     void set_ui_draw_extent(int32_t w, int32_t h) { m_ui_draw_extent = {w, h}; }
 
+    // Dynamic size (pixels) that the LGUI ui_target should be allocated at. Decoupled from the shared scene RT size
+    // (get_d3d12_rt_size) so the UI target can be made tall enough to hold LGUI's full per-eye canvas (view_rect),
+    // which is taller than the scene RT height when NSF is on. The UI is then cropped/stretched back to 16:9 at
+    // presentation time. Returns integer width/height. Falls back to the scene RT size if VR is unavailable.
+    static UIDrawExtent get_ui_target_size();
+
+    // Game-thread viewport size (FViewport::GetSizeXY) sampled in UGameViewportClient::Draw. LGUI lays out its
+    // screen-space canvas / ortho projection from this, so the redirected draw extent must match it.
+    UIDrawExtent get_game_viewport_size() const { return m_game_viewport_size; }
+    void set_game_viewport_size(int32_t w, int32_t h) { m_game_viewport_size = {w, h}; }
+
     void attempt_hooking();
     void attempt_hook_game_engine_tick(uintptr_t return_address = 0);
     void attempt_hook_slate_thread(uintptr_t return_address = 0, bool alternate = false);
@@ -645,6 +656,7 @@ private:
     bool m_manually_constructed{false};
     bool m_pixel_format_cvar_found{false};
     UIDrawExtent m_ui_draw_extent{};
+    UIDrawExtent m_game_viewport_size{};
     bool m_injected_stereo_at_runtime{false};
     bool m_has_double_precision{false}; // for the projection matrix... AND the view offset... IS UE5 DOING THIS NOW???
     bool m_fixed_localplayer_view_count{false};

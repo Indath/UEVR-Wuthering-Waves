@@ -666,6 +666,12 @@ public:
         return m_native_stereo_fix_mirror->value();
     }
 
+    // Only report the tall-UI target fix as active when Native Stereo Fix itself is active AND the toggle is on.
+    // In AFR / NSF OFF the LGUI canvas is not per-eye-tall, so growing the UI target would distort the UI.
+    bool is_native_stereo_fix_tall_ui_enabled() const {
+        return m_native_stereo_fix_tall_ui->value() && is_native_stereo_fix_enabled();
+    }
+
     bool are_loading_guards_disabled() const {
         return m_disable_loading_guards->value();
     }
@@ -1092,6 +1098,12 @@ private:
     // shared per-view-state history is what freezes distant foliage in the second-rendered eye.
     const ModToggle::Ptr m_native_stereo_fix_null_pass2_view_state{ ModToggle::create(generate_name("NativeStereoFixNullPass2ViewState"), false) };
     const ModToggle::Ptr m_native_stereo_fix_mirror{ ModToggle::create(generate_name("NativeStereoFixMirror"), false) };
+    // When Native Stereo Fix is on, LGUI lays its UI canvas out at the per-eye view rect height (which is taller
+    // than the scene RT), so the bottom of the UI is clipped by the normal (scene-sized) UI render target. This
+    // grows the UEVR-owned UI target to the full per-eye canvas height so the whole UI is captured, then presents
+    // it cropped/stretched back to 16:9. Only valid for NSF ON: in AFR / NSF OFF the canvas is not tall, so growing
+    // the target distorts the UI. Gated to NSF ON via is_native_stereo_fix_tall_ui_enabled().
+    const ModToggle::Ptr m_native_stereo_fix_tall_ui{ ModToggle::create(generate_name("NativeStereoFixTallUI"), true) };
     // Allows Native Stereo Fix's scene-capture/compositing path (normally exclusive to non-AFR
     // rendering) to also run while Alternate-Frame-Rendering / Synchronized Sequential mode is active.
     // Confirmed to fix both incorrect 2D-screen UI scale (previously locked to HMD resolution) and
@@ -1234,6 +1246,7 @@ public:
             *m_native_stereo_fix_auto_suspend,
             *m_native_stereo_fix_null_pass2_view_state,
             *m_native_stereo_fix_mirror,
+            *m_native_stereo_fix_tall_ui,
             *m_native_stereo_fix_allow_with_afr,
             *m_unify_afr_frame_parity,
             *m_disable_loading_guards,
