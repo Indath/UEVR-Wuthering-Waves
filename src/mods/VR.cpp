@@ -2477,6 +2477,15 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
         m_load_blueprint_code->draw("Load Blueprint Code");
         m_ghosting_fix->draw("Ghosting Fix");
 
+        m_disable_lgui_ui_redirect->draw("DIAG: Disable LGUI UI Redirect (perf A/B test)");
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Skips submitting the redirected LGUI UI texture to the compositor every frame\n"
+                               "(wait/acquire/copy/clear/draw on the UI swapchain), without changing how the\n"
+                               "game itself renders its UI. Use this to A/B test whether the UI redirect submission\n"
+                               "is responsible for a GPU utilization / FPS drop, without needing an external Lua script.\n"
+                               "The in-VR UI quad will go blank/stale while this is enabled.");
+        }
+
         ImGui::SetNextItemOpen(true, ImGuiCond_::ImGuiCond_Once);
         if (ImGui::TreeNode("Native Stereo Fix")) {
             m_native_stereo_fix->draw("Enabled");

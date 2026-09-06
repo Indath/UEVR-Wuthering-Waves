@@ -1045,6 +1045,11 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
         commands.clear_rtv(m_game_ui_tex, (float*)&ui_clear_color, ENGINE_SRC_COLOR);
     };
 
+    // NOTE: the actual LGUI redirect (forcing LGUI to draw into ui_target instead of its native RHI texture) is
+    // gated at its source in FFakeStereoRenderingHook::game_viewport_client_draw_hook via
+    // VR::is_lgui_ui_redirect_disabled(). When disabled there, ui_target is never populated by LGUI, so this
+    // submission path naturally has nothing new to present each frame (falling back to whatever was last there,
+    // typically blank/stale) rather than needing a separate skip here.
     if (runtime->is_openvr() && m_openvr.ui_tex.texture.Get() != nullptr) {
         m_openvr.ui_tex.commands.wait(INFINITE);
 
@@ -1131,20 +1136,28 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
                 // crop, so this is visually identical while moving far fewer bytes.
                 const auto ext = ffsr->get_ui_draw_extent();
                 const auto native_ui = (ID3D12Resource*)ui_target->get_native_resource();
-                const auto ui_desc = native_ui->GetDesc();
+
                 D3D12_BOX ui_box{};
                 D3D12_BOX* ui_box_ptr = nullptr;
-                if (ext.width > 0 && ext.height > 0 &&
-                    (UINT)ext.width <= ui_desc.Width && (UINT)ext.height <= ui_desc.Height &&
-                    ((UINT)ext.width < ui_desc.Width || (UINT)ext.height < ui_desc.Height)) {
-                    ui_box.left = 0;
-                    ui_box.top = 0;
-                    ui_box.front = 0;
-                    ui_box.right = (UINT)ext.width;
-                    ui_box.bottom = (UINT)ext.height;
-                    ui_box.back = 1;
-                    ui_box_ptr = &ui_box;
+
+                // Only apply the crop optimization if native_ui is valid; if it's null, fall back to full copy
+                if (native_ui != nullptr) {
+                    const auto ui_desc = native_ui->GetDesc();
+                    if (ext.width > 0 && ext.height > 0 &&
+                        (UINT)ext.width <= ui_desc.Width && (UINT)ext.height <= ui_desc.Height &&
+                        ((UINT)ext.width < ui_desc.Width || (UINT)ext.height < ui_desc.Height)) {
+                        ui_box.left = 0;
+                        ui_box.top = 0;
+                        ui_box.front = 0;
+                        ui_box.right = (UINT)ext.width;
+                        ui_box.bottom = (UINT)ext.height;
+                        ui_box.back = 1;
+                        ui_box_ptr = &ui_box;
+                    }
+                } else {
+                    SPDLOG_WARN("[D3D12Component] LGUI ui_target native_ui is nullptr - falling back to full target copy. ui_target={:p}", (void*)ui_target);
                 }
+
                 m_openxr.copy((uint32_t)runtimes::OpenXR::SwapchainIndex::UI, native_ui, draw_2d_view, clear_rt, ENGINE_SRC_COLOR, ui_box_ptr);
             }
 
@@ -2685,6 +2698,33 @@ void D3D12Component::OpenXR::copy(
             auto& texture_ctx = ctx.texture_contexts[texture_index];
             texture_ctx->commands.wait(INFINITE);
 
+            // DIAG: GPU-time the submission recorded on each relevant swapchain's command context so we
+            // can compare the redirected UI copy/clear/draw against the actual per-eye scene composite.
+            // The UI path already measured ~0.14 ms (negligible); if the eye-composite path is also small
+            // while FPS still drops in both NSF ON/OFF, the cost is the engine's per-eye scene render
+            // (config-tunable), not our compositor.
+            // PERF: this instrumentation forces CommandContext::end_gpu_timing() to set has_commands = true
+            // every frame for every recognized swapchain (UI/DOUBLE_WIDE/AFR eyes), which in turn forces
+            // execute() to always ExecuteCommandLists/Signal/SetEventOnCompletion even on frames that would
+            // otherwise have nothing to submit here. Unlike the other [DIAG] readback helpers in this file,
+            // this was not gated behind is_diag_verbose_logging_enabled(), so it silently ran unconditionally
+            // in every build. Gate it the same way so it only costs anything while actively diagnosing.
+            const wchar_t* timing_label = nullptr;
+            if (vr->is_diag_verbose_logging_enabled()) {
+                switch ((runtimes::OpenXR::SwapchainIndex)swapchain_idx) {
+                case runtimes::OpenXR::SwapchainIndex::UI: timing_label = L"OpenXR UI copy+clear+draw"; break;
+                case runtimes::OpenXR::SwapchainIndex::DOUBLE_WIDE: timing_label = L"OpenXR double-wide scene composite"; break;
+                case runtimes::OpenXR::SwapchainIndex::AFR_LEFT_EYE: timing_label = L"OpenXR AFR left-eye composite"; break;
+                case runtimes::OpenXR::SwapchainIndex::AFR_RIGHT_EYE: timing_label = L"OpenXR AFR right-eye composite"; break;
+                default: break;
+                }
+            }
+            const bool time_ui = timing_label != nullptr;
+            if (time_ui) {
+                texture_ctx->commands.enable_gpu_timing(timing_label);
+                texture_ctx->commands.begin_gpu_timing();
+            }
+
             if (pre_commands) {
                 (*pre_commands)(texture_ctx->commands, ctx.textures[texture_index].texture);
             }
@@ -2714,6 +2754,10 @@ void D3D12Component::OpenXR::copy(
 
             if (additional_commands) {
                 (*additional_commands)(texture_ctx->commands);
+            }
+
+            if (time_ui) {
+                texture_ctx->commands.end_gpu_timing();
             }
 
             texture_ctx->commands.execute();

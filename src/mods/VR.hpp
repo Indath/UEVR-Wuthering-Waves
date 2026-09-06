@@ -684,6 +684,15 @@ public:
         return m_ghosting_fix->value();
     }
 
+    // DIAG/PERF: fully skips the redirected-LGUI-UI per-frame submission (wait/acquire/copy/clear/draw
+    // on the UI OpenVR/OpenXR swapchain(s)) so the cost of the redirect itself can be A/B tested at
+    // runtime without needing an external Lua script to change how the game renders its UI. The LGUI
+    // render target is still captured/redirected upstream (get_ui_target); this only stops us from
+    // submitting it to the compositor every frame.
+    bool is_lgui_ui_redirect_disabled() const {
+        return m_disable_lgui_ui_redirect->value();
+    }
+
     auto& get_fake_stereo_hook() {
         return m_fake_stereo_hook;
     }
@@ -1082,6 +1091,8 @@ private:
     const ModSlider::Ptr m_depth_scale{ ModSlider::create(generate_name("DepthScale"), 0.01f, 1.0f, 1.0f) };
 
     const ModToggle::Ptr m_ghosting_fix{ ModToggle::create(generate_name("GhostingFix"), false) };
+    // DIAG/PERF: see is_lgui_ui_redirect_disabled().
+    const ModToggle::Ptr m_disable_lgui_ui_redirect{ ModToggle::create(generate_name("DisableLGUIUIRedirect"), false) };
     const ModToggle::Ptr m_native_stereo_fix{ ModToggle::create(generate_name("NativeStereoFix"), false) };
     // Default OFF: with the real FSceneViewInitOptions offsets now resolved (sceneview_xref), this branch
     // actually executes in this game and null-derefs inside the engine (views->count=0 during construction).
@@ -1240,6 +1251,7 @@ public:
             *m_custom_z_near,
             *m_custom_z_near_enabled,
             *m_ghosting_fix,
+            *m_disable_lgui_ui_redirect,
             *m_native_stereo_fix,
             *m_native_stereo_fix_same_pass,
             *m_native_stereo_fix_right_eye_shadows,

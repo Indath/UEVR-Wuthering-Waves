@@ -368,8 +368,16 @@ void CommandContext::clear_rtv(d3d12::TextureContext& tex, const float* color, D
 
 void CommandContext::execute() {
     std::scoped_lock _{this->mtx};
-    
+
     if (this->has_commands) {
+        // If a GPU timing region was recorded this frame, resolve the two timestamps into the
+        // readback buffer before closing so the result is available after the next fence wait.
+        if (this->gpu_timing_active && this->timestamp_query_heap != nullptr && this->timestamp_readback != nullptr) {
+            this->cmd_list->ResolveQueryData(this->timestamp_query_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0, 2, this->timestamp_readback.Get(), 0);
+            this->gpu_timing_active = false;
+            this->gpu_timing_pending = true;
+        }
+
         if (FAILED(this->cmd_list->Close())) {
             spdlog::error("[VR] Failed to close command list. ({})", utility::narrow(this->internal_name));
             return;
@@ -383,5 +391,110 @@ void CommandContext::execute() {
         this->waiting_for_fence = true;
         this->has_commands = false;
     }
+}
+
+void CommandContext::enable_gpu_timing(const wchar_t* label) {
+    std::scoped_lock _{this->mtx};
+
+    this->gpu_timing_label = label;
+
+    if (this->timestamp_query_heap != nullptr && this->timestamp_readback != nullptr) {
+        this->gpu_timing_enabled = true;
+        return;
+    }
+
+    auto& hook = g_framework->get_d3d12_hook();
+    auto device = hook->get_device();
+
+    if (device == nullptr) {
+        return;
+    }
+
+    D3D12_QUERY_HEAP_DESC qd{};
+    qd.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+    qd.Count = 2;
+    qd.NodeMask = 0;
+
+    if (FAILED(device->CreateQueryHeap(&qd, IID_PPV_ARGS(&this->timestamp_query_heap)))) {
+        spdlog::error("[VR] Failed to create timestamp query heap for {}", utility::narrow(this->internal_name));
+        return;
+    }
+
+    D3D12_HEAP_PROPERTIES hp{};
+    hp.Type = D3D12_HEAP_TYPE_READBACK;
+
+    D3D12_RESOURCE_DESC rd{};
+    rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    rd.Width = sizeof(uint64_t) * 2;
+    rd.Height = 1;
+    rd.DepthOrArraySize = 1;
+    rd.MipLevels = 1;
+    rd.Format = DXGI_FORMAT_UNKNOWN;
+    rd.SampleDesc.Count = 1;
+    rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+    if (FAILED(device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&this->timestamp_readback)))) {
+        spdlog::error("[VR] Failed to create timestamp readback buffer for {}", utility::narrow(this->internal_name));
+        this->timestamp_query_heap.Reset();
+        return;
+    }
+
+    this->gpu_timing_enabled = true;
+}
+
+void CommandContext::begin_gpu_timing() {
+    std::scoped_lock _{this->mtx};
+
+    if (!this->gpu_timing_enabled || this->timestamp_query_heap == nullptr || this->cmd_list == nullptr) {
+        return;
+    }
+
+    // The previous submission has completed (wait() was called before re-recording), so its
+    // resolved timestamps are safe to read back now.
+    if (this->gpu_timing_pending && this->timestamp_readback != nullptr) {
+        this->gpu_timing_pending = false;
+
+        uint64_t* mapped = nullptr;
+        D3D12_RANGE read_range{0, sizeof(uint64_t) * 2};
+
+        if (SUCCEEDED(this->timestamp_readback->Map(0, &read_range, reinterpret_cast<void**>(&mapped))) && mapped != nullptr) {
+            const uint64_t start = mapped[0];
+            const uint64_t end = mapped[1];
+
+            D3D12_RANGE write_range{0, 0};
+            this->timestamp_readback->Unmap(0, &write_range);
+
+            auto command_queue = g_framework->get_d3d12_hook()->get_command_queue();
+            uint64_t freq = 0;
+
+            if (command_queue != nullptr && SUCCEEDED(command_queue->GetTimestampFrequency(&freq)) && freq != 0 && end >= start) {
+                this->last_gpu_time_ms = (double)(end - start) * 1000.0 / (double)freq;
+
+                // Per-instance throttle (NOT the shared-static SPDLOG_INFO_EVERY_N_SEC macro): that
+                // macro's static timer lives at this call site and would be shared across every
+                // CommandContext/label, starving out all but the first label to log each second.
+                const auto now = std::chrono::steady_clock::now();
+                if (now - this->last_gpu_time_log >= std::chrono::seconds(1)) {
+                    this->last_gpu_time_log = now;
+                    SPDLOG_INFO("[GPU_TIMING] {} = {:.3f} ms", utility::narrow(this->gpu_timing_label), this->last_gpu_time_ms);
+                }
+            }
+        }
+    }
+
+    this->cmd_list->EndQuery(this->timestamp_query_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0);
+    this->gpu_timing_active = true;
+}
+
+void CommandContext::end_gpu_timing() {
+    std::scoped_lock _{this->mtx};
+
+    if (!this->gpu_timing_active || this->timestamp_query_heap == nullptr || this->cmd_list == nullptr) {
+        return;
+    }
+
+    this->cmd_list->EndQuery(this->timestamp_query_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 1);
+    // Ensure execute() runs (and resolves) even if no other commands were recorded.
+    this->has_commands = true;
 }
 }

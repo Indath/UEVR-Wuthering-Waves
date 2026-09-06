@@ -828,6 +828,13 @@ std::optional<std::reference_wrapper<XrCompositionLayerQuad>> OverlayComponent::
 
     layer.type = XR_TYPE_COMPOSITION_LAYER_QUAD;
     const auto& ui_swapchain = vr->m_openxr->swapchains[(uint32_t)swapchain];
+
+    // Validate swapchain handle is not null before using it
+    if (ui_swapchain.handle == XR_NULL_HANDLE) {
+        SPDLOG_WARN("[generate_slate_quad] Swapchain handle is XR_NULL_HANDLE for swapchain index {} - skipping layer", (uint32_t)swapchain);
+        return std::nullopt;
+    }
+
     layer.subImage.swapchain = ui_swapchain.handle;
     layer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
     layer.subImage.imageRect.offset.x = 0;
@@ -974,6 +981,13 @@ std::optional<std::reference_wrapper<XrCompositionLayerCylinderKHR>> OverlayComp
 
     layer.type = XR_TYPE_COMPOSITION_LAYER_CYLINDER_KHR;
     const auto& ui_swapchain = vr->m_openxr->swapchains[(uint32_t)swapchain];
+
+    // Validate swapchain handle is not null before using it
+    if (ui_swapchain.handle == XR_NULL_HANDLE) {
+        SPDLOG_WARN("[generate_slate_cylinder] Swapchain handle is XR_NULL_HANDLE for swapchain index {} - skipping layer", (uint32_t)swapchain);
+        return std::nullopt;
+    }
+
     layer.subImage.swapchain = ui_swapchain.handle;
     layer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
     layer.subImage.imageRect.offset.x = 0;
@@ -1077,6 +1091,13 @@ std::optional<std::reference_wrapper<XrCompositionLayerQuad>> OverlayComponent::
 
     layer.type = XR_TYPE_COMPOSITION_LAYER_QUAD;
     const auto& ui_swapchain = vr->m_openxr->swapchains[(uint32_t)runtimes::OpenXR::SwapchainIndex::FRAMEWORK_UI];
+
+    // Validate swapchain handle is not null before using it
+    if (ui_swapchain.handle == XR_NULL_HANDLE) {
+        SPDLOG_WARN("[generate_framework_ui_quad] Swapchain handle is XR_NULL_HANDLE for FRAMEWORK_UI - skipping layer");
+        return std::nullopt;
+    }
+
     layer.subImage.swapchain = ui_swapchain.handle;
     layer.subImage.imageRect.offset.x = 0;
     layer.subImage.imageRect.offset.y = 0;
@@ -1113,9 +1134,16 @@ std::optional<std::reference_wrapper<XrCompositionLayerQuad>> OverlayComponent::
     // Adjust size_meters based on scaling factor.
     const float adjusted_size_meters = size_meters * scale_factor;
 
-    // Compute the new dimensions in meters.
-    const auto meters_w = (float)ui_swapchain.width / (float)ui_swapchain.height * adjusted_size_meters;
+    // Compute the new dimensions in meters, with protection against uninitialized swapchain dimensions.
+    // When entering certain menus, swapchain might be 0-sized, so guard against division by zero.
+    const float swapchain_aspect = (ui_swapchain.height > 0) ? ((float)ui_swapchain.width / (float)ui_swapchain.height) : (16.0f / 9.0f);
+    const auto meters_w = swapchain_aspect * adjusted_size_meters;
     const auto meters_h = adjusted_size_meters;
+
+    if (ui_swapchain.height == 0) {
+        SPDLOG_WARN("[generate_framework_ui_quad] Swapchain height is 0 (width={}) - using fallback 16:9 aspect ratio. swapchain_ptr={:p}", 
+                    ui_swapchain.width, (void*)&ui_swapchain);
+    }
 
     layer.size = {meters_w, meters_h};
 
