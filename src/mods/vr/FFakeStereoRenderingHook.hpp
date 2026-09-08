@@ -3,6 +3,8 @@
 #include <memory>
 #include <array>
 #include <atomic>
+#include <algorithm>
+#include <cmath>
 
 #include <SafetyHook.hpp>
 
@@ -392,6 +394,94 @@ public:
         m_skip_next_adjust_view_rect = true;
     }
 
+    uint64_t get_view_target_generation() const {
+        return m_view_target_generation;
+    }
+
+    // Called at the moment a view-target/scene-capture reallocation is actually committed (not merely
+    // requested). Bumps the "epoch" counter so downstream consumers (scene capture bind, eye composite,
+    // OpenXR end_frame submission) can log/verify which texture generation they are operating on, to
+    // diagnose ghosting/double-image artifacts caused by stale texture content being composited/
+    // submitted across a reallocation boundary.
+    uint64_t bump_view_target_generation() {
+        return ++m_view_target_generation;
+    }
+
+    // DIAG: tracks how long the scene capture render target has been continuously reporting null
+    // while the compositor keeps presenting a stale last-known-good texture (see D3D12Component's
+    // "keeping last-known-good scene capture texture" path). Used to drive both a manual log marker
+    // and a real-time in-headset visual indicator so the user can correlate perceived blur/double-
+    // image moments against this specific freeze condition instead of guessing at timestamps.
+    void report_scene_capture_stall_frame(bool is_stalled) {
+        if (is_stalled) {
+            if (m_scene_capture_stall_start == std::chrono::steady_clock::time_point{}) {
+                m_scene_capture_stall_start = std::chrono::steady_clock::now();
+            }
+        } else {
+            m_scene_capture_stall_start = std::chrono::steady_clock::time_point{};
+        }
+    }
+
+    // Returns how long (in ms) the stall has been ongoing, or 0 if not currently stalled.
+    uint64_t get_scene_capture_stall_duration_ms() const {
+        if (m_scene_capture_stall_start == std::chrono::steady_clock::time_point{}) {
+            return 0;
+        }
+
+        return (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - m_scene_capture_stall_start).count();
+    }
+
+    bool is_scene_capture_stalled() const {
+        return m_scene_capture_stall_start != std::chrono::steady_clock::time_point{};
+    }
+
+    // DIAG/TRIGGER: heartbeat for LGUI's per-frame draw hook (lgui_slot24_hook). Wuthering Waves blanks
+    // its LGUI-driven UI/quad during certain skill/VFX animations (the user has observed the UI go blank
+    // and return to stock UI once the animation ends) - LGUI's draw call simply stops firing for that
+    // window, which is a much more direct signal for "is a skill/VFX animation currently playing" than
+    // bCinematicMode (which only reflects Sequencer/Matinee cutscenes, not this kind of skill-driven UI
+    // hide). Call this once per LGUI draw invocation to record the heartbeat.
+    void report_lgui_draw_heartbeat() {
+        m_lgui_last_draw_time = std::chrono::steady_clock::now();
+        m_lgui_ever_drawn = true;
+    }
+
+    // Returns how long (in ms) it has been since LGUI last actually drew a frame. Returns 0 if LGUI has
+    // never drawn yet (e.g. very early boot), so callers should treat that as "not stalled" rather than
+    // "infinitely stalled".
+    uint64_t get_lgui_draw_silence_duration_ms() const {
+        if (!m_lgui_ever_drawn) {
+            return 0;
+        }
+
+        return (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - m_lgui_last_draw_time).count();
+    }
+
+    // DIAG/TRIGGER: call whenever calculate_stereo_view_offset's NSF sync-pose branch measures a
+    // meaningful Pass1/Pass2 rotation or position delta for the current frame - i.e. the live animated
+    // camera pose itself changed between the two eyes' render calls this frame (skill/VFX/dash camera
+    // motion), as opposed to being stationary. This is a direct per-frame measurement of the actual
+    // "camera motion vector changing due to animation" condition, unlike bCinematicMode/UI-blank which
+    // only correlate with unrelated engine states (loading screens, Sequencer cutscenes).
+    void report_pose_divergence_event() {
+        m_last_pose_divergence_time = std::chrono::steady_clock::now();
+        m_had_pose_divergence = true;
+    }
+
+    // Returns how long (in ms) it has been since the last pose-divergence event. Returns UINT64_MAX if
+    // no divergence has ever been observed yet, so callers can distinguish "never happened" from
+    // "happened a long time ago" (both should be treated as "not currently diverging").
+    uint64_t get_ms_since_last_pose_divergence() const {
+        if (!m_had_pose_divergence) {
+            return UINT64_MAX;
+        }
+
+        return (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - m_last_pose_divergence_time).count();
+    }
+
     // The engine's own AdjustViewRect call decides, independently of D3D12Component/D3D11Component's
     // frame-parity-based is_left_eye_frame classification, which physical x-offset half of the
     // double-wide backbuffer each eye's scene gets rendered into. These two "which eye is this"
@@ -627,6 +717,132 @@ private:
 
     Rotator<float> m_last_afr_rotation{};
     Rotator<double> m_last_afr_rotation_double{};
+
+    // Monotonically increasing "epoch" for the current view-target/scene-capture texture identity.
+    // Bumped every time set_should_recreate_textures(true) is called (i.e. whenever a reallocation
+    // is requested). Logged alongside texture pointers at reallocation, scene-capture bind/retention,
+    // eye composite copy/blit, and OpenXR end_frame submission so a captured log can reveal whether a
+    // frame ever mixes content from two different generations (a race producing single-image ghosting/
+    // double-image artifacts independent of stereo/eye desync).
+    uint64_t m_view_target_generation{0};
+
+    // DIAG: epoch (steady_clock time_point) when the scene capture RT most recently began
+    // continuously reporting null while the compositor is retaining a stale last-known-good
+    // texture. Epoch value (default-constructed) means "not currently stalled". See
+    // report_scene_capture_stall_frame()/get_scene_capture_stall_duration_ms()/is_scene_capture_stalled().
+    std::chrono::steady_clock::time_point m_scene_capture_stall_start{};
+
+    // DIAG/TRIGGER: last time LGUI's render-thread draw hook (lgui_slot24_hook) actually fired, and
+    // whether it has ever fired at all yet. See report_lgui_draw_heartbeat()/get_lgui_draw_silence_duration_ms().
+    std::chrono::steady_clock::time_point m_lgui_last_draw_time{};
+    bool m_lgui_ever_drawn{false};
+
+    // DIAG/TRIGGER: last time the NSF sync-pose code (calculate_stereo_view_offset) observed a
+    // meaningful rotation/position divergence between Pass1 (left) and Pass2 (right) within the SAME
+    // engine frame - i.e. the live animated camera actually moved between the two eyes' render calls.
+    // This is a direct measurement of "camera motion vectors changing due to animation/VFX", which is
+    // exactly the condition the user identified as the real trigger for the disorienting right-eye lag
+    // (as opposed to bCinematicMode or UI-blank, which don't correlate). See
+    // report_pose_divergence_event()/get_ms_since_last_pose_divergence().
+    std::chrono::steady_clock::time_point m_last_pose_divergence_time{};
+    bool m_had_pose_divergence{false};
+
+    // NSF (non-AFR) equivalent of the AFR rotation-cache above:
+    // location for the current frame so Pass2 (right eye) can be forced to reuse it, eliminating a
+    // momentary eye desync when the live animated camera pose changes between the two eyes' render
+    // calls within the same frame (camera-transition animations). Gated behind
+    // is_native_stereo_fix_sync_pose_enabled(); see calculate_stereo_view_offset().
+    Rotator<float> m_nsf_sync_pose_rotation{};
+    Rotator<double> m_nsf_sync_pose_rotation_double{};
+    Vector3f m_nsf_sync_pose_location{};
+    Vector3d m_nsf_sync_pose_location_double{};
+    uint32_t m_nsf_sync_pose_frame_count{0};
+    bool m_nsf_sync_pose_have_left{false};
+
+    // HARD-CUT detection state for the NSF sync-pose blend (see calculate_stereo_view_offset). Plain
+    // magnitude thresholds alone (mirroring the Lua cutscene-actor reset script's >10deg/>30unit test)
+    // turned out to be too sensitive here because, unlike the Lua script (which only ever evaluates
+    // that test while the view target is an actual CineCameraActor, i.e. never during normal player-
+    // controlled input), our C++ check runs every frame regardless of what is driving the camera - so
+    // a normal fast thumbstick turn can rack up >10 degrees of Pass1/Pass2 divergence in a single frame
+    // and would get misclassified as a hard cut. To compensate we track a smoothed rolling baseline
+    // (EMA) of recent per-frame deltas and only call it a hard cut if the current delta is both an
+    // abrupt SPIKE relative to that recent baseline (a real discontinuity) AND above a raised absolute
+    // floor (a safety net for cases where the whole preceding window was already elevated, e.g. very
+    // fast continuous spinning).
+    float m_nsf_pose_delta_rot_ema{0.0f};
+    float m_nsf_pose_delta_pos_ema{0.0f};
+    uint32_t m_nsf_pose_delta_sample_count{0};
+
+    // Returns true if the given per-frame rotation/position delta should be treated as a hard camera
+    // cut (full instant snap) rather than continuous motion (blended). Updates the rolling EMA
+    // baseline as a side effect, so this must be called at most once per frame from the NSF sync-pose
+    // branch.
+    bool is_nsf_sync_pose_hard_cut(float rot_delta, float pos_delta) {
+        constexpr float kEmaAlpha = 0.1f;
+        constexpr float kSpikeMultiplier = 6.0f;
+        constexpr float kMinBaselineRot = 2.0f;   // degrees, avoids div-by-near-zero baseline spikes
+        constexpr float kMinBaselinePos = 5.0f;   // units
+        constexpr float kHardCutRotFloor = 25.0f; // degrees - raised safety-net floor
+        constexpr float kHardCutPosFloor = 80.0f; // units - raised safety-net floor
+        constexpr uint32_t kMinSamplesForSpike = 10;
+
+        const auto rot_baseline = (std::max)(m_nsf_pose_delta_rot_ema, kMinBaselineRot);
+        const auto pos_baseline = (std::max)(m_nsf_pose_delta_pos_ema, kMinBaselinePos);
+
+        const bool has_enough_samples = m_nsf_pose_delta_sample_count >= kMinSamplesForSpike;
+        const bool is_spike = has_enough_samples &&
+            (rot_delta > rot_baseline * kSpikeMultiplier || pos_delta > pos_baseline * kSpikeMultiplier);
+        const bool is_over_floor = rot_delta > kHardCutRotFloor || pos_delta > kHardCutPosFloor;
+
+        // Update the rolling baseline AFTER evaluating this frame so the spike itself doesn't get
+        // absorbed into the baseline before we've judged it.
+        m_nsf_pose_delta_rot_ema = (m_nsf_pose_delta_sample_count == 0)
+            ? rot_delta
+            : std::lerp(m_nsf_pose_delta_rot_ema, rot_delta, kEmaAlpha);
+        m_nsf_pose_delta_pos_ema = (m_nsf_pose_delta_sample_count == 0)
+            ? pos_delta
+            : std::lerp(m_nsf_pose_delta_pos_ema, pos_delta, kEmaAlpha);
+        ++m_nsf_pose_delta_sample_count;
+
+        return is_spike && is_over_floor;
+    }
+
+    // DIAG: gradual hard-cut convergence state. Instead of instantly snapping Pass2's rotation/
+    // position to Pass1's cached pose the moment a hard cut is detected (blend_alpha=1.0 applied on a
+    // single frame), this ramps an effective blend_alpha from 0 up to 1 linearly over
+    // duration_ms once a hard cut fires, so the two eyes ease back into agreement over roughly a
+    // second instead of one eye teleporting into place. Purely diagnostic/toggle-gated - see
+    // is_diag_gradual_hard_cut_convergence_enabled() in VR.hpp.
+    std::chrono::steady_clock::time_point m_nsf_hard_cut_start_time{};
+    bool m_nsf_hard_cut_active{false};
+
+    // Must be called at most once per Pass2 (true_index==1) call per frame, mirroring
+    // is_nsf_sync_pose_hard_cut() above. trigger_now should be (is_hard_cut || force_full) for the
+    // current frame. Returns the ramped alpha to use in place of the instant 1.0 snap; returns 0.0f
+    // once no hard cut is active/being converged (caller should fall back to the normal continuous
+    // blend_alpha in that case).
+    float get_nsf_gradual_convergence_alpha(bool trigger_now, float duration_ms) {
+        const auto now = std::chrono::steady_clock::now();
+
+        if (trigger_now) {
+            m_nsf_hard_cut_start_time = now;
+            m_nsf_hard_cut_active = true;
+        }
+
+        if (!m_nsf_hard_cut_active) {
+            return 0.0f;
+        }
+
+        const auto elapsed_ms = (float)std::chrono::duration_cast<std::chrono::milliseconds>(now - m_nsf_hard_cut_start_time).count();
+
+        if (duration_ms <= 0.0f || elapsed_ms >= duration_ms) {
+            m_nsf_hard_cut_active = false;
+            return 1.0f;
+        }
+
+        return elapsed_ms / duration_ms;
+    }
 
     Rotator<float> m_last_pre_rotation{};
     Rotator<double> m_last_pre_rotation_double{};

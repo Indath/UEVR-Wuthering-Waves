@@ -123,14 +123,14 @@ VRRuntime::Error OpenXR::synchronize_frame(std::optional<uint32_t> frame_count) 
     // cant sync frame between begin and endframe
     if (!this->session_ready || this->frame_began) {
         if (this->frame_began) {
-            spdlog::info("Frame already began, skipping xrWaitFrame call.");
+            SPDLOG_INFO_EVERY_N_SEC(2, "Frame already began, skipping xrWaitFrame call.");
         }
         
         return VRRuntime::Error::UNSPECIFIED;
     }
 
     if (this->frame_synced) {
-        spdlog::info("Frame already synchronized, skipping xrWaitFrame call.");
+        SPDLOG_INFO_EVERY_N_SEC(2, "Frame already synchronized, skipping xrWaitFrame call.");
 
         return VRRuntime::Error::SUCCESS;
     }
@@ -1741,6 +1741,19 @@ XrResult OpenXR::end_frame(const std::vector<XrCompositionLayerBaseHeader*>& qua
         return XR_ERROR_CALL_ORDER_INVALID;
     }
 
+    // DIAG (single-image ghosting/double-image race hunt): tag the view-target generation that was
+    // current at the moment this frame's eye textures are submitted to the compositor. Correlate this
+    // against the "Reallocating view target!"/composite/scene-capture-retention logs in
+    // FFakeStereoRenderingHook.cpp and D3D11/D3D12Component.cpp - if the generation logged here lags
+    // behind (or straddles) a reallocation that already happened earlier in the same frame, that is a
+    // candidate for stale-texture content being submitted to the runtime across a reallocation boundary.
+    {
+        const auto& ffsr = VR::get()->get_fake_stereo_hook();
+        if (ffsr != nullptr) {
+            SPDLOG_INFO_EVERY_N_SEC(2, "[VR][DIAG] OpenXR::end_frame submitting frame (view_target_generation={})", ffsr->get_view_target_generation());
+        }
+    }
+
     const auto is_afr = VR::get()->is_using_afr();
 
     if (is_afr) {
@@ -1915,7 +1928,38 @@ XrResult OpenXR::end_frame(const std::vector<XrCompositionLayerBaseHeader*>& qua
 
                 depth_layers[i].nearZ = FLT_MAX;
                 depth_layers[i].farZ = nearz * VR::get()->get_depth_scale();
-                
+
+                // DIAG: the depth-based compositor reprojection (XR_KHR_composition_layer_depth) is
+                // entirely dependent on farZ (derived from the game's near-clipping-plane value and
+                // world_to_meters) being stable frame-to-frame. If the game briefly changes its near
+                // clip plane during an animation/camera-cut (common for cutscene/ability cameras), farZ
+                // jumps to a different value for those frames, which would make the runtime's own
+                // depth-reprojection misinterpret the submitted depth buffer for exactly that duration -
+                // producing a transient double-image/ghosting artifact that is invisible in screenshots
+                // (compositor-only effect) and only visible in-headset, matching a reported symptom that
+                // survived disabling TAA/DLSS/Lumen entirely. Log farZ/nearz/wtm whenever farZ changes
+                // by a large relative amount between consecutive frames for this eye index.
+                {
+                    static thread_local float s_diag_last_farz[2] = {-1.0f, -1.0f};
+                    static thread_local bool s_diag_has_last_farz[2] = {false, false};
+
+                    if (i < 2) {
+                        const auto new_farz = depth_layers[i].farZ;
+
+                        if (s_diag_has_last_farz[i] && s_diag_last_farz[i] != 0.0f) {
+                            const auto ratio = new_farz / s_diag_last_farz[i];
+
+                            if (ratio > 1.5f || ratio < 0.667f) {
+                                SPDLOG_WARN("[DIAG] depth_layers[{}].farZ JUMP: {:.4f} -> {:.4f} (ratio={:.3f}) nearz={:.6f} wtm={:.4f} depth_scale={:.4f}",
+                                    i, s_diag_last_farz[i], new_farz, ratio, nearz, wtm, VR::get()->get_depth_scale());
+                            }
+                        }
+
+                        s_diag_last_farz[i] = new_farz;
+                        s_diag_has_last_farz[i] = true;
+                    }
+                }
+
                 projection_layer_views[i].next = &depth_layers[i];
             }
         }

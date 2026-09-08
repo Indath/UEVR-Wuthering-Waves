@@ -5,6 +5,7 @@
 #include <memory>
 #include <string>
 #include <atomic>
+#include <optional>
 
 #include <sdk/Math.hpp>
 
@@ -333,10 +334,13 @@ public:
         return m_controllers;
     }
 
-    bool is_using_controllers() const {
-        return m_controller_test_mode || (m_controllers_allowed->value() &&
-        is_hmd_active() && !m_controllers.empty() && (std::chrono::steady_clock::now() - m_last_controller_update) <= std::chrono::seconds((int32_t)m_motion_controls_inactivity_timer->value()));
-    }
+    // NOTE: Deliberately NOT defined inline here. This function is called from many places across
+    // the DLL (game thread action-state updates, render-thread overlay/slate quad generation, etc.),
+    // and being re-inlined separately at each call site with different surrounding register pressure
+    // was implicated in a crash where a float bit-pattern (e.g. 1.0f == 0x3F800000) was misread as
+    // part of a pointer, causing an access violation reading a bogus address. Keeping a single
+    // out-of-line compiled instance (defined in VR.cpp) avoids that class of inlining/codegen issue.
+    bool is_using_controllers() const;
 
     bool is_using_controllers_within(std::chrono::seconds seconds) const {
         return m_controllers_allowed->value() && is_hmd_active() && !m_controllers.empty() && (std::chrono::steady_clock::now() - m_last_controller_update) <= seconds;
@@ -616,11 +620,41 @@ public:
         // it - the UI was rendered at HMD resolution and Slate's hit-testing/focus no longer lined up
         // with what was drawn on screen). Allow it to run even while is_using_afr() is true when this
         // option is enabled.
-        if (m_native_stereo_fix_allow_with_afr->value()) {
-            return m_native_stereo_fix->value() && !m_native_stereo_fix_suspended.load(std::memory_order_relaxed);
+        const auto raw_value = m_native_stereo_fix->value();
+        const auto allow_with_afr = m_native_stereo_fix_allow_with_afr->value();
+        const auto using_afr = is_using_afr();
+        const auto suspended = m_native_stereo_fix_suspended.load(std::memory_order_relaxed);
+
+        bool result{};
+
+        if (allow_with_afr) {
+            result = raw_value && !suspended;
+        } else {
+            result = raw_value && !using_afr && !suspended;
         }
 
-        return m_native_stereo_fix->value() && !is_using_afr() && !m_native_stereo_fix_suspended.load(std::memory_order_relaxed);
+        // DIAG: the "Enabled" checkbox under Native Stereo Fix can appear unchecked in the UI while
+        // the composited/effective result still reads true. Log every input to the decision (not just
+        // the final result) so a raw_value=true (checkbox not actually persisted/applied), a stuck
+        // suspended=true->false transition, or an unexpected using_afr flip can each be told apart.
+        {
+            static uint64_t s_diag_call_count = 0;
+            static bool s_diag_last_result = false;
+            static bool s_diag_has_last_result = false;
+            ++s_diag_call_count;
+
+            const auto result_changed = !s_diag_has_last_result || s_diag_last_result != result;
+
+            if (result_changed || s_diag_call_count % 601 == 1) {
+                SPDLOG_INFO("[DIAG] is_native_stereo_fix_enabled (#{}): raw_value={} allow_with_afr={} using_afr={} suspended={} -> result={}",
+                    s_diag_call_count, raw_value, allow_with_afr, using_afr, suspended, result);
+            }
+
+            s_diag_last_result = result;
+            s_diag_has_last_result = true;
+        }
+
+        return result;
     }
 
     // Automatically flips Native Stereo Fix off (falling back to its already-working "disabled"
@@ -640,6 +674,18 @@ public:
         return m_native_stereo_fix_same_pass->value();
     }
 
+    // DIAG/EXPERIMENTAL: re-enables the previously-disabled StereoPass=PRIMARY override for the
+    // secondary (right-eye) view inside sceneview_constructor. This WAS confirmed in an earlier
+    // session to cause full black-screen (main menu characters black, both eyes black in-game)
+    // under some conditions, which is why it was disabled and left dormant behind the (now
+    // effectively no-op) "Use Same Stereo Pass" toggle. This separate toggle exists purely to
+    // re-test that exact code path with decisive added logging around set_stereo_pass() and the
+    // FSceneView constructor entry, to correlate exactly which frames/views/conditions the
+    // black-screen recurs under. Defaults to OFF - only enable intentionally for diagnostics.
+    bool is_native_stereo_fix_same_pass_force_primary_enabled() const {
+        return m_native_stereo_fix_same_pass_force_primary->value();
+    }
+
     bool is_native_stereo_fix_right_eye_shadows_enabled() const {
         return m_native_stereo_fix_right_eye_shadows->value();
     }
@@ -650,6 +696,197 @@ public:
 
     bool is_native_stereo_fix_null_pass2_view_state_enabled() const {
         return m_native_stereo_fix_null_pass2_view_state->value();
+    }
+
+    bool is_native_stereo_fix_sync_pose_enabled() const {
+        return m_native_stereo_fix_sync_pose->value();
+    }
+
+    // NOTE: position sync used to be a separate opt-in toggle from rotation sync. Direct in-headset
+    // testing proved that freezing ONLY rotation or ONLY position (via the manual Camera Freeze debug
+    // tool) still produced the left/right eye desync - freezing BOTH simultaneously was required to
+    // eliminate it. This makes sense: Pass1/Pass2 reading a different combined pose (position+rotation
+    // together) is the actual divergence, so correcting only one component still leaves the two eyes
+    // rendering from different world transforms. Position sync is therefore no longer independently
+    // toggleable - it's always applied together with rotation sync (both driven by the single
+    // NativeStereoFixSyncPose toggle), since applying only one is now known to not work.
+    bool is_native_stereo_fix_sync_pose_position_enabled() const {
+        return m_native_stereo_fix_sync_pose->value();
+    }
+
+    // Blend factor used when forcing Pass2 (right eye) rotation/position toward Pass1 (left eye)'s
+    // cached pose in calculate_stereo_view_offset(). 1.0 = old behavior (Pass2 fully snaps to Pass1's
+    // pose, i.e. the right eye completely stops tracking the live animated camera for that frame,
+    // which reads as the right eye "lagging"/freezing relative to the left). 0.0 = sync disabled (Pass2
+    // keeps its own live pose, full desync). A value in between splits the difference so the right eye
+    // still moves with the animation (reducing the disorienting one-sided lag) at the cost of not fully
+    // eliminating desync - trading a smaller, more symmetric-feeling error for the previous full/frozen
+    // one-eye error.
+    float get_native_stereo_fix_sync_pose_blend_alpha() const {
+        return m_native_stereo_fix_sync_pose_blend_alpha->value();
+    }
+
+    // DIAG: test-only toggle. When enabled, a detected hard-cut no longer instantly snaps Pass2's
+    // rotation/position to Pass1's pose in a single frame (blend_alpha=1.0 applied once) - instead the
+    // effective alpha ramps from 0 up to 1 linearly over
+    // get_diag_gradual_hard_cut_convergence_duration_ms(), so the two eyes ease back into agreement
+    // over that window instead of one eye teleporting into place. Purely additive/test toggle so it
+    // can be A/B compared against the existing instant-snap behavior before deciding whether to make
+    // it the default.
+    bool is_diag_gradual_hard_cut_convergence_enabled() const {
+        return m_diag_gradual_hard_cut_convergence->value();
+    }
+
+    float get_diag_gradual_hard_cut_convergence_duration_ms() const {
+        return (float)m_diag_gradual_hard_cut_convergence_duration_ms->value();
+    }
+
+    // DIAG: normally the full blend_alpha=1.0 snap only applies on a detected hard-cut-grade spike
+    // (see is_nsf_sync_pose_hard_cut()); ordinary small per-frame divergence during continuous motion
+    // uses the slider's blend_alpha instead. This proved insufficient for a reported multi-frame
+    // divergence (one eye snapping instantly to a UI/menu camera target while the other eye visibly
+    // interpolates/zooms back into alignment over ~1 second when a UI menu is opened during/after a
+    // skill animation) - so this forces the hard-cut branch (full 1.0 snap, unconditionally) on EVERY
+    // Pass2 call while enabled, regardless of the spike-detector's verdict, and logs unconditionally
+    // (not throttled) so we can confirm with certainty that the sync is actually engaging on every
+    // single frame during the reported glitch window, not just on detected spikes.
+    bool is_native_stereo_fix_sync_pose_force_full_enabled() const {
+        return m_native_stereo_fix_sync_pose_force_full->value();
+    }
+
+    // DIAG: gates the in-headset visual indicator (see D3D12Component's right-eye composite) that
+    // flashes when the scene capture RT has been continuously null for a visually-meaningful amount
+    // of time and the compositor is presenting a stale last-known-good texture instead. Lets the user
+    // confirm in real time whether a perceived blur/double-image moment lines up with this condition.
+    bool is_scene_capture_stall_indicator_enabled() const {
+        return m_scene_capture_stall_indicator->value();
+    }
+
+    // DIAG: user-triggered marker key. When pressed, logs the current timestamp plus the live
+    // scene-capture stall state, so a captured log can be greped for the exact moment the user
+    // perceived a blur/double-image glitch instead of relying on estimated minute-level timestamps.
+    bool is_glitch_marker_key_down() const {
+        return GetAsyncKeyState(m_glitch_marker_vkey) & 0x8000;
+    }
+
+    // DIAG: frame dump-on-marker BURST. Pressing the glitch marker key arms a TIME-based dump window
+    // (not a fixed frame count) so a multi-frame divergence (e.g. one eye snapping instantly to a
+    // UI/menu camera target while the other eye visibly interpolates/zooms back into alignment over
+    // roughly a second) can be seen unfolding over the ACTUAL reported duration, regardless of the
+    // live framerate at the time (a fixed frame count would only cover ~66ms of a ~1s event at 90fps,
+    // and would cover an even smaller fraction if framerate dips during the very glitch being
+    // captured). The D3D12 compositor (which is the only place that has both the left/game texture
+    // and the right/scene-capture texture live at once) checks this once per frame while the window
+    // is active and, every Nth frame (see GLITCH_FRAME_DUMP_STRIDE), writes the composited frame to
+    // disk tagged with a shared burst id + sequence index - striding avoids ~90 full-resolution disk
+    // writes in one second, which could itself introduce stutter that pollutes the very capture we're
+    // trying to take.
+    static constexpr int64_t GLITCH_FRAME_DUMP_WINDOW_MS = 1200;
+    static constexpr uint32_t GLITCH_FRAME_DUMP_STRIDE = 3; // dump every 3rd frame (~30fps sampling at 90fps)
+
+    void request_glitch_frame_dump() {
+        m_glitch_frame_dump_burst_id.fetch_add(1, std::memory_order_relaxed);
+        m_glitch_frame_dump_seq.store(0, std::memory_order_relaxed);
+        m_glitch_frame_dump_stride_counter.store(0, std::memory_order_relaxed);
+
+        const auto deadline_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count() + GLITCH_FRAME_DUMP_WINDOW_MS;
+        m_glitch_frame_dump_deadline_ms.store(deadline_ms, std::memory_order_relaxed);
+    }
+
+    // Returns the next sequence index to use for this dump if a dump should happen this frame
+    // (window still active AND this is a stride-selected frame), or std::nullopt otherwise.
+    std::optional<uint32_t> consume_glitch_frame_dump_request() {
+        const auto deadline_ms = m_glitch_frame_dump_deadline_ms.load(std::memory_order_relaxed);
+
+        if (deadline_ms == 0) {
+            return std::nullopt;
+        }
+
+        const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+
+        if (now_ms >= deadline_ms) {
+            // Window expired; disarm so we don't keep checking the clock every frame for nothing.
+            m_glitch_frame_dump_deadline_ms.store(0, std::memory_order_relaxed);
+            return std::nullopt;
+        }
+
+        if ((m_glitch_frame_dump_stride_counter.fetch_add(1, std::memory_order_relaxed) % GLITCH_FRAME_DUMP_STRIDE) != 0) {
+            return std::nullopt;
+        }
+
+        return m_glitch_frame_dump_seq.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    uint32_t get_glitch_frame_dump_burst_id() const {
+        return m_glitch_frame_dump_burst_id.load(std::memory_order_relaxed);
+    }
+
+    // DIAG: opens a short verbose-logging window (see is_glitch_eye_diag_window_active()) alongside
+    // the frame dump above. Ability/cutscene VFX (e.g. camera-facing translucent afterimage effects)
+    // can desync per-eye stereo separation without the main scene's camera pose/view_rect/generation
+    // diverging at all, so this lets us log the actual computed per-eye eye_separation/head_offset
+    // vectors in calculate_stereo_view_offset for a few seconds around the marker press, instead of
+    // relying on a single-frame snapshot that can't show the effect's per-eye behavior over time.
+    void request_glitch_eye_diag_window() {
+        const auto deadline_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count() + 3000;
+        m_glitch_eye_diag_deadline_ms.store(deadline_ms, std::memory_order_relaxed);
+    }
+
+    bool is_glitch_eye_diag_window_active() const {
+        const auto deadline_ms = m_glitch_eye_diag_deadline_ms.load(std::memory_order_relaxed);
+        const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        return now_ms < deadline_ms;
+    }
+
+    bool is_diag_log_final_eye_pose_enabled() const {
+        return m_diag_log_final_eye_pose->value();
+    }
+
+    bool is_diag_suppress_extra_view_enabled() const {
+        return m_diag_suppress_extra_view->value();
+    }
+
+    int32_t get_diag_suppress_view_index() const {
+        return m_diag_suppress_view_index->value();
+    }
+
+    bool is_diag_log_true_index_alias_enabled() const {
+        return m_diag_log_true_index_alias->value();
+    }
+
+    bool is_diag_log_world_to_meters_enabled() const {
+        return m_diag_log_world_to_meters->value();
+    }
+
+    bool is_diag_log_raw_view_index_enabled() const {
+        return m_diag_log_raw_view_index->value();
+    }
+
+    // See the comment at its usage site in calculate_stereo_view_offset for full rationale: excludes
+    // a specific raw view_index from ever writing to/reading from the NSF sync-pose cache (NOT a full
+    // render skip - rendering of that index, if any, is untouched). Confirmed via in-headset testing
+    // that view_index=1 does not correspond to a visible rendered eye, and it races with the real
+    // view_index=3 eye call on the same true_index, plausibly explaining eye-switching glitch reports.
+    bool is_diag_exclude_view_index_from_sync_cache_enabled() const {
+        return m_diag_exclude_view_index_from_sync_cache->value();
+    }
+
+    int32_t get_diag_exclude_view_index_from_sync_cache() const {
+        return m_diag_exclude_view_index_from_sync_cache_index->value();
+    }
+
+    // See usage site in calculate_stereo_view_offset. When the excluded view_index (above) is hit,
+    // this controls whether that view still receives the SAME synced rotation/position the real eyes
+    // converge to (just without writing its own result back into the cache), instead of being left
+    // completely untouched. Intended to fix shadow-cascade/occlusion-culling desync (index=1 appears
+    // to feed a sub-view-per-frame system like shadow depth passes, not a renderable eye) while
+    // preserving the existing eye blur/desync fix, which relies on that index never writing the cache.
+    bool is_diag_apply_synced_pose_to_excluded_view_index_enabled() const {
+        return m_diag_apply_synced_pose_to_excluded_view_index->value();
     }
 
     // Bitmask over sceneview_xref::eye_fields (bit N = flip the N-th discovered field). Default all.
@@ -665,6 +902,83 @@ public:
     bool is_native_stereo_fix_mirror_enabled() const {
         return m_native_stereo_fix_mirror->value();
     }
+
+    // Auto-mirror-on-cinematic: when enabled, the right eye automatically falls back to mirroring
+    // the left eye (same mechanism as the manual "Mirror Right Eye" toggle above) whenever the game's
+    // own APlayerController::bCinematicMode flag is set, which UE sets true during Sequencer/Matinee
+    // cutscenes. This targets the GPU-double-buffered VFX/foliage-wind desync (frozen/laggy right eye
+    // during camera transitions) that CPU-side frame-counter fixes could not touch - see
+    // is_in_cinematic_mode() for the underlying detection. Independent of the manual mirror toggle so
+    // either can be used/tested on its own.
+    bool is_native_stereo_fix_auto_mirror_on_cinematic_enabled() const {
+        return m_native_stereo_fix_auto_mirror_on_cinematic->value();
+    }
+
+    // Auto-mirror-on-UI-blank: when enabled, the right eye automatically falls back to mirroring the
+    // left eye whenever LGUI's draw hook has gone silent for at least m_lgui_draw_silence_threshold_ms -
+    // i.e. the game's own UI/quad has gone blank. NOTE: in testing this only fired on world load/menu
+    // transitions, NOT during the actual skill/VFX animations - kept as an optional secondary trigger
+    // (off by default) but superseded by auto-mirror-on-motion below for the animation-blur symptom.
+    bool is_native_stereo_fix_auto_mirror_on_ui_blank_enabled() const {
+        return m_native_stereo_fix_auto_mirror_on_ui_blank->value();
+    }
+
+    // Returns true if LGUI's draw hook has been silent long enough to be treated as "UI blanked" for
+    // the auto-mirror trigger. Returns false if the hook has never drawn yet (startup) since that is
+    // not a meaningful "blanked" state.
+    bool is_ui_blanked_for_mirror_trigger() const;
+
+    // Auto-mirror-on-motion: when enabled, the right eye automatically falls back to mirroring the left
+    // eye for a short window after NSF's sync-pose logic (calculate_stereo_view_offset) measures a
+    // meaningful Pass1/Pass2 rotation or position delta - i.e. the live animated camera pose itself is
+    // changing between the two eyes' render calls this frame. This directly targets "camera motion
+    // vectors changing due to animations/VFX", which is the actual condition behind the disorienting
+    // right-eye lag (bCinematicMode and UI-blank do not correlate with it). Defaults on.
+    bool is_native_stereo_fix_auto_mirror_on_motion_enabled() const {
+        return m_native_stereo_fix_auto_mirror_on_motion->value();
+    }
+
+    // Returns true if a pose-divergence event happened recently enough (within
+    // m_pose_divergence_mirror_window_ms) to be treated as "the camera is currently in an
+    // animation/VFX motion window" for the auto-mirror trigger.
+    bool is_camera_in_motion_for_mirror_trigger() const {
+        if (m_fake_stereo_hook == nullptr) {
+            return false;
+        }
+
+        return m_fake_stereo_hook->get_ms_since_last_pose_divergence() <= m_pose_divergence_mirror_window_ms;
+    }
+
+    // Combined decision for "should the right eye be a mirror of the left eye THIS frame" - true if
+    // the manual mirror toggle is on, auto-mirror-on-cinematic is enabled AND bCinematicMode==true,
+    // auto-mirror-on-UI-blank is enabled AND LGUI's UI draw has gone silent, or auto-mirror-on-motion is
+    // enabled AND the camera pose has recently diverged between eyes (animation/VFX motion).
+    bool should_mirror_right_eye_this_frame() {
+        if (is_native_stereo_fix_mirror_enabled()) {
+            return true;
+        }
+
+        if (is_native_stereo_fix_auto_mirror_on_cinematic_enabled() && is_in_cinematic_mode()) {
+            return true;
+        }
+
+        if (is_native_stereo_fix_auto_mirror_on_ui_blank_enabled() && is_ui_blanked_for_mirror_trigger()) {
+            return true;
+        }
+
+        if (is_native_stereo_fix_auto_mirror_on_motion_enabled() && is_camera_in_motion_for_mirror_trigger()) {
+            return true;
+        }
+
+        return false;
+    }
+
+    // Polls the local player controller's bCinematicMode bool property (set true by UE's Sequencer/
+    // Matinee cutscene system) via the same find_property/FBoolProperty pattern already used elsewhere
+    // in this codebase (e.g. bUsePawnControlRotation). Cheap: one controller lookup plus one cached
+    // property/bitmask read. Returns false (safe default - no auto-mirror) if the controller, its
+    // class, or the property itself cannot be resolved.
+    bool is_in_cinematic_mode();
 
     // Only report the tall-UI target fix as active when Native Stereo Fix itself is active AND the toggle is on.
     // In AFR / NSF OFF the LGUI canvas is not per-eye-tall, so growing the UI target would distort the UI.
@@ -691,6 +1005,15 @@ public:
     // submitting it to the compositor every frame.
     bool is_lgui_ui_redirect_disabled() const {
         return m_disable_lgui_ui_redirect->value();
+    }
+
+    // DIAG: A/B test to determine whether the runtime's own depth-based compositor reprojection
+    // (submitted via XR_KHR_composition_layer_depth, see OpenXR::end_frame) is responsible for a
+    // transient double-image/ghosting artifact seen only in-headset (not in screenshots) during
+    // animation/camera-cut transitions. Disabling this stops us from ever passing has_depth=true to
+    // end_frame, so the runtime falls back to orientation-only reprojection with no depth layer at all.
+    bool is_depth_submission_disabled() const {
+        return m_disable_depth_submission->value();
     }
 
     auto& get_fake_stereo_hook() {
@@ -966,6 +1289,15 @@ private:
     // See set_native_stereo_fix_suspended()/is_native_stereo_fix_enabled().
     std::atomic<bool> m_native_stereo_fix_suspended{false};
 
+    // See request_glitch_frame_dump()/consume_glitch_frame_dump_request().
+    std::atomic<int64_t> m_glitch_frame_dump_deadline_ms{0};
+    std::atomic<uint32_t> m_glitch_frame_dump_seq{0};
+    std::atomic<uint32_t> m_glitch_frame_dump_stride_counter{0};
+    std::atomic<uint32_t> m_glitch_frame_dump_burst_id{0};
+
+    // See request_glitch_eye_diag_window()/is_glitch_eye_diag_window_active().
+    std::atomic<int64_t> m_glitch_eye_diag_deadline_ms{0};
+
     uint32_t m_lowest_xinput_user_index{};
 
     std::chrono::nanoseconds m_last_input_delay{};
@@ -1027,6 +1359,79 @@ private:
     const ModToggle::Ptr m_disable_hdr_compositing{ ModToggle::create(generate_name("DisableHDRCompositing"), true, true) };
     const ModToggle::Ptr m_disable_hzbocclusion{ ModToggle::create(generate_name("DisableHZBOcclusion"), true, true) };
     const ModToggle::Ptr m_disable_instance_culling{ ModToggle::create(generate_name("DisableInstanceCulling"), true, true) };
+    // NSF (non-AFR native stereo) never force-disables r.DefaultFeature.MotionBlur the way the AFR
+    // path already does (see update_hmd_state's is_using_afr() branch) - motion blur is authored/
+    // reprojected for a single mono camera, and its per-pixel velocity buffer does not account for
+    // the second eye's independent view; the two eyes' blur trails diverge and read as ghosting/
+    // double-vision, most visible during large screen-space motion (fast camera pans, skill/ability
+    // VFX, cutscene blends) which is exactly the residual symptom reported after pose-sync fixes.
+    const ModToggle::Ptr m_disable_motion_blur_nsf{ ModToggle::create(generate_name("DisableMotionBlurNSF"), true, true) };
+    // DIAG: forces r.SkinCache.Mode to 0 (disabled) at runtime. GPU Skin Cache double-buffers bone
+    // transform data keyed off "current"/"previous" frame slots; since NSF renders both eyes within
+    // the same engine frame as two separate render calls, a per-render-call (rather than per-tick)
+    // buffer selection could make one eye sample a stale/previous-frame skeletal pose relative to the
+    // other during fast animation (e.g. skill/ability poses), which would show up exactly as a one-
+    // eye "snapped to an earlier pose" divergence. Off by default; toggle on to A/B test whether
+    // disabling the skin cache changes/removes that artifact. Console command equivalent is
+    // "r.SkinCache.Mode 0", exposed here instead since the in-game console is unstable/crashes.
+    const ModToggle::Ptr m_disable_skin_cache_nsf{ ModToggle::create(generate_name("DisableSkinCacheNSF"), false) };
+    // DIAG: logs the FINAL per-eye camera position/rotation (after head_offset/eye_separation/roomscale
+    // are applied - i.e. the actual pose each eye renders from) every single frame, for both eyes,
+    // unconditionally (throttled per-eye, not gated behind a glitch-marker window). This lets the two
+    // eyes' full camera trajectories be directly compared frame-by-frame across an entire glitch
+    // (e.g. a UI-open camera return) instead of only a short capture window, to answer directly: does
+    // eye0 snap back to position while eye1 slowly lerps back (or vice versa)? If one eye's logged
+    // position visibly lags/interpolates toward the other eye's position across several frames while
+    // the other jumps immediately, that pinpoints an asymmetric camera-return interpolation (likely in
+    // game/engine code driving the view target, not in our per-eye offset math) as the cause.
+    const ModToggle::Ptr m_diag_log_final_eye_pose{ ModToggle::create(generate_name("DiagLogFinalEyePose"), false) };
+    // DIAG: log evidence (NSF-FINAL-EYE-POSE captures during a glitch marker press) proves
+    // calculate_stereo_view_offset() is called at least THREE times per frame during NSF, not two.
+    // IMPORTANT: further captures across separate play sessions PROVED the raw view_index assigned to
+    // that third call is NOT stable (it was 3 in one session, matched a REAL eye in another - see
+    // m_diag_log_true_index_alias for why), so suppressing by a hardcoded view_index number is
+    // unreliable and can suppress a genuine eye (confirmed in-headset: index 2 or 3 sticks one eye to
+    // the HMD depending on session). Kept only as a manual, session-specific diagnostic - re-verify the
+    // correct index via m_diag_log_final_eye_pose/m_diag_log_true_index_alias EVERY session before
+    // using this, do not assume a fixed value like 3 is always correct.
+    const ModToggle::Ptr m_diag_suppress_extra_view{ ModToggle::create(generate_name("DiagSuppressExtraView"), false) };
+    const ModInt32::Ptr m_diag_suppress_view_index{ ModSliderInt32::create(generate_name("DiagSuppressViewIndex"), -1, 8, 3) };
+    // DIAG: true_index (which decides "left" vs "right" and is what the sync-pose cache/eye-offset
+    // math key off of) is derived purely from view_index's PARITY: true_index = (view_index + 1) % 2
+    // or view_index % 2 depending on index_starts_from_one. That means two DIFFERENT view_index values
+    // sharing the same parity (e.g. 1 and 3 once index_starts_from_one is true) ALIAS onto the exact
+    // same true_index - so an "extra" call isn't just an ignorable third render, it can silently
+    // overwrite/compete with a real eye's cached pose/offset state for that frame. This is a much
+    // better candidate root cause for the reported doubled-image/eye desync than a simple stray view.
+    // When enabled, logs an unthrottled [VR][NSF-TRUE-INDEX-ALIAS] warning the instant two different
+    // view_index values collide onto the same true_index within one engine frame, pinpointing exactly
+    // when/how often the aliasing happens without touching or risking any real eye's rendering.
+    const ModToggle::Ptr m_diag_log_true_index_alias{ ModToggle::create(generate_name("DiagLogTrueIndexAlias"), false) };
+    // DIAG: logs the world_to_meters value passed in on every stereo view-offset call, keyed by the
+    // real true_index (so it stays consistent with NSF-TRUE-INDEX-ALIAS), and warns when a call's
+    // world_to_meters differs from the last value seen for the OTHER true_index within the same
+    // frame. Used to determine whether the reported double-image symptom could be caused by a
+    // per-view world-scale mismatch rather than (or in addition to) camera-position/true_index
+    // aliasing.
+    const ModToggle::Ptr m_diag_log_world_to_meters{ ModToggle::create(generate_name("DiagLogWorldToMeters"), false) };
+    // DIAG: unconditionally logs EVERY raw view_index this hook is called with, alongside true_index,
+    // is_full_pass, is_using_afr, and a running per-index call count/recency. Used to build a single
+    // authoritative table of which raw indices actually occur (observed 0-4 previously) instead of
+    // inferring it indirectly from aliasing/pose diagnostics alone.
+    const ModToggle::Ptr m_diag_log_raw_view_index{ ModToggle::create(generate_name("DiagLogRawViewIndex"), false) };
+    // Off by default until confirmed stable across more sessions; user directly tested that excluding
+    // view_index=1 from rendering entirely (a full early-return, stronger than this) caused no visible
+    // regression (no stuck/frozen/blank eye). This toggle is the narrower, safer version of that test:
+    // it only excludes the index from the sync-pose cache race, not from rendering.
+    const ModToggle::Ptr m_diag_exclude_view_index_from_sync_cache{ ModToggle::create(generate_name("DiagExcludeViewIndexFromSyncCache"), false) };
+    const ModInt32::Ptr m_diag_exclude_view_index_from_sync_cache_index{ ModSliderInt32::create(generate_name("DiagExcludeViewIndexFromSyncCacheIndex"), -1, 8, 1) };
+    // See is_diag_apply_synced_pose_to_excluded_view_index_enabled() for full rationale: feeds the
+    // excluded view_index the same converged/synced rotation+position as the real eyes (without
+    // letting it write back into the cache), instead of leaving it completely untouched. Intended to
+    // fix shadow-cascade/occlusion-culling desync attributed to that index while keeping the eye
+    // blur/desync fix from DiagExcludeViewIndexFromSyncCache intact. Only has any effect when
+    // DiagExcludeViewIndexFromSyncCache is also enabled.
+    const ModToggle::Ptr m_diag_apply_synced_pose_to_excluded_view_index{ ModToggle::create(generate_name("DiagApplySyncedPoseToExcludedViewIndex"), false) };
     const ModToggle::Ptr m_desktop_fix{ ModToggle::create(generate_name("DesktopRecordingFix_V2"), true) };
     const ModToggle::Ptr m_enable_gui{ ModToggle::create(generate_name("EnableGUI"), true) };
     const ModToggle::Ptr m_enable_depth{ ModToggle::create(generate_name("PassDepthToRuntime"), false, true) };
@@ -1093,11 +1498,17 @@ private:
     const ModToggle::Ptr m_ghosting_fix{ ModToggle::create(generate_name("GhostingFix"), false) };
     // DIAG/PERF: see is_lgui_ui_redirect_disabled().
     const ModToggle::Ptr m_disable_lgui_ui_redirect{ ModToggle::create(generate_name("DisableLGUIUIRedirect"), false) };
+    // DIAG: see is_depth_submission_disabled().
+    const ModToggle::Ptr m_disable_depth_submission{ ModToggle::create(generate_name("DisableDepthSubmission"), false) };
     const ModToggle::Ptr m_native_stereo_fix{ ModToggle::create(generate_name("NativeStereoFix"), false) };
     // Default OFF: with the real FSceneViewInitOptions offsets now resolved (sceneview_xref), this branch
     // actually executes in this game and null-derefs inside the engine (views->count=0 during construction).
     // The right-eye shadow fix below makes it unnecessary.
     const ModToggle::Ptr m_native_stereo_fix_same_pass{ ModToggle::create(generate_name("NativeStereoFixSamePass"), false) };
+    // DIAG/EXPERIMENTAL: see is_native_stereo_fix_same_pass_force_primary_enabled(). Re-arms the
+    // StereoPass=PRIMARY override for Pass2 that was previously disabled due to black-screen reports.
+    // Default OFF - only for deliberate diagnostic re-testing with the added decisive logging.
+    const ModToggle::Ptr m_native_stereo_fix_same_pass_force_primary{ ModToggle::create(generate_name("NativeStereoFixSamePassForcePrimary"), false) };
     // Flip the Pass2 (right eye) FSceneView's eye-identity metadata (StereoPass + cached copy, view index,
     // primary flag) to the left eye's values while it renders, so whole-scene shadows are set up for it.
     // Offsets/values are discovered at runtime by sceneview_xref, never hardcoded. Camera data untouched.
@@ -1108,7 +1519,68 @@ private:
     // DIAG: render NSF Pass2 with a null FSceneViewState (no occlusion/TAA history) to test whether
     // shared per-view-state history is what freezes distant foliage in the second-rendered eye.
     const ModToggle::Ptr m_native_stereo_fix_null_pass2_view_state{ ModToggle::create(generate_name("NativeStereoFixNullPass2ViewState"), false) };
+    // NSF renders both eyes within the same engine frame via two calculate_stereo_view_offset() calls
+    // (Pass1=left, Pass2=right). Unlike AFR (which already caches/reuses eye 0's rotation across the
+    // frame - see m_last_afr_rotation), NSF has no equivalent: each eye independently reads whatever the
+    // live animated camera pose is at the moment it's queried. During a camera-transition animation
+    // (cutscene blend, dash, ability camera shift) that pose can change between the two calls within
+    // the same frame, producing a momentary left/right eye desync that resolves once the camera holds
+    // still. When enabled, cache Pass1 (left)'s rotation/location for this frame and force Pass2
+    // (right) to reuse it, tying the two eyes together for that single stereo frame without affecting
+    // head tracking/parallax on any other frame.
+    const ModToggle::Ptr m_native_stereo_fix_sync_pose{ ModToggle::create(generate_name("NativeStereoFixSyncPose"), false) };
+    // DEPRECATED: position sync used to be independently toggleable here, A/B tested against
+    // rotation-only sync. Direct in-headset testing (Camera Freeze debug tool) proved freezing only
+    // ONE of position/rotation still produced the eye desync - both must move together. Position sync
+    // is therefore now unconditionally tied to m_native_stereo_fix_sync_pose (see
+    // is_native_stereo_fix_sync_pose_position_enabled()). This ModToggle is kept only so existing
+    // saved configs/UI ordering aren't disrupted; its value is no longer read.
+    const ModToggle::Ptr m_native_stereo_fix_sync_pose_position{ ModToggle::create(generate_name("NativeStereoFixSyncPosePosition"), false) };
+    // See get_native_stereo_fix_sync_pose_blend_alpha(). 1.0 = Pass2 fully snaps to Pass1's pose
+    // (default, matches original behavior); lower values let Pass2 keep some of its own live motion so
+    // any residual lag is split between both eyes instead of the right eye alone appearing frozen.
+    const ModSlider::Ptr m_native_stereo_fix_sync_pose_blend_alpha{ ModSlider::create(generate_name("NativeStereoFixSyncPoseBlendAlpha"), 0.0f, 1.0f, 1.0f) };
+    // DIAG: see is_native_stereo_fix_sync_pose_force_full_enabled(). Off by default; only for deliberate
+    // diagnostic re-testing to confirm the sync path engages on every frame during a reported glitch.
+    const ModToggle::Ptr m_native_stereo_fix_sync_pose_force_full{ ModToggle::create(generate_name("NativeStereoFixSyncPoseForceFull"), false) };
+    // DIAG: see is_diag_gradual_hard_cut_convergence_enabled(). Off by default - test toggle to A/B
+    // the ramped convergence against the existing instant hard-cut snap before making it the default.
+    const ModToggle::Ptr m_diag_gradual_hard_cut_convergence{ ModToggle::create(generate_name("DiagGradualHardCutConvergence"), false) };
+    const ModInt32::Ptr m_diag_gradual_hard_cut_convergence_duration_ms{ ModSliderInt32::create(generate_name("DiagGradualHardCutConvergenceDurationMs"), 50, 3000, 1000) };
+    // DIAG: in-headset visual indicator for the stale-scene-capture-freeze condition (see
+    // is_scene_capture_stall_indicator_enabled()). Off by default since it's a diagnostic aid.
+    const ModToggle::Ptr m_scene_capture_stall_indicator{ ModToggle::create(generate_name("SceneCaptureStallIndicator"), false) };
+    // DIAG: virtual-key code for the manual glitch marker (default: NumPad0). Not exposed as a
+    // persistent user-facing setting yet, just a fixed diagnostic keybind.
+    static constexpr int m_glitch_marker_vkey = VK_NUMPAD0;
     const ModToggle::Ptr m_native_stereo_fix_mirror{ ModToggle::create(generate_name("NativeStereoFixMirror"), false) };
+    // Automatically enables the same mirror-right-eye fallback above whenever the game reports
+    // APlayerController::bCinematicMode==true (see is_in_cinematic_mode()). Defaults on since the
+    // mirror path is cheaper than full NSF stereo (a straight GPU copy, no second scene render) and
+    // targets a GPU-double-buffered VFX/foliage desync class that cannot be fixed via CPU-side state.
+    const ModToggle::Ptr m_native_stereo_fix_auto_mirror_on_cinematic{ ModToggle::create(generate_name("NativeStereoFixAutoMirrorOnCinematic"), true) };
+    // Automatically enables the mirror-right-eye fallback whenever LGUI's per-frame draw hook has not
+    // fired for m_lgui_draw_silence_threshold_ms - i.e. the game's own UI has gone fully blank/redirected
+    // away. NOTE: testing showed this only fires on world load/menu transitions, NOT during the actual
+    // skill/VFX animations that cause the reported blur, so this is now OFF by default. Kept as an
+    // optional secondary trigger; see m_native_stereo_fix_auto_mirror_on_motion below for the trigger
+    // that actually correlates with skill/VFX animation camera motion.
+    const ModToggle::Ptr m_native_stereo_fix_auto_mirror_on_ui_blank{ ModToggle::create(generate_name("NativeStereoFixAutoMirrorOnUiBlank"), false) };
+    // How long LGUI must go without drawing (ms) before we consider the UI "blanked" for the purposes of
+    // the auto-mirror-on-UI-blank trigger above. Kept fairly low since normal UI redraw cadence is every
+    // frame; a genuine skill/VFX UI-hide window should exceed this quickly.
+    static constexpr uint64_t m_lgui_draw_silence_threshold_ms = 150;
+    // Automatically enables the mirror-right-eye fallback for a short window after NSF's sync-pose
+    // logic (calculate_stereo_view_offset) measures a meaningful Pass1/Pass2 rotation or position delta,
+    // i.e. the live camera pose is actually changing between the two eyes' render calls this frame -
+    // exactly the "camera motion vectors changing due to animations/VFX" condition. Defaults on: this
+    // targets the real symptom window, unlike bCinematicMode/UI-blank above.
+    const ModToggle::Ptr m_native_stereo_fix_auto_mirror_on_motion{ ModToggle::create(generate_name("NativeStereoFixAutoMirrorOnMotion"), true) };
+    // How long (ms) after the last detected pose-divergence event the auto-mirror-on-motion trigger
+    // should keep considering the camera "in motion". A single spike would otherwise only cover one
+    // frame; this window smooths that out across a short burst of animation frames without flip-
+    // flopping the right-eye source every other frame.
+    static constexpr uint64_t m_pose_divergence_mirror_window_ms = 250;
     // When Native Stereo Fix is on, LGUI lays its UI canvas out at the per-eye view rect height (which is taller
     // than the scene RT), so the bottom of the UI is clipped by the normal (scene-sized) UI render target. This
     // grows the UEVR-owned UI target to the full per-eye canvas height so the whole UI is captured, then presents
@@ -1155,7 +1627,7 @@ private:
     bool m_disable_vr{false}; // definitely should not be persistent
     bool m_diag_force_afr_off{false}; // definitely should not be persistent
     bool m_diag_disable_forced_second_draw{false}; // definitely should not be persistent
-    bool m_diag_verbose_logging{false}; // gates high-frequency [DIAG]/[diag] debug logs added while investigating Synced Sequential issues; definitely should not be persistent
+    bool m_diag_verbose_logging{false}; // gates high-frequency [DIAG]/[diag] debug logs added while investigating Synced Sequential (AFR) issues; not useful for Native Stereo Fix debugging; definitely should not be persistent
     // Default 0xFB: F2 (a 0/1 "secondary view" flag @0x2ec in WuWa) is NOT flipped. Flipping it made Pass 2 build far
     // shadow cascades/caster lists with left-eye bounds while rendering the right eye -> far shadows flickering between eyes.
     int m_diag_nsf_pass2_eye_field_mask{0xFB}; // bisect mask over the runtime-discovered eye identity fields flipped by the right-eye shadow fix; not persistent
@@ -1215,6 +1687,19 @@ public:
             *m_disable_hdr_compositing,
             *m_disable_hzbocclusion,
             *m_disable_instance_culling,
+            *m_disable_motion_blur_nsf,
+            *m_disable_skin_cache_nsf,
+            *m_diag_log_final_eye_pose,
+            *m_diag_suppress_extra_view,
+            *m_diag_suppress_view_index,
+            *m_diag_log_true_index_alias,
+            *m_diag_log_world_to_meters,
+            *m_diag_log_raw_view_index,
+            *m_diag_exclude_view_index_from_sync_cache,
+            *m_diag_exclude_view_index_from_sync_cache_index,
+            *m_diag_apply_synced_pose_to_excluded_view_index,
+            *m_diag_gradual_hard_cut_convergence,
+            *m_diag_gradual_hard_cut_convergence_duration_ms,
             *m_desktop_fix,
             *m_enable_gui,
             *m_enable_depth,
@@ -1252,12 +1737,21 @@ public:
             *m_custom_z_near_enabled,
             *m_ghosting_fix,
             *m_disable_lgui_ui_redirect,
+            *m_disable_depth_submission,
             *m_native_stereo_fix,
             *m_native_stereo_fix_same_pass,
+            *m_native_stereo_fix_same_pass_force_primary,
             *m_native_stereo_fix_right_eye_shadows,
             *m_native_stereo_fix_auto_suspend,
             *m_native_stereo_fix_null_pass2_view_state,
+            *m_native_stereo_fix_sync_pose,
+            *m_native_stereo_fix_sync_pose_position,
+            *m_native_stereo_fix_sync_pose_blend_alpha,
+            *m_native_stereo_fix_sync_pose_force_full,
             *m_native_stereo_fix_mirror,
+            *m_native_stereo_fix_auto_mirror_on_cinematic,
+            *m_native_stereo_fix_auto_mirror_on_ui_blank,
+            *m_native_stereo_fix_auto_mirror_on_motion,
             *m_native_stereo_fix_tall_ui,
             *m_native_stereo_fix_allow_with_afr,
             *m_unify_afr_frame_parity,

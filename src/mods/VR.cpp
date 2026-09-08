@@ -15,6 +15,8 @@
 #include <sdk/threading/GameThreadWorker.hpp>
 #include <sdk/UGameplayStatics.hpp>
 #include <sdk/APlayerController.hpp>
+#include <sdk/FBoolProperty.hpp>
+#include <sdk/UEngine.hpp>
 
 #include <tracy/Tracy.hpp>
 
@@ -28,6 +30,45 @@
 std::shared_ptr<VR>& VR::get() {
     //static std::shared_ptr<VR> instance = std::make_shared<VR>();
     return g_framework->vr();
+}
+
+// SEH wrapper (no C++ objects needing unwinding in this frame) around VR::update_action_states().
+// update_action_states() -> update_dpad_gestures() -> trigger_haptic_vibration() -> is_using_controllers()
+// has been observed to crash with an access violation reading a garbage address, most likely due to
+// hook/trampoline or exception-recovery-scanner offsets shifting after a rebuild (see FFakeStereoRenderingHook.cpp
+// exception handler diagnostics). Rather than let this take down the whole process, catch it here, log it,
+// and skip this tick's action/haptic/dpad update so the game and rendering can keep running.
+static bool call_update_action_states_seh(VR* vr) {
+    __try {
+        vr->update_action_states();
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+// Out-of-line, non-inlined on purpose. See declaration comment in VR.hpp for why.
+__declspec(noinline) bool VR::is_using_controllers() const {
+    if (m_controller_test_mode) {
+        return true;
+    }
+
+    if (!m_controllers_allowed->value()) {
+        return false;
+    }
+
+    if (!is_hmd_active()) {
+        return false;
+    }
+
+    if (m_controllers.empty()) {
+        return false;
+    }
+
+    const auto inactivity_timer_seconds = (int32_t)m_motion_controls_inactivity_timer->value();
+    const auto elapsed = std::chrono::steady_clock::now() - m_last_controller_update;
+
+    return elapsed <= std::chrono::seconds(inactivity_timer_seconds);
 }
 
 // Called when the mod is initialized
@@ -1386,6 +1427,24 @@ void VR::on_pre_engine_tick(sdk::UGameEngine* engine, float delta) {
     // A full level transition (as opposed to sub-level streaming) can begin tearing down the
     // world the capture actor lives in well before the next render call arrives, so checking
     // here closes that window and unhooks the capture setup before the unload proceeds further.
+    // DIAG: manual glitch marker. Press the marker key (NumPad0) the instant a blur/double-image
+    // moment is perceived in the headset. Logs a precise, greppable timestamp plus the live
+    // scene-capture stall state, so it can be correlated against the exact log window afterward
+    // instead of relying on estimated minute-level timestamps.
+    {
+        static bool s_marker_key_was_down = false;
+        const auto marker_key_down = is_glitch_marker_key_down();
+
+        if (marker_key_down && !s_marker_key_was_down) {
+            const auto stall_ms = m_fake_stereo_hook != nullptr ? m_fake_stereo_hook->get_scene_capture_stall_duration_ms() : 0;
+            SPDLOG_WARN("[VR][GLITCH-MARKER] User-reported glitch at this moment (scene_capture_stall_ms={})", stall_ms);
+            request_glitch_frame_dump();
+            request_glitch_eye_diag_window();
+        }
+
+        s_marker_key_was_down = marker_key_down;
+    }
+
     if (m_fake_stereo_hook != nullptr) {
         if (auto rtm = m_fake_stereo_hook->get_render_target_manager(); rtm != nullptr && rtm->is_scene_capture_world_stale()) {
             auto engine_ptr = sdk::UEngine::get();
@@ -1410,7 +1469,12 @@ void VR::on_pre_engine_tick(sdk::UGameEngine* engine, float delta) {
     // Dont update action states on AFR frames
     // TODO: fix this for actual AFR, but we dont really care about pure AFR since synced beats it most of the time
     if (m_fake_stereo_hook != nullptr && !m_fake_stereo_hook->is_ignoring_next_viewport_draw()) {
-        update_action_states();
+        static uint32_t s_action_states_fault_count = 0;
+
+        if (!call_update_action_states_seh(this)) {
+            ++s_action_states_fault_count;
+            SPDLOG_ERROR("[VR] update_action_states() faulted (SEH caught), skipping this tick's action/haptic/dpad update (fault_count={})", s_action_states_fault_count);
+        }
     }
 }
 
@@ -1544,6 +1608,59 @@ void VR::on_pre_viewport_client_draw(void* viewport_client, void* viewport, void
     }
 }
 
+bool VR::is_in_cinematic_mode() {
+    const auto world = sdk::UEngine::get()->get_world();
+
+    if (world == nullptr) {
+        return false;
+    }
+
+    const auto controller = sdk::UGameplayStatics::get()->get_player_controller(world, 0);
+
+    if (controller == nullptr) {
+        return false;
+    }
+
+    if (controller->get_class() == nullptr) {
+        return false;
+    }
+
+    static const auto boolprop = (sdk::FBoolProperty*)controller->get_class()->find_property(L"bCinematicMode");
+
+    if (boolprop == nullptr) {
+        return false;
+    }
+
+    const auto in_cinematic = boolprop->get_value_from_object(controller);
+
+    static bool was_in_cinematic = false;
+
+    if (in_cinematic != was_in_cinematic) {
+        SPDLOG_INFO("[VR][CINEMATIC-MODE] bCinematicMode transitioned to {}", in_cinematic);
+        was_in_cinematic = in_cinematic;
+    }
+
+    return in_cinematic;
+}
+
+bool VR::is_ui_blanked_for_mirror_trigger() const {
+    if (m_fake_stereo_hook == nullptr) {
+        return false;
+    }
+
+    const auto silence_ms = m_fake_stereo_hook->get_lgui_draw_silence_duration_ms();
+    const auto blanked = silence_ms >= m_lgui_draw_silence_threshold_ms;
+
+    static bool was_blanked = false;
+
+    if (blanked != was_blanked) {
+        SPDLOG_INFO("[VR][UI-BLANK] LGUI draw-silence trigger transitioned to {} (silence_ms={})", blanked, silence_ms);
+        was_blanked = blanked;
+    }
+
+    return blanked;
+}
+
 void VR::update_hmd_state(bool from_view_extensions, uint32_t frame_count) {
     ZoneScopedN(__FUNCTION__);
 
@@ -1584,6 +1701,30 @@ void VR::update_hmd_state(bool from_view_extensions, uint32_t frame_count) {
 
             if (r_instance_culling_value && *r_instance_culling_value != 0) {
                 sdk::set_cvar_int(L"Renderer", L"r.InstanceCulling.OcclusionCull", 0);
+            }
+        }
+
+        // See m_disable_motion_blur_nsf declaration for rationale: motion blur is only ever force-
+        // disabled below for AFR; NSF left it fully enabled, and its mono-authored per-pixel motion
+        // vectors can diverge between the two independently-rendered eyes during large screen-space
+        // motion (fast pans, skill/ability VFX, cutscene blends), reading as ghosting/double-vision.
+        if (m_disable_motion_blur_nsf->value()) {
+            const auto motion_blur_value = sdk::get_cvar_int(L"Engine", L"r.DefaultFeature.MotionBlur");
+
+            if (motion_blur_value && *motion_blur_value != 0) {
+                sdk::set_cvar_data_int(L"Engine", L"r.DefaultFeature.MotionBlur", 0);
+            }
+        }
+
+        // DIAG: see m_disable_skin_cache_nsf declaration for rationale. Applied continuously (rather
+        // than once) so it stays disabled even if the engine/game re-enables it after a level/menu
+        // transition. Off by default; this is a safe, console-free alternative to running
+        // "r.SkinCache.Mode 0" since the in-game console crashes the game.
+        if (m_disable_skin_cache_nsf->value()) {
+            const auto skin_cache_value = sdk::get_cvar_int(L"Engine", L"r.SkinCache.Mode");
+
+            if (skin_cache_value && *skin_cache_value != 0) {
+                sdk::set_cvar_data_int(L"Engine", L"r.SkinCache.Mode", 0);
             }
         }
     }
@@ -2486,6 +2627,18 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
                                "The in-VR UI quad will go blank/stale while this is enabled.");
         }
 
+        m_disable_depth_submission->draw("DIAG: Disable Depth Submission (compositor reprojection A/B test)");
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Stops submitting a depth layer (XR_KHR_composition_layer_depth) to the runtime's\n"
+                               "compositor, even if the extension is available. The runtime's own depth-based\n"
+                               "reprojection/timewarp is entirely dependent on this depth data; use this to A/B\n"
+                               "test whether a transient double-image/ghosting artifact seen only in-headset\n"
+                               "(not in screenshots) during animation/camera-cut transitions is caused by the\n"
+                               "runtime's depth-based reprojection misinterpreting a momentarily unstable\n"
+                               "near-clip-plane-derived depth range, rather than anything in the game/UEVR's\n"
+                               "own rendering pipeline.");
+        }
+
         ImGui::SetNextItemOpen(true, ImGuiCond_::ImGuiCond_Once);
         if (ImGui::TreeNode("Native Stereo Fix")) {
             m_native_stereo_fix->draw("Enabled");
@@ -2497,6 +2650,10 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
             if (ImGui::IsItemHovered()) {
                 ImGui::SetTooltip("Legacy approach: hides the view family from the FSceneView constructor and\nforces PRIMARY on the secondary view's init options. Crashes in this game\n(null deref inside the engine). Superseded by Right Eye Shadow Fix.");
             }
+            m_native_stereo_fix_same_pass_force_primary->draw("DIAG: Force Pass2 StereoPass=PRIMARY (known black-screen risk)");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Re-arms the previously disabled StereoPass=PRIMARY override for the secondary\n(right eye) view inside sceneview_constructor. A prior session confirmed this\ncauses full black-screen (main menu characters black, both eyes black in-game)\nunder some conditions. Only enable this deliberately to re-test with the added\ndecisive [VR][SAME-PASS-FORCE] logging around set_stereo_pass() and the\nFSceneView constructor entry, to correlate exactly when/why it recurs.\nRequires 'Use Same Stereo Pass (unstable)' above to also be enabled.");
+            }
             m_native_stereo_fix_auto_suspend->draw("Auto-Suspend During Level Transitions");
             if (ImGui::IsItemHovered()) {
                 ImGui::SetTooltip("Automatically turns Native Stereo Fix off while a loading screen / level\ntransition is detected (tick stall, missing pawn/controller, stale world) and\nback on once the world settles - the same as manually toggling it. Untick to\ntest whether the fix is still needed now that the scene capture is no longer\nrooted across LoadMap.");
@@ -2507,9 +2664,190 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
                                   "If distant trees stop freezing in the right eye with this on, shared per-view-state occlusion history is the cause. "
                                   "Expect aliasing/flicker in the right eye while enabled.");
             }
+            m_native_stereo_fix_sync_pose->draw("Sync Eye Pose During Camera Transitions");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Caches the left eye's (Pass 1) camera rotation AND position for this frame and\\n"
+                                  "forces the right eye (Pass 2) to reuse both, instead of independently re-sampling\\n"
+                                  "the live animated camera. Fixes a momentary left/right eye desync during camera-\\n"
+                                  "transition animations (cutscene blends, dashes, ability camera shifts, menu/\\n"
+                                  "conversation view-target switches) where the pose can change between the two eyes'\\n"
+                                  "render calls within the same frame. Position and rotation are always synced\\n"
+                                  "together now (previously separate toggles) - direct in-headset testing with the\\n"
+                                  "Camera Freeze debug tool proved that freezing only ONE of position/rotation still\\n"
+                                  "produced the desync; both must be pinned together to eliminate it, since a camera\\n"
+                                  "pose is the combination of both and correcting only one still leaves the two eyes\\n"
+                                  "rendering from different world transforms. The position portion is applied BEFORE\\n"
+                                  "the per-eye IPD/eye-separation offset, so stereo depth/parallax is preserved. Head\\n"
+                                  "tracking/parallax on all other frames is unaffected.\\n");
+            }
+            m_native_stereo_fix_sync_pose_blend_alpha->draw("Sync Pose Blend Alpha");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Controls how strongly the right eye (Pass 2) is forced toward the left eye's (Pass 1)\n"
+                                  "cached pose above. 1.0 (default) fully snaps Pass2 to Pass1's pose - this eliminates\n"
+                                  "desync but makes the right eye feel completely frozen/lagging behind the live animated\n"
+                                  "camera for that frame, which can read as disorienting one-sided lag. Lowering this lets\n"
+                                  "Pass2 keep some of its own live motion, splitting the residual error across both eyes\n"
+                                  "instead - trading a smaller, more symmetric-feeling desync for the previous frozen-right-\n"
+                                  "eye behavior. Try values around 0.5 if the full snap feels too disorienting.");
+            }
+            m_native_stereo_fix_sync_pose_force_full->draw("DIAG: Force Full Sync Every Frame (bypass hard-cut gate)");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Normally the full 1.0 blend_alpha snap above only applies on a detected hard-cut-grade\n"
+                                  "spike; ordinary small per-frame divergence during continuous motion (walking/dashing)\n"
+                                  "uses the slider's blend_alpha instead, and near-zero divergence is left unsynced.\n"
+                                  "Enable this to force the FULL 1.0 snap unconditionally on every single Pass2 call,\n"
+                                  "regardless of the spike-detector's verdict, and to log every application (not\n"
+                                  "throttled) so it can be confirmed the sync is engaging on every frame during a\n"
+                                  "reported glitch window. Only for deliberate diagnostic re-testing.");
+            }
+            m_diag_gradual_hard_cut_convergence->draw("DIAG: Gradual Hard-Cut Convergence (test, replaces instant snap)");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("TEST TOGGLE. Normally, once a hard-cut-grade pose divergence is detected, Pass2 (right\n"
+                                  "eye) is snapped INSTANTLY (blend_alpha=1.0, applied in a single frame) to Pass1's (left\n"
+                                  "eye) cached pose. Enable this to instead ramp the effective blend alpha from 0 up to 1\n"
+                                  "LINEARLY over the duration below, so the two eyes ease back into agreement over roughly\n"
+                                  "a second instead of one eye teleporting into place. Purely additive - A/B test this\n"
+                                  "against the default instant snap before deciding which feels better.");
+            }
+            m_diag_gradual_hard_cut_convergence_duration_ms->draw("DIAG: Gradual Hard-Cut Convergence Duration (ms)");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("How long (in milliseconds) the ramp above takes to go from 0 to full (1.0) blend alpha\n"
+                                  "after a hard cut is detected. Defaults to 1000ms (~1 second). Only used while DIAG:\n"
+                                  "Gradual Hard-Cut Convergence above is enabled.");
+            }
+            m_disable_motion_blur_nsf->draw("Disable Motion Blur (Native Stereo Fix)");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Forces r.DefaultFeature.MotionBlur off while Native Stereo Fix (non-AFR) is active.\\n"
+                                  "AFR already force-disables motion blur (see update_hmd_state) because its mono-\\n"
+                                  "authored per-pixel velocity buffer does not account for a second independent eye;\\n"
+                                  "NSF never had the same protection. If left on, the two eyes' blur trails can\\n"
+                                  "diverge during large screen-space motion (fast pans, skill/ability VFX, cutscene\\n"
+                                  "blends), which reads as ghosting/double-vision. Disable this toggle to A/B test\\n"
+                                  "whether motion blur is contributing to reported blur during skills/VFX.");
+            }
+            m_disable_skin_cache_nsf->draw("DIAG: Disable GPU Skin Cache (r.SkinCache.Mode = 0)");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Forces r.SkinCache.Mode to 0 (disabled) every frame while active. Safe, console-\\n"
+                                  "free equivalent of running \"r.SkinCache.Mode 0\" in the in-game console, which is\\n"
+                                  "unstable and crashes the game. GPU Skin Cache double-buffers bone transform data\\n"
+                                  "per render call rather than per game-tick; since NSF renders both eyes as separate\\n"
+                                  "render calls within the same frame, this can theoretically make one eye sample a\\n"
+                                  "stale skeletal pose relative to the other during fast animation. Off by default;\\n"
+                                  "enable to A/B test whether it changes/removes the reported eye-pose divergence.");
+            }
+            m_diag_log_final_eye_pose->draw("DIAG: Log Final Per-Eye Camera Pose (spammy)");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Logs the FULLY RESOLVED per-eye position/rotation (what each eye actually renders\n"
+                                  "from, after head_offset/eye_separation/sync-pose) every single frame, for BOTH\n"
+                                  "eyes, tagged [VR][NSF-FINAL-EYE-POSE] eye=0/1. Enable this, reproduce the glitch\n"
+                                  "(e.g. open a UI menu after a skill), then disable it again and grab the log. You\n"
+                                  "can then directly compare eye=0 vs eye=1 pos/rot line-by-line across the same\n"
+                                  "frame range to see exactly how each eye's camera moves: whether one eye jumps\n"
+                                  "immediately to the new position while the other's pos/rot values visibly\n"
+                                  "interpolate toward it over several frames (proving an asymmetric camera-return\n"
+                                  "lerp), or whether both eyes already match every frame (which would instead point\n"
+                                  "to a rendering/compositing-side cause rather than the camera pose itself). This is\n"
+                                  "very verbose (every frame, both eyes) - only leave it on while reproducing.");
+            }
+            m_diag_suppress_extra_view->draw("DIAG: Suppress Extra View Index (unreliable - see tooltip)");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Log evidence (NSF-FINAL-EYE-POSE + GLITCH-EYE-DIAG) proved calculate_stereo_view_\n"
+                                  "offset() is actually called at least THREE times per frame during NSF, not two.\n"
+                                  "CAUTION: cross-session captures then proved the raw view_index assigned to that\n"
+                                  "extra call is NOT stable - it was 3 in one session, but suppressing 2 or 3 in\n"
+                                  "later sessions instead stuck a REAL eye to the HMD (confirmed in-headset). Do\n"
+                                  "not assume a fixed index; use DIAG: Log True-Index Alias / Log Final Per-Eye\n"
+                                  "Camera Pose to re-derive the correct index for THIS session before ever\n"
+                                  "enabling this toggle, and disable it immediately if an eye sticks to the HMD.");
+            }
+            m_diag_suppress_view_index->draw("DIAG: Suppressed View Index");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("The exact view_index to suppress when the toggle above is enabled. IMPORTANT:\n"
+                                  "the raw view_index for the extra call is NOT stable across sessions - it was 3 in\n"
+                                  "one capture, but suppressing 2 or 3 in later sessions instead stuck a REAL eye to\n"
+                                  "the HMD, proving this value must be re-verified every session (see\n"
+                                  "m_diag_log_final_eye_pose / DIAG: Log True-Index Alias below) rather than assumed.");
+            }
+            m_diag_log_true_index_alias->draw("DIAG: Log True-Index Alias");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("true_index (which decides left vs right eye, and is what the sync-pose cache and\n"
+                                  "eye-offset math key off of) is derived purely from view_index's PARITY, so two\n"
+                                  "DIFFERENT view_index values sharing the same parity silently ALIAS onto the same\n"
+                                  "true_index - meaning an 'extra' render call can overwrite/compete with a real\n"
+                                  "eye's cached pose for that frame instead of just being an ignorable third view.\n"
+                                  "Enable this, reproduce the glitch, then grab the log and search for\n"
+                                  "[VR][NSF-TRUE-INDEX-ALIAS] - each hit shows the exact frame and both colliding\n"
+                                  "view_index values, which pinpoints the aliasing directly instead of guessing a\n"
+                                  "fixed view_index to suppress.");
+            }
+            m_diag_log_world_to_meters->draw("DIAG: Log World-To-Meters Per-Eye");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Logs the world_to_meters value passed in on every stereo view-offset call,\n"
+                                  "keyed by the real true_index (consistent with true_index aliasing above),\n"
+                                  "and warns with [VR][NSF-WTM-MISMATCH] whenever a call's world_to_meters\n"
+                                  "differs from the last value seen for the OTHER eye within the same frame.\n"
+                                  "Every call is also logged as [VR][NSF-WTM-VALUE] so values can be compared\n"
+                                  "directly. Use this to determine whether the doubled-image symptom could be\n"
+                                  "caused by a per-eye world-scale mismatch rather than (or in addition to)\n"
+                                  "camera-position/true_index aliasing.");
+            }
+            m_diag_log_raw_view_index->draw("DIAG: Log Raw View Index (ALL indices, unconditional)");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Logs [VR][NSF-RAW-VIEW-INDEX] for EVERY raw view_index this hook is\n"
+                                  "called with (0-8), alongside true_index, is_full_pass, is_using_afr,\n"
+                                  "and a running per-index call count/recency. Use this to build one\n"
+                                  "authoritative table of exactly which raw indices occur and how often,\n"
+                                  "instead of piecing it together from aliasing/pose diagnostics alone.\n"
+                                  "Very verbose - enable only during a short repro window.");
+            }
+            m_diag_exclude_view_index_from_sync_cache->draw("DIAG: Exclude View Index From Sync-Pose Cache");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Excludes the specified view_index from ever writing to/reading from the NSF\n"
+                                  "sync-pose cache used by calculate_stereo_view_offset - it does NOT skip\n"
+                                  "rendering of that index (unlike DIAG: Suppress Extra View Index above), so it\n"
+                                  "is much safer to leave on. Confirmed in-headset that fully suppressing\n"
+                                  "view_index=1's rendering caused no stuck/frozen/blank eye, and\n"
+                                  "NSF-TRUE-INDEX-ALIAS showed view_index=1 racing with the real view_index=3\n"
+                                  "eye call on the same true_index - this excludes it from that race instead.\n"
+                                  "Disable immediately if an eye sticks or goes blank.");
+            }
+            m_diag_exclude_view_index_from_sync_cache_index->draw("DIAG: Sync-Cache-Excluded View Index");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("The view_index to exclude from the sync-pose cache when the toggle above is\n"
+                                  "enabled. Defaults to 1 based on the current session's NSF-RAW-VIEW-INDEX /\n"
+                                  "NSF-TRUE-INDEX-ALIAS evidence, but re-verify per session as raw indices are\n"
+                                  "not guaranteed stable across sessions.");
+            }
+            m_diag_apply_synced_pose_to_excluded_view_index->draw("DIAG: Apply Synced Pose To Excluded View Index");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Only has an effect while DIAG: Exclude View Index From Sync-Pose Cache is also\n"
+                                  "enabled. Instead of leaving the excluded view_index's pose completely untouched,\n"
+                                  "feeds it the SAME fully-converged rotation/position the real eyes settle on this\n"
+                                  "frame (read-only - does not write back into the cache). Intended to fix\n"
+                                  "shadow-cascade/occlusion-culling desync (e.g. inconsistent foliage-sway culling)\n"
+                                  "attributed to that index, since NSF-VIEWINDEX-IDENTITY shows it never gets its own\n"
+                                  "FSceneView and fires a variable number of times per frame, consistent with a\n"
+                                  "sub-view pass rather than a renderable eye. Disable if culling/shadows get worse.");
+            }
             m_native_stereo_fix_mirror->draw("Mirror Right Eye (No Scene Capture)");
             if (ImGui::IsItemHovered()) {
                 ImGui::SetTooltip("Skips spawning the scene-capture actor entirely. The right eye is\njust a flat mirror of the left/game view (no stereoscopic depth).\nUse this as a stable fallback if the scene capture is causing\nstuck loading screens during level transitions.");
+            }
+            m_native_stereo_fix_auto_mirror_on_cinematic->draw("Auto-Mirror Right Eye During Cutscenes (bCinematicMode)");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Automatically applies the same mirror fallback above (no scene capture,\nflat right eye) whenever the game reports APlayerController::bCinematicMode\n== true (Sequencer/Matinee cutscenes). Targets GPU-side VFX/foliage blur\nand desync during cutscene camera transitions that CPU-side frame-counter\nfixes could not address, without disabling stereo depth during normal\ngameplay. Independent of the manual mirror toggle above.");
+            }
+            m_native_stereo_fix_auto_mirror_on_ui_blank->draw("Auto-Mirror Right Eye When UI Blanks (Skill/VFX Animations)");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Automatically applies the same mirror fallback above whenever LGUI's own\nUI/quad draw hook stops firing for a short window - this happens during\nmany characters' skill/VFX-heavy animations, where the UI goes blank and\nreturns to normal once the animation ends. Unlike the cutscene toggle\nabove (bCinematicMode never fires for this case), this directly detects\nthe UI-hidden window itself. Independent of the other mirror toggles.\nNOTE: testing showed this only fires on world load/menu transitions, not\nduring actual skill/VFX animations - off by default, prefer the motion\ntoggle below for that case.");
+            }
+            m_native_stereo_fix_auto_mirror_on_motion->draw("Auto-Mirror Right Eye On Camera Motion Divergence");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Automatically applies the same mirror fallback above for a short window after\nNSF's sync-pose logic detects the live camera pose actually diverging between\nthe left/right eye render calls within the same frame (see the NSF-POSE-DIVERGE\nlog and the Sync Pose toggles above) - i.e. real camera motion caused by\nskill/VFX/dash animations. This is a direct measurement of the animation-driven\nmotion that causes the disorienting right-eye lag, unlike bCinematicMode or the\nUI-blank toggle above which do not correlate with it.");
+            }
+            m_scene_capture_stall_indicator->draw("DIAG: Scene Capture Stall Visual Indicator");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Tints the right eye red when the scene capture render target has been\ncontinuously null for a visually-meaningful duration and the compositor\nis presenting a stale last-known-good texture instead. Use this to see\nin real time whether a perceived blur/double-image moment lines up with\nthis specific freeze condition. Press NumPad0 the instant you see a\nglitch to also log a precise marker timestamp for later correlation.");
             }
             m_native_stereo_fix_tall_ui->draw("Fit UI To Full Canvas (Fix Bottom Cutoff)");
             if (ImGui::IsItemHovered()) {

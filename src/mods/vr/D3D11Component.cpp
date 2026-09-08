@@ -336,6 +336,19 @@ vr::EVRCompositorError D3D11Component::on_frame(VR* vr) {
 
             spdlog::info("[VR] Scene capture texture format: {}, {}x{}", (uint32_t)desc.Format, desc.Width, desc.Height);
         }
+
+        // NOTE: unlike D3D12Component.cpp, this path unconditionally calls set() below even when
+        // scene_capture_rt is nullptr, which resets m_scene_capture_tex_ref to null rather than
+        // retaining the last-known-good texture across a momentary null (e.g. during a view-target
+        // reallocation). If the single-image ghosting/double-image artifact reproduces on the D3D11
+        // path, this reset-to-null-then-rebuild behavior (as opposed to D3D12's "keep last-known-good"
+        // fix) is a prime candidate to compare against. Logged with the current view-target generation
+        // for correlation against FFakeStereoRenderingHook.cpp's reallocation logging.
+        if (scene_capture_rt == nullptr && m_scene_capture_tex_ref.tex.Get() != nullptr) {
+            SPDLOG_INFO("[VR][DIAG] D3D11 scene capture RT went null (generation={}) - resetting m_scene_capture_tex_ref to null (no retention, unlike D3D12 path)",
+                ffsr->get_view_target_generation());
+        }
+
         m_scene_capture_tex_ref.set(scene_capture_rt, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM);
     } else {
         m_scene_capture_tex_ref.reset();
@@ -727,7 +740,7 @@ vr::EVRCompositorError D3D11Component::on_frame(VR* vr) {
                 }
             }
             
-            auto result = vr->m_openxr->end_frame(quad_layers, scene_depth_tex != nullptr);
+            auto result = vr->m_openxr->end_frame(quad_layers, !vr->is_depth_submission_disabled() && scene_depth_tex != nullptr);
 
             vr->m_openxr->needs_pose_update = true;
             vr->m_submitted = result == XR_SUCCESS;

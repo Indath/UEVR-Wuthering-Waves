@@ -210,6 +210,15 @@ private:
         // Bools
         std::make_unique<CVarStandard>(L"Renderer", L"r.HZBOcclusion", CVar::Type::BOOL, 0, 1),
         std::make_unique<CVarStandard>(L"Renderer", L"r.SSGI.Enable", CVar::Type::BOOL, 0, 1),
+        // Lumen (GI/reflections) maintains its own screen-probe/radiance-cache temporal history that is
+        // independent of TAA's history buffer. If that history isn't reset on a camera cut the same way
+        // TAA's is, it can produce a similar "ghost/double image that settles over several frames"
+        // artifact even with all TAA/upsampling/DLSS disabled - use these to A/B test disabling Lumen
+        // GI and reflections entirely.
+        std::make_unique<CVarStandard>(L"Renderer", L"r.Lumen.DiffuseIndirect.Allow", CVar::Type::BOOL, 0, 1),
+        std::make_unique<CVarStandard>(L"Renderer", L"r.Lumen.Reflections.Allow", CVar::Type::BOOL, 0, 1),
+        std::make_unique<CVarStandard>(L"Renderer", L"r.Lumen.ScreenProbeGather.TemporalFilter", CVar::Type::BOOL, 0, 1),
+        std::make_unique<CVarStandard>(L"Renderer", L"r.Lumen.Reflections.Temporal", CVar::Type::BOOL, 0, 1),
         std::make_unique<CVarStandard>(L"Renderer", L"r.Shadow.Virtual.Enable", CVar::Type::BOOL, 0, 1),
         std::make_unique<CVarStandard>(L"Renderer", L"r.TranslucentLightingVolume", CVar::Type::BOOL, 0, 1),
         // GPUScene (per-instance transform/WPO-relevant data) is normally only re-uploaded for
@@ -235,10 +244,15 @@ private:
         std::make_unique<CVarStandard>(L"Renderer", L"r.Upscale.Quality", CVar::Type::INT, 0, 5),
         std::make_unique<CVarStandard>(L"Renderer", L"r.LightCulling.Quality", CVar::Type::INT, 0, 2),
         std::make_unique<CVarStandard>(L"Renderer", L"r.SubsurfaceScattering", CVar::Type::INT, 0, 2),
-        
+
         // Floats
         std::make_unique<CVarStandard>(L"Renderer", L"r.Upscale.Softness", CVar::Type::FLOAT, 0.0f, 1.0f),
         std::make_unique<CVarStandard>(L"Core", L"r.ScreenPercentage", CVar::Type::FLOAT, 10.0f, 150.0f),
+        // Controls how strongly the current frame is weighted vs reprojected history each frame (higher
+        // = less history influence = faster to "settle"/less ghosting, but noisier/more aliased image).
+        // Raising this temporarily/permanently is a common mitigation for TAA ghosting after camera cuts.
+        std::make_unique<CVarStandard>(L"Renderer", L"r.TemporalAACurrentFrameWeight", CVar::Type::FLOAT, 0.04f, 1.0f),
+        std::make_unique<CVarStandard>(L"Renderer", L"r.TemporalAACatmullRom", CVar::Type::FLOAT, 0.0f, 1.0f),
     };
 
     static inline std::vector<std::shared_ptr<CVarData>> s_default_data_cvars {

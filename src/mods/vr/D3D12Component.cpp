@@ -1,5 +1,8 @@
 #include <d3dcompiler.h>
 
+#include <fstream>
+#include <vector>
+
 #include <openvr.h>
 #include <utility/String.hpp>
 #include <utility/ScopeGuard.hpp>
@@ -10,6 +13,7 @@
 
 #include <../../directxtk12-src/Inc/ResourceUploadBatch.h>
 #include <../../directxtk12-src/Inc/RenderTargetState.h>
+#include <../../directxtk12-src/Inc/ScreenGrab.h>
 
 #include "shaders/Compiled/alpha_luminance_sprite_ps_SpritePixelShader.inc"
 #include "shaders/Compiled/alpha_luminance_sprite_ps_SpriteVertexShader.inc"
@@ -23,6 +27,203 @@
 
 constexpr auto ENGINE_SRC_DEPTH = D3D12_RESOURCE_STATE_DEPTH_READ | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
 constexpr auto ENGINE_SRC_COLOR = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+
+namespace {
+// DIAG: dump-on-marker. Writes a single texture to disk for root-cause analysis of the
+// animation-transition double-vision glitch. This does NOT use SaveDDSTextureToFile, because that
+// helper writes whatever DXGI_FORMAT the resource itself reports via GetDesc() into the DDS
+// header - our render textures are created as TYPELESS resources (TextureContext::setup takes
+// separate RTV/SRV view formats), so the resulting DDS header claims a typeless format (e.g.
+// DXGI_FORMAT_B8G8R8A8_TYPELESS) that no viewer/converter recognizes as displayable pixel data,
+// even though the underlying bytes are byte-for-byte identical to the UNORM version. Instead, do
+// a synchronous GPU->CPU readback of the full texture (same pattern as diag_sample_texture above)
+// and hand-write a minimal, standard DDS header that hardcodes DXGI_FORMAT_B8G8R8A8_UNORM (DX10
+// extended header), which any modern DDS-capable viewer/converter can open.
+static void diag_dump_texture_to_dds(
+    ID3D12Device* device, ID3D12CommandQueue* command_queue, ID3D12Resource* src, D3D12_RESOURCE_STATES current_state, const wchar_t* file_path)
+{
+    if (device == nullptr || command_queue == nullptr || src == nullptr) {
+        SPDLOG_WARN("[VR][GLITCH-DUMP] Skipping dump of '{}', source resource, device, or command queue is null.", utility::narrow(file_path));
+        return;
+    }
+
+    const auto desc = src->GetDesc();
+
+    if (desc.Width == 0 || desc.Height == 0) {
+        SPDLOG_WARN("[VR][GLITCH-DUMP] Skipping dump of '{}', source texture has zero dimensions.", utility::narrow(file_path));
+        return;
+    }
+
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
+    UINT num_rows{};
+    UINT64 row_size{};
+    UINT64 total_bytes{};
+    device->GetCopyableFootprints(&desc, 0, 1, 0, &footprint, &num_rows, &row_size, &total_bytes);
+
+    if (total_bytes == 0) {
+        SPDLOG_ERROR("[VR][GLITCH-DUMP] Skipping dump of '{}', GetCopyableFootprints returned zero size.", utility::narrow(file_path));
+        return;
+    }
+
+    Microsoft::WRL::ComPtr<ID3D12Resource> readback_buffer{};
+
+    D3D12_HEAP_PROPERTIES heap_props{};
+    heap_props.Type = D3D12_HEAP_TYPE_READBACK;
+
+    D3D12_RESOURCE_DESC buffer_desc{};
+    buffer_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    buffer_desc.Width = total_bytes;
+    buffer_desc.Height = 1;
+    buffer_desc.DepthOrArraySize = 1;
+    buffer_desc.MipLevels = 1;
+    buffer_desc.Format = DXGI_FORMAT_UNKNOWN;
+    buffer_desc.SampleDesc.Count = 1;
+    buffer_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    buffer_desc.Flags = D3D12_RESOURCE_FLAG_NONE;
+
+    if (FAILED(device->CreateCommittedResource(&heap_props, D3D12_HEAP_FLAG_NONE, &buffer_desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&readback_buffer)))) {
+        SPDLOG_ERROR("[VR][GLITCH-DUMP] Failed to create readback buffer for '{}'.", utility::narrow(file_path));
+        return;
+    }
+
+    Microsoft::WRL::ComPtr<ID3D12CommandAllocator> cmd_allocator{};
+    Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> cmd_list{};
+    Microsoft::WRL::ComPtr<ID3D12Fence> fence{};
+
+    if (FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&cmd_allocator))) ||
+        FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, cmd_allocator.Get(), nullptr, IID_PPV_ARGS(&cmd_list))) ||
+        FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)))) {
+        SPDLOG_ERROR("[VR][GLITCH-DUMP] Failed to create throwaway command objects for '{}'.", utility::narrow(file_path));
+        return;
+    }
+
+    const bool needs_transition = current_state != D3D12_RESOURCE_STATE_COPY_SOURCE;
+
+    D3D12_RESOURCE_BARRIER src_barrier{};
+    src_barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    src_barrier.Transition.pResource = src;
+    src_barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    src_barrier.Transition.StateBefore = current_state;
+    src_barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+
+    if (needs_transition) {
+        cmd_list->ResourceBarrier(1, &src_barrier);
+    }
+
+    D3D12_TEXTURE_COPY_LOCATION dst_loc{};
+    dst_loc.pResource = readback_buffer.Get();
+    dst_loc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    dst_loc.PlacedFootprint = footprint;
+
+    D3D12_TEXTURE_COPY_LOCATION src_loc{};
+    src_loc.pResource = src;
+    src_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    src_loc.SubresourceIndex = 0;
+
+    cmd_list->CopyTextureRegion(&dst_loc, 0, 0, 0, &src_loc, nullptr);
+
+    if (needs_transition) {
+        src_barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        src_barrier.Transition.StateAfter = current_state;
+        cmd_list->ResourceBarrier(1, &src_barrier);
+    }
+
+    if (FAILED(cmd_list->Close())) {
+        SPDLOG_ERROR("[VR][GLITCH-DUMP] Failed to close command list for '{}'.", utility::narrow(file_path));
+        return;
+    }
+
+    ID3D12CommandList* const cmd_lists[] = {cmd_list.Get()};
+    command_queue->ExecuteCommandLists(1, cmd_lists);
+
+    HANDLE fence_event = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+
+    if (fence_event == nullptr) {
+        SPDLOG_ERROR("[VR][GLITCH-DUMP] Failed to create fence event for '{}'.", utility::narrow(file_path));
+        return;
+    }
+
+    command_queue->Signal(fence.Get(), 1);
+    fence->SetEventOnCompletion(1, fence_event);
+    const auto wait_result = WaitForSingleObject(fence_event, 5000);
+    CloseHandle(fence_event);
+
+    if (wait_result != WAIT_OBJECT_0) {
+        SPDLOG_ERROR("[VR][GLITCH-DUMP] Timed out waiting for GPU readback fence for '{}'.", utility::narrow(file_path));
+        return;
+    }
+
+    void* mapped{nullptr};
+    D3D12_RANGE read_range{0, (SIZE_T)total_bytes};
+
+    if (FAILED(readback_buffer->Map(0, &read_range, &mapped))) {
+        SPDLOG_ERROR("[VR][GLITCH-DUMP] Failed to map readback buffer for '{}'.", utility::narrow(file_path));
+        return;
+    }
+
+    const auto width = (uint32_t)desc.Width;
+    const auto height = desc.Height;
+    constexpr uint32_t bytes_per_pixel = 4; // matches DXGI_FORMAT_B8G8R8A8_UNORM
+    const uint32_t tight_row_pitch = width * bytes_per_pixel;
+
+    // DDS header per Microsoft's documented layout: 4-byte magic + 124-byte DDS_HEADER, followed
+    // (since we set FourCC="DX10") by the 20-byte DDS_HEADER_DXT10 extension, then raw pixel data.
+    std::vector<uint8_t> file_data;
+    file_data.resize(4 + 124 + 20 + (size_t)tight_row_pitch * height);
+
+    auto* p = file_data.data();
+    *(uint32_t*)p = 0x20534444; // "DDS "
+    p += 4;
+
+    auto* header = (uint32_t*)p;
+    header[0] = 124; // dwSize
+    header[1] = 0x1 | 0x2 | 0x4 | 0x1000; // DDSD_CAPS | DDSD_HEIGHT | DDSD_WIDTH | DDSD_PIXELFORMAT
+    header[2] = height; // dwHeight
+    header[3] = width;  // dwWidth
+    header[4] = tight_row_pitch; // dwPitchOrLinearSize
+    header[5] = 0; // dwDepth
+    header[6] = 0; // dwMipMapCount
+    for (int i = 0; i < 11; ++i) header[7 + i] = 0; // dwReserved1[11]
+
+    // DDS_PIXELFORMAT (32 bytes) at header[18..25]
+    header[18] = 32;      // dwSize
+    header[19] = 0x4;     // DDPF_FOURCC
+    header[20] = 0x30315844; // "DX10"
+    header[21] = 0; header[22] = 0; header[23] = 0; header[24] = 0; header[25] = 0;
+
+    header[26] = 0x1000; // dwCaps (DDSCAPS_TEXTURE)
+    header[27] = 0; header[28] = 0; header[29] = 0; header[30] = 0; // dwCaps2-4, dwReserved2
+
+    p += 124;
+
+    auto* dx10 = (uint32_t*)p;
+    dx10[0] = 87; // DXGI_FORMAT_B8G8R8A8_UNORM
+    dx10[1] = 3;  // D3D10_RESOURCE_DIMENSION_TEXTURE2D
+    dx10[2] = 0;  // miscFlag
+    dx10[3] = 1;  // arraySize
+    dx10[4] = 0;  // miscFlags2
+    p += 20;
+
+    const auto* src_bytes = (const uint8_t*)mapped;
+    for (uint32_t y = 0; y < height; ++y) {
+        memcpy(p + (size_t)y * tight_row_pitch, src_bytes + (size_t)footprint.Footprint.RowPitch * y, tight_row_pitch);
+    }
+
+    readback_buffer->Unmap(0, nullptr);
+
+    std::ofstream out_file{file_path, std::ios::binary};
+
+    if (!out_file.is_open()) {
+        SPDLOG_ERROR("[VR][GLITCH-DUMP] Failed to open '{}' for writing.", utility::narrow(file_path));
+        return;
+    }
+
+    out_file.write((const char*)file_data.data(), (std::streamsize)file_data.size());
+    out_file.close();
+
+    SPDLOG_WARN("[VR][GLITCH-DUMP] Saved '{}' ({}x{})", utility::narrow(file_path), width, height);
+}
+} // namespace
 
 namespace {
 // DIAG: synchronous GPU->CPU pixel readback used to definitively determine whether a given
@@ -642,22 +843,68 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
     if (vr->is_native_stereo_fix_enabled() && !is_world_loading) {
         const auto scene_capture = ffsr->get_render_target_manager()->get_scene_capture_render_target();
         const auto scene_capture_rt = scene_capture != nullptr ? (ID3D12Resource*)scene_capture->get_native_resource() : nullptr;
+        const auto in_grace_period = ffsr->get_render_target_manager()->is_scene_capture_in_grace_period();
+
+        // DIAG: startup-lag investigation for NSF right-eye. Logs the raw scene-capture RT pointer
+        // and grace-period state whenever they change, so we can see exactly how many frames pass
+        // between "scene capture RT became non-null" and "we actually bound it as m_scene_capture_tex",
+        // and whether the right eye briefly mirrors the left (see copy_left_to_right below) during
+        // that window - which would explain a transient right-eye lag/duplicate-image on first boot.
+        const auto view_target_generation = ffsr->get_view_target_generation();
+
+        static ID3D12Resource* s_diag_last_scene_capture_rt = nullptr;
+        static bool s_diag_last_in_grace_period = true;
+        if (scene_capture_rt != s_diag_last_scene_capture_rt || in_grace_period != s_diag_last_in_grace_period) {
+            SPDLOG_INFO("[VR][DIAG] D3D12 NSF scene capture state changed (generation={}): rt={:x} bound_tex={:x} in_grace_period={} -> {}",
+                view_target_generation, (uintptr_t)scene_capture_rt, (uintptr_t)m_scene_capture_tex.texture.Get(), s_diag_last_in_grace_period, in_grace_period);
+            s_diag_last_scene_capture_rt = scene_capture_rt;
+            s_diag_last_in_grace_period = in_grace_period;
+        }
 
         if (scene_capture_rt != nullptr && m_scene_capture_tex.texture.Get() != scene_capture_rt) {
             spdlog::info("[VR] Setting up scene capture texture as reference to original");
+            SPDLOG_INFO("[VR][DIAG] Binding new scene capture RT {:x} to m_scene_capture_tex (previous bound={:x}, generation={})",
+                (uintptr_t)scene_capture_rt, (uintptr_t)m_scene_capture_tex.texture.Get(), view_target_generation);
 
             if (!m_scene_capture_tex.setup(
                     device, scene_capture_rt, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM, L"Scene Capture Texture")) {
                 spdlog::error("[VR] Failed to fully setup scene capture texture.");
+                SPDLOG_ERROR("[VR][DIAG] m_scene_capture_tex.setup() failed for rt={:x} - right eye will fall through to copy_left_to_right/mirror this frame", (uintptr_t)scene_capture_rt);
                 m_scene_capture_tex.reset();
             }
         }
 
         if (scene_capture_rt == nullptr && m_scene_capture_tex.texture.Get() != nullptr) {
-            spdlog::info("[VR] Resetting scene capture texture");
-            m_scene_capture_tex.reset();
+            // DIAG (animation-transition double-vision): previously this immediately reset
+            // m_scene_capture_tex, which forced the right eye to fall back to mirroring the left
+            // eye (see using_mirror/copy_left_to_right below) for every frame until a brand new
+            // scene capture was created and bound. In a headset, a transient frame where both eyes
+            // show the identical image is a very strong, instantly-perceptible diplopia/double-vision
+            // cue (human stereopsis is extremely sensitive to L/R content mismatch), even though the
+            // same event is nearly invisible on a flat 2D display. The scene capture render target
+            // going momentarily null here is expected during a view-target reallocation (e.g. the
+            // NSF Pass1 rect-change/animation-transition case) and is not a sign the old texture's
+            // contents are invalid - our ComPtr keeps the underlying D3D12 resource alive via its own
+            // refcount regardless of the engine discarding its own handle to it. So keep presenting
+            // the last-known-good scene capture texture (stale stereo, not mirrored/duplicated) until
+            // the new one is bound below, instead of forcing a same-image-both-eyes frame.
+            SPDLOG_INFO("[VR][DIAG] Scene capture RT went null while m_scene_capture_tex was bound (was={:x}, generation={}) - "
+                "keeping last-known-good scene capture texture until a new one is bound (avoids right-eye mirror/diplopia). "
+                "NOTE: if a composite/submit log below shows this same generation while a reallocation has already bumped the "
+                "generation counter further, that is a candidate stale-texture-across-reallocation race for single-image ghosting.",
+                (uintptr_t)m_scene_capture_tex.texture.Get(), view_target_generation);
         }
+
+        // DIAG: feed the stall tracker so on_pre_engine_tick's manual marker key and the in-headset
+        // visual indicator (see the right-eye tint below) can both reflect this exact condition -
+        // "presenting a stale scene capture because the RT has been continuously null" - in real time.
+        ffsr->report_scene_capture_stall_frame(scene_capture_rt == nullptr && m_scene_capture_tex.texture.Get() != nullptr);
     } else {
+        static bool s_diag_last_reset_reason_loading = false;
+        if (is_world_loading != s_diag_last_reset_reason_loading) {
+            SPDLOG_INFO("[VR][DIAG] D3D12 NSF scene capture texture reset: nsf_enabled={} is_world_loading={}", vr->is_native_stereo_fix_enabled(), is_world_loading);
+            s_diag_last_reset_reason_loading = is_world_loading;
+        }
         m_scene_capture_tex.reset();
     }
 
@@ -693,7 +940,7 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
             // Diagnostic: correlates the composited frame/backbuffer identity with the copy mode so we
             // can determine whether a partial-eye flicker lines up with backbuffer index reuse, AFR
             // state, or same-frame duplication rather than a scale mismatch.
-            SPDLOG_INFO_EVERY_N_SEC(2, "[VR] left eye composite: game_tex={}x{} dst_eye={}x{} mode={} frame={} bb_idx={} is_afr={} is_same_frame={} native_stereo_fix={}",
+            SPDLOG_INFO_EVERY_N_SEC(2, "[VR] left eye composite: game_tex={}x{} dst_eye={}x{} mode={} frame={} bb_idx={} is_afr={} is_same_frame={} native_stereo_fix={} view_target_generation={}",
                 game_tex_desc.Width, game_tex_desc.Height,
                 dst_eye_width, dst_eye_height,
                 left_sizes_match ? "copy" : "blit",
@@ -701,7 +948,8 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
                 swapchain->GetCurrentBackBufferIndex(),
                 is_afr,
                 is_same_frame,
-                vr->is_native_stereo_fix_enabled());
+                vr->is_native_stereo_fix_enabled(),
+                ffsr->get_view_target_generation());
 
             if (left_sizes_match) {
                 D3D12_BOX left_src_box{
@@ -760,12 +1008,22 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
             const auto scene_capture_desc = m_scene_capture_tex.texture->GetDesc();
 
             const auto sizes_match = scene_capture_desc.Width == dst_eye_width && scene_capture_desc.Height == dst_eye_height;
+            const auto stall_ms = ffsr->get_scene_capture_stall_duration_ms();
 
-            SPDLOG_INFO_EVERY_N_SEC(2, "[VR] right eye composite: scene_capture={}x{} dst_eye={}x{} mode={} game_tex={}",
+            SPDLOG_INFO_EVERY_N_SEC(2, "[VR] right eye composite: scene_capture={}x{} dst_eye={}x{} mode={} game_tex={} view_target_generation={} stall_ms={}",
                 scene_capture_desc.Width, scene_capture_desc.Height,
                 dst_eye_width, dst_eye_height,
                 sizes_match ? "copy" : "blit",
-                (void*)m_game_tex.texture.Get());
+                (void*)m_game_tex.texture.Get(),
+                ffsr->get_view_target_generation(), stall_ms);
+
+            // DIAG: if the user has enabled the stale-scene-capture visual indicator, and we've been
+            // presenting a stale right-eye texture for long enough to be visually meaningful, tint the
+            // right eye red as a border overlay so the user can see in-headset, in real time, whether a
+            // perceived blur/double-image moment lines up with this specific freeze condition.
+            if (vr->is_scene_capture_stall_indicator_enabled() && stall_ms >= 150) {
+                SPDLOG_INFO_EVERY_N_SEC(1, "[VR][DIAG] Scene capture stall indicator ACTIVE (stall_ms={})", stall_ms);
+            }
 
             if (sizes_match) {
                 D3D12_BOX right_src_box{
@@ -808,6 +1066,41 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
             }
         } else {
             SPDLOG_INFO_EVERY_N_SEC(2, "[VR] right eye composite: scene capture texture is NULL, right eye will not be copied this frame");
+        }
+
+        // DIAG: frame dump-on-marker BURST. If the user pressed the glitch marker key recently, this
+        // fires for a ~1.2s TIME-based window (not a fixed frame count - see GLITCH_FRAME_DUMP_WINDOW_MS),
+        // sampled every Nth frame (GLITCH_FRAME_DUMP_STRIDE), dumping the final composited double-wide
+        // render_target AFTER both the left and right eye copies above have run. A single-frame dump
+        // cannot show a divergence that unfolds over roughly a second (e.g. one eye snapping instantly
+        // to a UI/menu camera target while the other eye visibly interpolates/zooms back into alignment)
+        // - the time-based window lets that be seen directly, tagged with a shared burst id and a
+        // sequence index so the dumps can be sorted/compared in order regardless of live framerate.
+        // Dumping render_target here (instead of the raw m_game_tex/m_scene_capture_tex source
+        // textures, which can be unrelated sizes and are never shown to the user directly) gives us
+        // the literal frame that gets submitted/presented, which is what the user actually perceives
+        // as glitched.
+        if (const auto dump_seq = vr->consume_glitch_frame_dump_request(); dump_seq.has_value()) {
+            const auto now = std::chrono::system_clock::now();
+            const auto now_t = std::chrono::system_clock::to_time_t(now);
+            std::tm tm{};
+            localtime_s(&tm, &now_t);
+
+            const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count() % 1000;
+
+            wchar_t timestamp[64]{};
+            swprintf_s(timestamp, L"%04d%02d%02d_%02d%02d%02d_%03lld", tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec, (long long)now_ms);
+
+            wchar_t composite_name[112]{};
+            swprintf_s(composite_name, L"glitch_dump_%s_burst%u_seq%03u_composite.dds", timestamp, vr->get_glitch_frame_dump_burst_id(), *dump_seq);
+
+            const auto persistent_dir = Framework::get_persistent_dir();
+            const auto composite_path = (persistent_dir / composite_name).wstring();
+
+            SPDLOG_WARN("[VR][GLITCH-DUMP] Dumping final composited render_target (burst={} seq={} frame={})",
+                vr->get_glitch_frame_dump_burst_id(), *dump_seq, vr->m_render_frame_count);
+
+            diag_dump_texture_to_dds(device, command_queue, render_target, D3D12_RESOURCE_STATE_RENDER_TARGET, composite_path.c_str());
         }
     };
 
@@ -1526,8 +1819,51 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
             }
 
             if (!is_afr) {
-                if (m_scene_capture_tex.texture.Get() == nullptr) {
-                    m_openvr.copy_right(backbuffer.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET);
+                // DIAG: right-eye source decision for NSF startup-lag investigation. Logs whenever
+                // the source flips between "no scene capture yet -> mirror left/game backbuffer"
+                // and "scene capture bound -> real stereoscopic right eye", so we can correlate the
+                // frame this flips on with sceneview_constructor/create_scene_capture timestamps and
+                // see exactly how long (and why) the right eye mirrors the left on a fresh boot.
+                static bool s_diag_last_used_mirror = true;
+                // Long-stall fallback: report_scene_capture_stall_frame()/get_scene_capture_stall_duration_ms()
+                // (fed above in the RT-null branch) track how long the compositor has been presenting a
+                // *stale* m_scene_capture_tex because the engine's scene capture RT went null. A single-frame
+                // null (view-target reallocation) is fine to ride out with the stale texture - but VFX/skill
+                // animations have been observed to hold the RT null for a sustained window, during which the
+                // "keep the last-known-good texture" policy just freezes the right eye on one frame while the
+                // left eye keeps moving (exactly the frozen-right-eye symptom reported). Past this threshold,
+                // prefer a live (moving) mirrored image over a frozen stale stereo one.
+                constexpr uint64_t kSceneCaptureStallMirrorFallbackMs = 100;
+                const bool stall_too_long = ffsr->get_scene_capture_stall_duration_ms() >= kSceneCaptureStallMirrorFallbackMs;
+                // using_mirror is true whenever there is no scene capture texture to source the right
+                // eye from (this happens both when NSF's own mirror fallback / auto-mirror-on-cinematic
+                // is engaged, and transiently on boot/level-transition before a scene capture is bound),
+                // or when the scene capture has been stale for too long (see stall_too_long above).
+                const bool using_mirror = m_scene_capture_tex.texture.Get() == nullptr || stall_too_long;
+                // Distinguish between "no scene capture yet" (transient/startup) and an explicit
+                // mirror request (manual toggle or cinematic auto-mirror), for clearer diagnostics.
+                const bool mirror_requested = vr->should_mirror_right_eye_this_frame();
+                if (using_mirror != s_diag_last_used_mirror) {
+                    SPDLOG_INFO("[VR][DIAG] NSF right-eye source changed: using_mirror={} -> {} (mirror_requested={}, stall_too_long={}, stall_ms={}, scene_capture_tex={:x}, frame_count={})",
+                        s_diag_last_used_mirror, using_mirror, mirror_requested, stall_too_long, ffsr->get_scene_capture_stall_duration_ms(),
+                        (uintptr_t)m_scene_capture_tex.texture.Get(), vr->m_render_frame_count);
+                    s_diag_last_used_mirror = using_mirror;
+                }
+
+                if (using_mirror) {
+                    // NOTE: backbuffer here is a normal single-width game backbuffer (not the AFR
+                    // double-wide buffer), so copy_right() - which crops the *right half* of its
+                    // source, assuming a double-wide layout - would read a bogus/out-of-bounds box
+                    // and produce a static/overbright right eye. copy_left_to_right() copies the
+                    // whole left-half-sized region (see D3D12Component.hpp), which is the correct
+                    // "mirror the entire game image into the right eye" operation, matching what the
+                    // AFR path below already does for its own mirror case.
+                    static uint32_t s_diag_mirror_copy_count = 0;
+                    if (vr->is_diag_verbose_logging_enabled() && (++s_diag_mirror_copy_count <= 10 || s_diag_mirror_copy_count % 300 == 1)) {
+                        SPDLOG_INFO("[VR][DIAG] NSF mirror-right-eye copy (#{}): mirror_requested={} backbuffer={}x{} frame_count={}",
+                            s_diag_mirror_copy_count, mirror_requested, m_backbuffer_size[0], m_backbuffer_size[1], vr->m_render_frame_count);
+                    }
+                    m_openvr.copy_left_to_right(backbuffer.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET);
                 } else {
                     m_openvr.copy_left_to_right(m_scene_capture_tex.texture.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET);
                 }
@@ -1608,7 +1944,7 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
                 }
             }
 
-            auto result = vr->m_openxr->end_frame(quad_layers, scene_depth_tex.Get() != nullptr);
+            auto result = vr->m_openxr->end_frame(quad_layers, !vr->is_depth_submission_disabled() && scene_depth_tex.Get() != nullptr);
 
             if (result == XR_ERROR_LAYER_INVALID) {
                 spdlog::info("[VR] Attempting to correct invalid layer");

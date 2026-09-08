@@ -4,6 +4,7 @@
 #include <winternl.h>
 #include <unordered_set>
 #include <array>
+#include <cmath>
 
 #include <asmjit/asmjit.h>
 #include <future>
@@ -4361,6 +4362,17 @@ static void* lgui_slot24_hook(void* self, void* a2, void* a3, void* a4, void* a5
         return nullptr;
     }
 
+    // TRIGGER: any invocation of this hook means LGUI's RDG draw pass exists and is executing this
+    // frame. The user has observed the LGUI-driven UI/quad go fully blank during certain skill/VFX
+    // animations and return once the animation ends - when the UI is blanked, LGUI produces no draw
+    // pass and this hook simply stops being called for that window. That makes "time since this hook
+    // last fired" a much more direct signal for "is a skill/VFX animation currently playing" than
+    // bCinematicMode, which only reflects Sequencer/Matinee cutscenes and never fired for this case.
+    // See report_lgui_draw_heartbeat()/get_lgui_draw_silence_duration_ms().
+    if (g_hook != nullptr) {
+        g_hook->report_lgui_draw_heartbeat();
+    }
+
     static uint32_t call_count = 0;
     const auto n = call_count++;
 
@@ -6218,6 +6230,27 @@ bool FFakeStereoRenderingHook::is_in_viewport_client_draw() const {
     return m_in_viewport_client_draw && GameThreadWorker::get().is_same_thread();
 }
 
+// Tracks the FSceneViewFamily that begin_render_viewfamily_real most recently confirmed to be the
+// real HMD stereo family (i.e. it had >=2 views, a valid scene interface, and a valid render
+// target). sceneview_constructor() cannot tell an unrelated single-view scene capture (menu
+// portrait captures, UI thumbnail captures, etc.) apart from the real stereo family just from
+// stereo-pass value alone, and forcing those unrelated families into the same-pass path corrupts
+// their render (black menu characters, black screens). Gate the same-pass branch on this pointer
+// so it only ever touches the real HMD family.
+static std::atomic<sdk::FSceneViewFamily*> g_last_real_stereo_view_family{nullptr};
+
+// DIAG: correlates the raw view_index passed into calculate_stereo_view_offset() with the real
+// FSceneView metadata later observed for that same view inside sceneview_constructor(). These are
+// two separate engine call sites, but UE processes one view at a time on the game thread
+// (ULocalPlayer::CalcSceneView -> GetProjectionData -> IStereoRendering::CalculateStereoViewOffset,
+// immediately followed by that same view's FSceneView constructor) before moving on to the next
+// view, so "most recently seen view_index this frame" reliably identifies which raw index produced
+// the FSceneView that sceneview_constructor is currently looking at. This gives an authoritative
+// view_index <-> {StereoPass, ViewRect, ViewFamily, Actor, PlayerIndex} mapping instead of inferring
+// identity from call-site RVA or index parity alone (see NSF-VIEWINDEX-IDENTITY below).
+static thread_local std::optional<int32_t> t_last_calc_stereo_view_index{};
+static thread_local uint32_t t_last_calc_stereo_view_index_frame{0xFFFFFFFFu};
+
 // FSceneView constructor hook
 sdk::FSceneView* FFakeStereoRenderingHook::sceneview_constructor(sdk::FSceneView* view, sdk::FSceneViewInitOptions* init_options, void* a3, void* a4) {
     SPDLOG_INFO_ONCE("Called FSceneView constructor for the first time");
@@ -6274,6 +6307,43 @@ sdk::FSceneView* FFakeStereoRenderingHook::sceneview_constructor(sdk::FSceneView
         SPDLOG_INFO("[VR] sceneview_constructor: new call site {:x} -> view_family={:x} plausible={} stereo_pass={} view_rect=({},{})-({},{})",
             retaddr, (uintptr_t)early_view_family, view_family_plausible, (int32_t)init_options->get_stereo_pass(),
             init_options->view_rect[0], init_options->view_rect[1], init_options->view_rect[2], init_options->view_rect[3]);
+    }
+
+    // DIAG: NSF-VIEWINDEX-IDENTITY. Attributes the raw view_index most recently seen by
+    // calculate_stereo_view_offset() (same frame, same game thread) to the ground-truth FSceneView
+    // metadata this constructor call is producing for that view: real engine StereoPass, view rect
+    // size/position, whether its ViewFamily is the confirmed real HMD stereo family (as opposed to an
+    // unrelated single-view scene capture), and its owning actor/player index. This is authoritative -
+    // unlike GetViewPassForIndex (synthetic, parity-based) or caller-RVA alone (only proves which UE
+    // loop iterates the indices, not what each index semantically is).
+    if (VR::get() != nullptr && VR::get()->is_diag_log_raw_view_index_enabled()) {
+        const bool index_is_current_frame = t_last_calc_stereo_view_index.has_value() && t_last_calc_stereo_view_index_frame == g_frame_count;
+        const int32_t attributed_view_index = index_is_current_frame ? *t_last_calc_stereo_view_index : -2;
+
+        const bool is_known_real_stereo_family = view_family_plausible &&
+            early_view_family == g_last_real_stereo_view_family.load(std::memory_order_relaxed);
+
+        const int32_t rect_w = init_options->view_rect[2] - init_options->view_rect[0];
+        const int32_t rect_h = init_options->view_rect[3] - init_options->view_rect[1];
+
+        static thread_local int32_t s_last_logged_attributed_index = -3;
+        static thread_local uint32_t s_last_logged_frame = 0xFFFFFFFFu;
+
+        // Throttle: one line per (attributed_index, frame) pair rather than one per call site, since
+        // this needs to show every distinct index's per-frame identity, not just the first sighting.
+        if (attributed_view_index != s_last_logged_attributed_index || g_frame_count != s_last_logged_frame) {
+            s_last_logged_attributed_index = attributed_view_index;
+            s_last_logged_frame = g_frame_count;
+
+            SPDLOG_WARN("[VR][NSF-VIEWINDEX-IDENTITY] frame={} view_index={} (attributed_this_frame={}) retaddr={:x} "
+                "stereo_pass={} view_family={:x} is_real_stereo_family={} rect=({},{})-({},{}) size={}x{} "
+                "scene_state={:x} actor={:x} player_index={}",
+                g_frame_count, attributed_view_index, index_is_current_frame, retaddr,
+                (int32_t)init_options->get_stereo_pass(), (uintptr_t)early_view_family, is_known_real_stereo_family,
+                init_options->view_rect[0], init_options->view_rect[1], init_options->view_rect[2], init_options->view_rect[3],
+                rect_w, rect_h, (uintptr_t)init_options->get_scene_state(),
+                (uintptr_t)init_options->actor, init_options->player_index);
+        }
     }
 
     if (view_family_plausible) {
@@ -6421,10 +6491,23 @@ sdk::FSceneView* FFakeStereoRenderingHook::sceneview_constructor(sdk::FSceneView
     const auto init_options_stereo_pass = init_options->get_stereo_pass();
 
     std::optional<uint32_t> views_original_count{};
+    bool same_pass_entered = false;
+    static thread_local int32_t s_same_pass_reentrancy_depth = 0;
 
-    SPDLOG_INFO_EVERY_N_SEC(2, "[VR] sceneview_constructor: same_pass_enabled={} init_options_stereo_pass={} scene_capture_rt={}",
-        vr->is_native_stereo_fix_same_pass_enabled(), (int32_t)init_options_stereo_pass,
+    SPDLOG_INFO_EVERY_N_SEC(2, "[VR] sceneview_constructor: same_pass_enabled={} force_primary_enabled={} init_options_stereo_pass={} scene_capture_rt={}",
+        vr->is_native_stereo_fix_same_pass_enabled(), vr->is_native_stereo_fix_same_pass_force_primary_enabled(), (int32_t)init_options_stereo_pass,
         (void*)g_hook->get_render_target_manager()->get_scene_capture_render_target());
+
+    // DIAG: only fires when the force-primary diagnostic toggle is on, so this is decisive/verbose
+    // logging that is safe to leave enabled specifically while re-testing that path (not gated by
+    // _EVERY_N_SEC, so every single FSceneView constructor call is visible during the test).
+    if (vr->is_native_stereo_fix_same_pass_force_primary_enabled()) {
+        SPDLOG_INFO(
+            "[VR][SAME-PASS-FORCE] sceneview_constructor ENTRY: init_options={:x} view={:x} init_options_stereo_pass={} "
+            "view_family={:x} scene_state={:x}",
+            (uintptr_t)init_options, (uintptr_t)view, (int32_t)init_options_stereo_pass,
+            (uintptr_t)init_options->get_view_family(), (uintptr_t)init_options_scene_state);
+    }
 
     // =========================================================================
     // LEVEL TRANSITION / LOAD GUARD
@@ -6488,23 +6571,60 @@ sdk::FSceneView* FFakeStereoRenderingHook::sceneview_constructor(sdk::FSceneView
             is_actively_loading, tick_stalled_svc, no_local_pawn_svc, boot_phase_svc, in_grace_period);
 
         // Only alter view counts if the target exists AND the level isn't actively tearing down / loading
-        // AND we're past the post-readiness grace period.
-        if (g_hook->get_render_target_manager()->get_scene_capture_render_target() != nullptr && !is_actively_loading && !in_grace_period) {
-            SPDLOG_INFO_EVERY_N_SEC(
-                2, "[VR] sceneview_constructor: entering same-pass branch, forcing stereo pass to PRIMARY for secondary view");
+        // AND we're past the post-readiness grace period AND this is confirmed to be the real HMD
+        // stereo family, not an unrelated single-view scene capture (menu portraits, UI thumbnails,
+        // etc.) that also passes through this constructor with a non-PRIMARY stereo pass. Without
+        // this check the same-pass branch was hijacking those unrelated families, blanking them out
+        // (black menu characters, black in-game screens) - see the views.count==0 evidence in the log.
+        auto candidate_view_family = init_options->get_view_family();
+        const bool is_real_stereo_family = candidate_view_family != nullptr &&
+            candidate_view_family == g_last_real_stereo_view_family.load(std::memory_order_relaxed);
 
-            init_options->set_stereo_pass(EStereoscopicPass::eSSP_PRIMARY);
+        if (g_hook->get_render_target_manager()->get_scene_capture_render_target() != nullptr && !is_actively_loading &&
+            !in_grace_period && is_real_stereo_family) {
+            // DIAG/EXPERIMENTAL RE-ENABLE: forcing StereoPass=PRIMARY on the secondary (right-eye)
+            // view was confirmed via diagnostics in an earlier session to be the actual root cause
+            // of the black-screen reports (main menu characters black, world visible behind HUD on
+            // loading screen, black in-game both eyes). Log evidence (2026-09-06 session) proved
+            // is_real_stereo_family=true for this exact family/branch, ruling out the earlier
+            // "hijacked unrelated family" theory - the Views.count==0/1 readings were simply the
+            // engine constructing Pass1 then Pass2 in-order (count hasn't been incremented yet at
+            // construction time), not a corrupted state. The real problem is structural: with two
+            // views flagged PRIMARY in the same family, whatever per-family shadow/base-pass setup
+            // keys off StereoPass==PRIMARY can only fully render one of them, silently dropping or
+            // misdirecting the other eye's render - exactly matching the reported symptoms. There
+            // is no known safe way to make the engine treat two views as PRIMARY simultaneously
+            // without patching that internal (unsymboled) engine logic directly, so this override
+            // stays gated behind a SEPARATE, off-by-default diagnostic toggle
+            // (is_native_stereo_fix_same_pass_force_primary_enabled()) instead of the main
+            // "Use Same Stereo Pass" toggle, so it can be deliberately re-tested with decisive
+            // logging without silently reintroducing the black-screen regression for normal users.
+            if (vr->is_native_stereo_fix_same_pass_force_primary_enabled()) {
+                const auto view_family_for_log = candidate_view_family;
+                const auto views_for_log = view_family_for_log != nullptr ? view_family_for_log->get_views() : nullptr;
+                const auto views_count_for_log = views_for_log != nullptr ? views_for_log->count : (uint32_t)0xFFFFFFFF;
 
-            auto view_family = init_options->get_view_family();
-            auto views = view_family != nullptr ? view_family->get_views() : nullptr;
+                SPDLOG_INFO(
+                    "[VR][SAME-PASS-FORCE] About to force StereoPass=PRIMARY: view_family={:x} views_ptr={:x} "
+                    "views_count={} init_options_stereo_pass(before)={} scene_capture_rt={:x} is_actively_loading={} "
+                    "in_grace_period={} is_real_stereo_family={}",
+                    (uintptr_t)view_family_for_log, (uintptr_t)views_for_log, views_count_for_log,
+                    (int32_t)init_options_stereo_pass,
+                    (uintptr_t)g_hook->get_render_target_manager()->get_scene_capture_render_target(),
+                    is_actively_loading, in_grace_period, is_real_stereo_family);
 
-            if (views != nullptr) {
-                // Hide the fact that we have multiple views from the FSceneView constructor.
-                views_original_count = views->count;
-                views->count = 0;
+                init_options->set_stereo_pass((uint32_t)EStereoscopicPass::eSSP_PRIMARY);
+
+                SPDLOG_INFO(
+                    "[VR][SAME-PASS-FORCE] Forced StereoPass=PRIMARY: view_family={:x} init_options_stereo_pass(after)={}",
+                    (uintptr_t)view_family_for_log, (int32_t)init_options->get_stereo_pass());
+            } else {
+                SPDLOG_INFO_EVERY_N_SEC(
+                    2, "[VR] sceneview_constructor: same-pass branch conditions met but override is disabled (see comment) - leaving stereo pass untouched");
             }
         } else {
-            SPDLOG_INFO_EVERY_N_SEC(2, "[VR] sceneview_constructor: skipping view count override during level transition / null target");
+            SPDLOG_INFO_EVERY_N_SEC(2, "[VR] sceneview_constructor: skipping view count override (loading={} in_grace_period={} is_real_stereo_family={} candidate_view_family={:x})",
+                is_actively_loading, in_grace_period, is_real_stereo_family, (uintptr_t)candidate_view_family);
         }
     }
 
@@ -6550,20 +6670,31 @@ sdk::FSceneView* FFakeStereoRenderingHook::sceneview_constructor(sdk::FSceneView
 
     auto result = g_hook->m_sceneview_data.constructor_hook.unsafe_call<sdk::FSceneView*>(view, init_options, a3, a4);
 
+    if (vr->is_native_stereo_fix_same_pass_force_primary_enabled()) {
+        SPDLOG_INFO(
+            "[VR][SAME-PASS-FORCE] sceneview_constructor EXIT: init_options={:x} result_view={:x} "
+            "init_options_stereo_pass(final)={} is_null_result={}",
+            (uintptr_t)init_options, (uintptr_t)result, (int32_t)init_options->get_stereo_pass(), result == nullptr);
+    }
+
+    // Restore the hidden view count now that this constructor call (and anything nested inside it)
+    // has finished, so the reentrancy guard above only ever sees a corrupted count if something
+    // genuinely re-entered while we still had it hidden.
+    if (same_pass_entered) {
+        auto view_family_restore = init_options->get_view_family();
+        auto views_restore = view_family_restore != nullptr ? view_family_restore->get_views() : nullptr;
+
+        if (views_restore != nullptr && views_original_count.has_value()) {
+            views_restore->count = views_original_count.value();
+        }
+
+        --s_same_pass_reentrancy_depth;
+    }
+
     // Only trust the init-options state pointer for live-offset discovery once sceneview_xref has
     // corrected the init-options layout for this game; before that get_scene_state() reads garbage.
     if (is_valid_scene_state && sceneview_xref::resolved) {
         sceneview_xref::resolve_live_scene_state(view, init_options->get_scene_state());
-    }
-
-    // Reset the view count back to what it was.
-    if (views_original_count.has_value()) {
-        auto view_family = init_options->get_view_family();
-        auto views = view_family != nullptr ? view_family->get_views() : nullptr;
-
-        if (views != nullptr) {
-            views->count = views_original_count.value();
-        }
     }
 
     return result;
@@ -6745,10 +6876,12 @@ void FFakeStereoRenderingHook::begin_render_viewfamily_real(
         }
     }
 
-    if (!vr->is_hmd_active() || !vr->is_native_stereo_fix_enabled() || vr->is_native_stereo_fix_mirror_enabled()) {
+    if (!vr->is_hmd_active() || !vr->is_native_stereo_fix_enabled() || vr->should_mirror_right_eye_this_frame()) {
         // Mirror mode intentionally takes the same no-scene-capture path as native stereo fix
         // being disabled: no actor is spawned, and the right eye falls back to the existing
         // "mirror the left/game texture" compositing already present in D3D11Component/D3D12Component.
+        // should_mirror_right_eye_this_frame() covers both the manual mirror toggle and the
+        // auto-mirror-on-cinematic fallback (bCinematicMode).
         rtm->destroy_scene_capture();
 
         g_hook->m_render_module_begin_render_viewfamily_hook.unsafe_call<void>(render_module, canvas, view_family_candidate);
@@ -6785,6 +6918,14 @@ void FFakeStereoRenderingHook::begin_render_viewfamily_real(
     }
 
     auto& views = *views_ptr;
+
+    // Record this as the confirmed real HMD stereo family (>=2 views, valid scene interface/RT
+    // already established above) so sceneview_constructor's same-pass branch can distinguish it
+    // from unrelated single-view scene captures (menu portraits, UI thumbnails, etc.) that also
+    // flow through the FSceneView constructor with a non-PRIMARY stereo pass.
+    if (views.count >= 2) {
+        g_last_real_stereo_view_family.store(view_family, std::memory_order_relaxed);
+    }
     const auto prev_count = views.count;
 
     const auto rt = rtm->get_scene_capture_utexture();
@@ -7003,7 +7144,16 @@ void FFakeStereoRenderingHook::begin_render_viewfamily_real(
     // view state) is most likely to desync the two eyes for a frame or two. When detected, we skip
     // those borrow/null hacks for this single frame so Pass2 renders fully on its own state instead
     // of a stale/mismatched one.
+    //
+    // NOTE: an earlier version of this guard also tried to detect camera cuts/refocus by a raw
+    // frame-to-frame view_origin distance threshold. Logs showed that heuristic misfiring on
+    // ordinary fast camera/character movement (dashing/running easily exceeds any fixed uu/frame
+    // threshold), so it was forcing a Pass2 view-state reset almost every frame during motion -
+    // likely making the desync worse rather than better. Removed; the rect-change signal below is
+    // kept since it's a discrete, reliable event (resolution/layout only changes on real UI
+    // transitions, never during normal camera motion).
     bool nsf_pass2_hacks_safe_this_frame = true;
+    bool nsf_force_reset_pass2_state_this_frame = false;
     {
         static uint32_t diag_pass1_count = 0;
         ++diag_pass1_count;
@@ -7022,10 +7172,28 @@ void FFakeStereoRenderingHook::begin_render_viewfamily_real(
                  rect_raw_pass1[2] != prev_pass1_rect[2] || rect_raw_pass1[3] != prev_pass1_rect[3])) {
                 nsf_pass2_hacks_safe_this_frame = false;
 
+                // DIAG (animation-transition double-vision): forcing a hard reset of Pass2's live
+                // view state on this transient frame (nulling FSceneViewState) was found to itself be
+                // the likely source of a one-frame stereo divergence right at the transition, since it
+                // discards occlusion/TAA history for one eye only while the other eye keeps its state.
+                // Leaving nsf_force_reset_pass2_state_this_frame=false here means we still skip the
+                // borrow hacks (still safe) but no longer forcibly null Pass2's state on this frame.
+                nsf_force_reset_pass2_state_this_frame = false;
+
+                // The rect jump also means the view target is about to need reallocating to the new
+                // (portrait, single-camera) size. The normal reallocation path debounces for 5 frames
+                // (~1s) to avoid thrashing on transient 2D-screen backbuffer resizes, but that same
+                // debounce leaves the render target mismatched against the engine's already-changed
+                // view rect for the whole debounce window during this animation-transition case,
+                // which manifests as the double-vision persisting/slowly resolving. Force the
+                // reallocation to happen immediately instead of waiting out the debounce.
+                g_hook->set_should_recreate_textures(true);
+
                 SPDLOG_INFO("[VR] NSF: Pass1 view_rect changed since last frame (({},{})-({},{}) -> ({},{})-({},{})); "
-                    "skipping Pass2 state-borrow hacks this frame to avoid eye desync",
+                    "skipping Pass2 state-borrow hacks this frame to avoid eye desync (forcing immediate view target reallocation, current generation={})",
                     prev_pass1_rect[0], prev_pass1_rect[1], prev_pass1_rect[2], prev_pass1_rect[3],
-                    rect_raw_pass1[0], rect_raw_pass1[1], rect_raw_pass1[2], rect_raw_pass1[3]);
+                    rect_raw_pass1[0], rect_raw_pass1[1], rect_raw_pass1[2], rect_raw_pass1[3],
+                    g_hook->get_view_target_generation());
             }
 
             memcpy(prev_pass1_rect, rect_raw_pass1, sizeof(prev_pass1_rect));
@@ -7062,7 +7230,22 @@ void FFakeStereoRenderingHook::begin_render_viewfamily_real(
             // "DIAG: NSF Pass2 Frame Count Mode" debug combo to A/B test None/Increment against
             // the current default (Decrement) - Increment intentionally looks like "a new frame"
             // to that logic, at the risk of a motion vector artifact, to isolate the true cause.
-            switch (vr->get_diag_nsf_pass2_frame_count_mode()) {
+            //
+            // DIAG: animation-blur investigation. The scene's frame count also gates many
+            // double-buffered animation/render systems (GPU skin cache "previous frame" bone
+            // buffer selection, cloth/anim-blueprint interpolation alpha, TAA/motion-vector
+            // history). If Pass2's mutated count causes those systems to read a STALE buffer
+            // (the pose from before an animation-driven camera transition/reset instead of the
+            // just-updated one), that would manifest as exactly what's reported: the right eye
+            // (or whichever eye is Pass2 this frame) momentarily showing an old/default pose
+            // during the transition, resolving once motion stops. Log the scene frame count
+            // immediately before/after the mutation, tagged with the active mode and a
+            // high-resolution timestamp, so a captured log can be correlated against the exact
+            // moment a visual glitch is observed.
+            const auto pre_mutation_frame_count = scene->get_frame_count();
+            const auto mutation_mode = vr->get_diag_nsf_pass2_frame_count_mode();
+
+            switch (mutation_mode) {
             case 1: // None
                 break;
             case 2: // Increment
@@ -7072,6 +7255,15 @@ void FFakeStereoRenderingHook::begin_render_viewfamily_real(
                 scene->decrement_frame_count();
                 break;
             }
+
+            static const char* const mode_names[] = {"Decrement", "None", "Increment"};
+            const auto mode_name = (mutation_mode >= 0 && mutation_mode <= 2) ? mode_names[mutation_mode] : "Unknown";
+            const auto now_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+
+            SPDLOG_INFO_EVERY_N_SEC(1,
+                "[NSF-ANIM-DIAG] Pass2 scene frame_count mutation: mode={} pre={} post={} g_frame_count={} t_us={}",
+                mode_name, pre_mutation_frame_count, scene->get_frame_count(), g_frame_count, now_us);
         }
 
         std::swap(views[0], views[1]);
@@ -7147,9 +7339,14 @@ void FFakeStereoRenderingHook::begin_render_viewfamily_real(
                 (uintptr_t)pass1_state, (uintptr_t)*pass2_state_slot, pass1_state == *pass2_state_slot,
                 g_hook->m_sceneview_data.known_scene_states.size());
 
-            if (vr->is_native_stereo_fix_null_pass2_view_state_enabled() && nsf_pass2_hacks_safe_this_frame) {
+            if ((vr->is_native_stereo_fix_null_pass2_view_state_enabled() && nsf_pass2_hacks_safe_this_frame) ||
+                nsf_force_reset_pass2_state_this_frame) {
                 pass2_state_saved = *pass2_state_slot;
                 *pass2_state_slot = nullptr;
+
+                if (nsf_force_reset_pass2_state_this_frame) {
+                    SPDLOG_INFO("[VR] NSF: forcing Pass2 view state reset this frame due to detected camera cut/refocus");
+                }
             } else {
                 pass2_state_slot = nullptr;
             }
@@ -7230,7 +7427,35 @@ void FFakeStereoRenderingHook::begin_render_viewfamily_real(
             }
         }
 
+        // DIAG: animation-blur investigation, continued. Time the actual nested engine render
+        // call for Pass2 (right eye). If this call occasionally takes far longer than usual
+        // (e.g. during a camera-transition animation with heavier skinning/blend work), the HMD
+        // pose/animation state sampled for Pass2 could be measurably staler than what Pass1 saw
+        // moments earlier for the same nominal frame, producing a transient blur/mismatch that
+        // clears once per-frame cost normalizes. Logged only when notably slower than a rolling
+        // baseline to avoid spamming on ordinary frame-to-frame jitter.
+        const auto pass2_render_start = std::chrono::steady_clock::now();
         g_hook->m_render_module_begin_render_viewfamily_hook.unsafe_call<void>(render_module, canvas, view_family_candidate);
+        const auto pass2_render_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - pass2_render_start).count();
+
+        {
+            static double s_pass2_avg_ms = 0.0;
+            static bool s_have_pass2_avg = false;
+
+            if (!s_have_pass2_avg) {
+                s_pass2_avg_ms = pass2_render_ms;
+                s_have_pass2_avg = true;
+            }
+
+            if (pass2_render_ms > s_pass2_avg_ms * 2.5 && pass2_render_ms > 2.0) {
+                SPDLOG_INFO("[NSF-ANIM-DIAG] Pass2 render call spike: {:.2f}ms (rolling avg {:.2f}ms) g_frame_count={}",
+                    pass2_render_ms, s_pass2_avg_ms, g_frame_count);
+            }
+
+            // Exponential moving average so the baseline adapts slowly without being skewed by
+            // any single spike frame.
+            s_pass2_avg_ms = (s_pass2_avg_ms * 0.95) + (pass2_render_ms * 0.05);
+        }
 
         if (pass2_state_slot != nullptr) {
             *pass2_state_slot = pass2_state_saved;
@@ -7854,7 +8079,47 @@ bool FFakeStereoRenderingHook::setup_view_extensions() try {
 
                                 if (dst_reg < 16) {
                                     *gpr_table[dst_reg] = 0;
-                                    ctx->Rip = exception_address + decoded_precheck->Length;
+
+                                    auto resume_addr = exception_address + decoded_precheck->Length;
+
+                                    // Guard against a second, unrecoverable crash: if the very next
+                                    // instruction is an indirect CALL/JMP that uses the register we just
+                                    // zeroed out (as either its base/index memory operand or a bare
+                                    // register operand), executing it as-is would jump/call through a
+                                    // near-null address (e.g. "Bad read pointer at 74") - a crash we've
+                                    // observed happen right after this recovery path fires. Since we've
+                                    // already established the underlying object is stale/freed, the only
+                                    // safe option is to also skip that indirect branch (treat it as a
+                                    // no-op) rather than let it execute. This only ever affects the game
+                                    // exe's own UAF-crash instructions caught here - it does not touch any
+                                    // rendering/stereo/eye-pose code paths.
+                                    const auto next_decoded = utility::decode_one((uint8_t*)resume_addr);
+
+                                    if (next_decoded) {
+                                        const std::string_view next_mnemonic{next_decoded->Mnemonic};
+
+                                        if (next_mnemonic.starts_with("CALL") || next_mnemonic.starts_with("JMP")) {
+                                            const auto& next_op0 = next_decoded->Operands[0];
+                                            const bool uses_zeroed_reg =
+                                                (next_op0.Type == ND_OP_REG && next_op0.Info.Register.Reg == dst_reg) ||
+                                                (next_op0.Type == ND_OP_MEM && next_op0.Info.Memory.HasBase && next_op0.Info.Memory.Base == dst_reg) ||
+                                                (next_op0.Type == ND_OP_MEM && next_op0.Info.Memory.HasIndex && next_op0.Info.Memory.Index == dst_reg);
+
+                                            if (uses_zeroed_reg) {
+                                                static std::unordered_set<uintptr_t> warned_branch_skip_rvas{};
+                                                const auto branch_rva = resume_addr - (uintptr_t)*ex_mod_precheck;
+
+                                                if (warned_branch_skip_rvas.insert(branch_rva).second) {
+                                                    SPDLOG_WARN("[Exception Handler] Skipping indirect {} at rva {:x} that would branch through zeroed register {}",
+                                                        next_decoded->Mnemonic, branch_rva, (int)dst_reg);
+                                                }
+
+                                                resume_addr += next_decoded->Length;
+                                            }
+                                        }
+                                    }
+
+                                    ctx->Rip = resume_addr;
                                     return EXCEPTION_CONTINUE_EXECUTION;
                                 }
                             }
@@ -8786,6 +9051,43 @@ __forceinline void FFakeStereoRenderingHook::calculate_stereo_view_offset(
     FFakeStereoRendering* stereo, const int32_t view_index, Rotator<float>* view_rotation, 
     const float world_to_meters, Vector3f* view_location)
 {
+    // DIAG: record the raw view_index for this frame/thread so sceneview_constructor() (called by
+    // the engine immediately afterwards for the SAME view) can attribute its ground-truth FSceneView
+    // metadata back to this exact index. See t_last_calc_stereo_view_index declaration for rationale.
+    t_last_calc_stereo_view_index = view_index;
+    t_last_calc_stereo_view_index_frame = g_frame_count;
+
+    // DIAG: NSF-CALLER-SITE. Captured at entry, before any trampoline/inline logic runs, so this is
+    // the exact return address of whatever engine code called into this (hooked) function - i.e. the
+    // real UE caller for THIS specific view_index. Logged (throttled per index) as module name + RVA
+    // offset from that module's base so it can be resolved (dumpbin /disasm, IDA/Ghidra, or symbols if
+    // available) to identify exactly which UE subsystem issues each raw view_index - e.g. distinguish
+    // a genuine second eye render from a shadow-depth/HZB-occlusion/Nanite-visibility/scene-capture
+    // pass, rather than inferring it indirectly from timing/alias behavior alone.
+    if (VR::get() != nullptr && VR::get()->is_diag_log_raw_view_index_enabled()) {
+        static uintptr_t s_last_logged_caller[9] = {};
+        const auto return_address = (uintptr_t)_ReturnAddress();
+        const auto clamped_index_for_caller = std::clamp(view_index, 0, 8);
+
+        if (s_last_logged_caller[clamped_index_for_caller] != return_address) {
+            s_last_logged_caller[clamped_index_for_caller] = return_address;
+
+            const auto module_within = utility::get_module_within(return_address);
+
+            if (module_within) {
+                const auto module_path = utility::get_module_path(*module_within);
+                const auto rva = return_address - (uintptr_t)*module_within;
+                const auto module_name_narrow = module_path ? *module_path : std::string{"<unknown>"};
+
+                SPDLOG_WARN("[VR][NSF-CALLER-SITE] view_index={} caller_module={} caller_rva=0x{:x}",
+                    view_index, module_name_narrow, rva);
+            } else {
+                SPDLOG_WARN("[VR][NSF-CALLER-SITE] view_index={} caller_addr=0x{:x} (module lookup failed)",
+                    view_index, return_address);
+            }
+        }
+    }
+
 #ifdef FFAKE_STEREO_RENDERING_LOG_ALL_CALLS
     SPDLOG_INFO("calculate stereo view offset called! {}", view_index);
 #else
@@ -8815,6 +9117,16 @@ __forceinline void FFakeStereoRenderingHook::calculate_stereo_view_offset(
         return;
     }
 
+    // DIAG: see m_diag_suppress_extra_view declaration for full rationale. Narrow, view_index-exact
+    // early-return so only the specific stray extra call (proven via NSF-FINAL-EYE-POSE/GLITCH-EYE-DIAG
+    // logs to sit at a different, slowly-converging position under the same true_index as a real eye)
+    // is suppressed, before any pose caching/state below can be polluted by it. Off by default.
+    if (vr->is_diag_suppress_extra_view_enabled() && view_index == vr->get_diag_suppress_view_index()) {
+        SPDLOG_WARNING_EVERY_N_SEC(1, "[VR][DIAG-SUPPRESS-VIEW] Suppressing calculate_stereo_view_offset call for view_index={} g_frame_count={}",
+            view_index, g_frame_count);
+        return;
+    }
+
     // This is eSSP_FULL, we don't care. It will cause the view to become monoscopic if we do anything.
     if (index_was_ever_two && view_index == 0) {
         SPDLOG_INFO_ONCE("calculate stereo view offset called with view index 0 after 2, ignoring.");
@@ -8835,6 +9147,99 @@ __forceinline void FFakeStereoRenderingHook::calculate_stereo_view_offset(
     auto true_index = index_starts_from_one ? ((view_index + 1) % 2) : (view_index % 2);
     const auto has_double_precision = g_hook->m_has_double_precision;
     const auto rot_d = (Rotator<double>*)view_rotation;
+
+    // DIAG: world_to_meters is supplied per-call (effectively per-eye) but immediately clobbers a single
+    // shared vr->m_world_to_meters value that is then read back later (as world_scale) for whichever eye
+    // renders next. If the engine ever supplies a DIFFERENT world_to_meters for the left-eye call vs the
+    // right-eye call within the same render frame - which can transiently happen while a camera/animation
+    // blend is driving WorldToMeters on the active camera component - then one eye's head/eye-offset math
+    // ends up scaled differently than the other eye's for that frame, which would look exactly like a
+    // brief per-eye scale mismatch (image "splits" then re-converges) without being an NSF/AFR issue at all,
+    // since this code path runs unconditionally for every eye in every stereo mode.
+    //
+    // FIXED: this previously bucketed calls via `(view_index == 2) ? 1 : (view_index % 2)`, which does
+    // NOT match true_index's real aliasing behavior (view_index=1 and view_index=3 both alias to
+    // true_index=0 once index_starts_from_one flips true - see NSF-TRUE-INDEX-ALIAS). That meant
+    // view_index 1/2/3 were all silently bucketed into slot "1" and slot "0" was never populated, so
+    // this check could never actually detect a real per-eye mismatch for this game. Now keyed off the
+    // same true_index used everywhere else, and logs every value (not just mismatches) so we can also
+    // directly compare aliased calls' world_to_meters against each other, not just eye0 vs eye1.
+    if (vr->is_diag_log_world_to_meters_enabled()) {
+        static thread_local uint32_t s_wtm_diag_frame_count = 0;
+        static thread_local float s_wtm_diag_last_value[2] = {0.0f, 0.0f};
+        static thread_local bool s_wtm_diag_has_value[2] = {false, false};
+
+        if ((uint32_t)g_frame_count != s_wtm_diag_frame_count) {
+            s_wtm_diag_frame_count = (uint32_t)g_frame_count;
+            s_wtm_diag_has_value[0] = false;
+            s_wtm_diag_has_value[1] = false;
+        }
+
+        const auto other_index = true_index == 0 ? 1 : 0;
+
+        if (s_wtm_diag_has_value[other_index] && s_wtm_diag_last_value[other_index] != world_to_meters) {
+            SPDLOG_WARN("[VR][NSF-WTM-MISMATCH] frame={} true_index={} view_index={} world_to_meters={:.4f} DIFFERS from true_index={} world_to_meters={:.4f}",
+                g_frame_count, true_index, view_index, world_to_meters, other_index, s_wtm_diag_last_value[other_index]);
+        }
+
+        SPDLOG_WARN("[VR][NSF-WTM-VALUE] frame={} true_index={} view_index={} world_to_meters={:.4f}",
+            g_frame_count, true_index, view_index, world_to_meters);
+
+        s_wtm_diag_last_value[true_index] = world_to_meters;
+        s_wtm_diag_has_value[true_index] = true;
+    }
+
+
+    // DIAG: NSF-TRUE-INDEX-ALIAS. true_index is derived purely from view_index's PARITY (see above),
+    // so two DIFFERENT view_index values landing on the same parity (e.g. view_index=1 and
+    // view_index=3 both -> true_index=0 once index_starts_from_one is true) silently alias onto the
+    // SAME true_index. Since true_index is what the sync-pose cache, eye-offset math, and every other
+    // per-eye branch in this function key off of, an aliased "extra" call doesn't just add a harmless
+    // third render - it can overwrite/compete with the real eye's cached pose and offset state for
+    // that frame, which is a much better explanation for the reported doubled-image/eye desync than a
+    // simple ignorable stray view. Track the most recent view_index seen for each true_index and warn
+    // loudly (not throttled - this is meant to be enabled briefly during a repro) the moment a
+    // DIFFERENT view_index reuses a true_index within the same g_frame_count, which pinpoints exactly
+    // when/how often the aliasing itself occurs, independent of whatever raw index numbers this
+    // session happens to be using.
+    if (vr->is_diag_log_true_index_alias_enabled()) {
+        static int32_t s_last_view_index_for_true_index[2] = { -999, -999 };
+        static uint64_t s_last_frame_for_true_index[2] = { (uint64_t)-1, (uint64_t)-1 };
+
+        if (s_last_frame_for_true_index[true_index] == (uint64_t)g_frame_count &&
+            s_last_view_index_for_true_index[true_index] != -999 &&
+            s_last_view_index_for_true_index[true_index] != view_index) {
+            SPDLOG_WARN("[VR][NSF-TRUE-INDEX-ALIAS] frame={} true_index={} view_index={} ALIASES with prior view_index={} in the SAME frame (index_starts_from_one={} index_was_ever_two={})",
+                g_frame_count, true_index, view_index, s_last_view_index_for_true_index[true_index],
+                index_starts_from_one, index_was_ever_two);
+        }
+
+        s_last_view_index_for_true_index[true_index] = view_index;
+        s_last_frame_for_true_index[true_index] = (uint64_t)g_frame_count;
+    }
+
+    // DIAG: NSF-RAW-VIEW-INDEX. Unconditional record of EVERY raw view_index this hook is ever
+    // called with (not just 0/1, and not just aliasing collisions), so we can answer directly which
+    // raw indices actually occur in a session, how many times each occurs, and in what order relative
+    // to true_index/is_full_pass - instead of inferring it indirectly from other diagnostics. Indexed
+    // by view_index directly (bounded/clamped) so this scales to whatever range this build's engine
+    // build actually uses (observed 0-4 previously).
+    if (vr->is_diag_log_raw_view_index_enabled()) {
+        constexpr int32_t kMaxTrackedViewIndex = 8;
+        static uint64_t s_raw_view_index_call_count[kMaxTrackedViewIndex + 1] = {};
+        static uint64_t s_raw_view_index_last_frame[kMaxTrackedViewIndex + 1] = {};
+
+        const auto clamped_index = std::clamp(view_index, 0, kMaxTrackedViewIndex);
+        s_raw_view_index_call_count[clamped_index]++;
+
+        SPDLOG_WARN("[VR][NSF-RAW-VIEW-INDEX] frame={} view_index={} true_index={} is_full_pass={} is_using_afr={} index_starts_from_one={} index_was_ever_two={} call_count_for_this_index={} frames_since_last_seen={}",
+            g_frame_count, view_index, true_index, is_full_pass, vr->is_using_afr(), index_starts_from_one, index_was_ever_two,
+            s_raw_view_index_call_count[clamped_index],
+            s_raw_view_index_last_frame[clamped_index] == 0 ? 0 : (uint64_t)g_frame_count - s_raw_view_index_last_frame[clamped_index]);
+
+        s_raw_view_index_last_frame[clamped_index] = (uint64_t)g_frame_count;
+    }
+
 
     if (vr->is_using_afr() && !is_full_pass) {
         // NOTE: We used to just do `true_index = g_frame_count % 2;` here, but g_frame_count
@@ -8879,6 +9284,308 @@ __forceinline void FFakeStereoRenderingHook::calculate_stereo_view_offset(
                 }
             }
         }
+    }
+
+    // NSF (non-AFR Native Stereo Fix) eye-desync mitigation: unlike AFR above, NSF renders both eyes
+    // within the SAME engine frame (two calls into this function per frame, Pass1=left then Pass2=
+    // right, see begin_render_viewfamily_real's wants_swap path), and had no cross-eye pose caching at
+    // all. During a camera-transition animation (cutscene blend, dash, ability camera shift) the live
+    // animated camera pose can change between these two calls, so the two eyes get built from two
+    // different poses for what should be one synchronized stereo frame - producing a momentary
+    // left/right desync that resolves once the camera holds still. Mirror the AFR rotation-cache
+    // pattern here: cache Pass1 (left)'s rotation/location for this frame, then force Pass2 (right) to
+    // reuse it. Gated to NSF (native_stereo_fix_enabled && !is_using_afr) and behind its own toggle so
+    // it never affects AFR (which already has its own mechanism above) or normal head tracking on
+    // frames where NSF isn't swapping passes.
+    //
+    // REVERTED: an earlier attempt restricted this cache to a "main stereo pass" view_index range
+    // derived from index_starts_from_one, based on a hypothesis that an extra secondary view (e.g. a
+    // VFX/portal capture) was polluting the cache. In-headset testing DISPROVED this: blocking that
+    // "extra" view instead caused it to stick rigidly to the HMD with no eye offset applied at all -
+    // proving it is actually a REAL eye call, not a secondary view, and the view_index classification
+    // above was wrong for this game. That restriction also caused a permanent low-level doubled-image
+    // regression by extension in the projection-matrix path. Both restrictions are reverted here; the
+    // cache is unconditional again (gated only on NSF/enabled/toggle) matching original behavior.
+    //
+    // FIX: user confirmed via the DiagSuppressExtraView test (fully early-returning view_index=1,
+    // BEFORE any pose caching/rendering) that view_index=1 does NOT correspond to a visible rendered
+    // eye this session - no stuck/frozen/blank eye resulted, unlike an earlier session where blocking
+    // an assumed "extra view" DID stick to the HMD (that was almost certainly a different, since-
+    // invalidated raw index guess, from before 2=left/3=right was established). view_index=1 fires at
+    // a CONSTANT ~4x rate relative to 2/3 regardless of glitch timing (see NSF-RAW-VIEW-INDEX), and it
+    // aliases onto true_index=0 alongside the real view_index=3 eye call (NSF-TRUE-INDEX-ALIAS) - a
+    // race where whichever of the two writes last wins, which plausibly explains why the reported
+    // glitch has switched eyes (L/R) across sessions. Exclude view_index=1 specifically from the
+    // sync-pose cache (NOT a full render skip) so it can never again overwrite/race with the real
+    // eye's cached pose, while leaving actual rendering of it untouched in case some other subsystem
+    // depends on it. Toggle-gated so it can be instantly reverted if further testing disagrees.
+    const bool diag_exclude_from_sync_cache = vr->is_diag_exclude_view_index_from_sync_cache_enabled() &&
+        view_index == vr->get_diag_exclude_view_index_from_sync_cache();
+
+    if (!diag_exclude_from_sync_cache && vr->is_native_stereo_fix_enabled() && !vr->is_using_afr() && vr->is_native_stereo_fix_sync_pose_enabled() && !is_full_pass) {
+        auto& hook_data = *g_hook;
+        const auto local_view_d = (Vector3d*)view_location;
+
+        if (true_index == 0) {
+            // Pass1 (left eye): cache this frame's pose for Pass2 to reuse below.
+            if (has_double_precision) {
+                hook_data.m_nsf_sync_pose_rotation_double = *rot_d;
+                hook_data.m_nsf_sync_pose_location_double = *local_view_d;
+            } else {
+                hook_data.m_nsf_sync_pose_rotation = *view_rotation;
+                hook_data.m_nsf_sync_pose_location = *view_location;
+            }
+
+            hook_data.m_nsf_sync_pose_frame_count = g_frame_count;
+            hook_data.m_nsf_sync_pose_have_left = true;
+
+            SPDLOG_INFO_EVERY_N_SEC(2, "[VR] NSF sync-pose: cached Pass1 (left) pose for frame {}", g_frame_count);
+        } else if (true_index == 1 && !hook_data.m_nsf_sync_pose_have_left) {
+            // DIAG: Pass2 (right eye) reached, but no Pass1 pose was cached this pass (have_left is
+            // false) - meaning sync is NOT applied for this Pass2 call. Previously this branch also
+            // required g_frame_count to match the cached Pass1 frame, but g_frame_count is sourced from
+            // the HMD runtime's internal_frame_count (see line ~2598), which increments once PER EYE
+            // SUBMISSION - so it always advances by ~2 between the Pass1 and Pass2 calls within the SAME
+            // engine render frame. That made the old frame_count equality check permanently false, so
+            // sync-pose silently never applied. Fixed below to rely on have_left alone.
+            SPDLOG_WARNING_EVERY_N_SEC(1, "[VR][NSF-POSE-DIVERGE-SKIP] Pass2 frame={} has no cached Pass1 pose (have_left=false), sync NOT applied",
+                g_frame_count);
+        } else if (hook_data.m_nsf_sync_pose_have_left) {
+            // Pass2 (right eye): Pass1 and Pass2 run back-to-back synchronously within the same
+            // begin_render_viewfamily_real call (see the immediate std::swap(views[0], views[1]) and
+            // re-invocation of the render module there), so no frame-count match is needed - have_left
+            // alone is sufficient. Consume and clear it immediately so a stale Pass1 pose can never be
+            // reused by some later, unrelated Pass2-only call.
+            hook_data.m_nsf_sync_pose_have_left = false;
+
+            // Force ROTATION to match to prevent orientation-based eye desync during animation/camera-
+            // transition frames. Do NOT touch view_location/local_view_d here - that holds the per-eye
+            // stereo position offset (IPD), which legitimately differs between the left and right eye.
+            // Overwriting it with Pass1's location collapses the right eye onto the left eye's position,
+            // eliminating positional parallax/depth between the two eyes for that frame. This was
+            // previously done unconditionally and with no delta logging, which produced a near-zero-
+            // disparity "flat"/double-vision-like frame that was misattributed to view_rect/composite
+            // scaling instead.
+            if (has_double_precision) {
+                const auto rot_delta = glm::length(glm::dvec3{
+                    rot_d->yaw - hook_data.m_nsf_sync_pose_rotation_double.yaw,
+                    rot_d->pitch - hook_data.m_nsf_sync_pose_rotation_double.pitch,
+                    rot_d->roll - hook_data.m_nsf_sync_pose_rotation_double.roll});
+
+                // DIAG: NSF-POSE-DIVERGE. We only force ROTATION here; POSITION is intentionally left
+                // alone (see comment above) because it legitimately carries the per-eye IPD offset.
+                // But if the underlying camera/actor location itself moves a large amount between the
+                // Pass1 (left) call and the Pass2 (right) call within the SAME engine frame - which can
+                // happen during a fast skill/ability/cutscene camera translation, as opposed to a pure
+                // rotation - then Pass2 still renders from a different WORLD position than Pass1, which
+                // would look exactly like a residual left/right positional desync ("double vision")
+                // that the rotation-only sync cannot fix. Log the raw position delta (not applied) so a
+                // captured log can prove/disprove whether large POSITION deltas (not just rotation
+                // deltas) are occurring during the reported glitch window.
+                const auto pos_delta = glm::length(glm::dvec3{*local_view_d} - glm::dvec3{hook_data.m_nsf_sync_pose_location_double});
+
+                // DIAG: unconditional (throttled) trace to prove this branch is actually reached and
+                // to see the real delta magnitudes even when they stay under the warn threshold below.
+                SPDLOG_INFO_EVERY_N_SEC(1, "[VR][NSF-POSE-DIVERGE-TRACE] Pass2 reached, frame={} rot_delta_deg={:.4f} pos_delta={:.4f}",
+                    g_frame_count, rot_delta, pos_delta);
+
+                if (rot_delta > 0.001 || pos_delta > 0.01) {
+                    SPDLOG_WARN("[VR][NSF-POSE-DIVERGE] frame={} rot_delta_deg={:.4f} pos_delta={:.4f} pass1_pos=({:.2f},{:.2f},{:.2f}) pass2_pos=({:.2f},{:.2f},{:.2f})",
+                        g_frame_count, rot_delta, pos_delta,
+                        hook_data.m_nsf_sync_pose_location_double.x, hook_data.m_nsf_sync_pose_location_double.y, hook_data.m_nsf_sync_pose_location_double.z,
+                        local_view_d->x, local_view_d->y, local_view_d->z);
+                }
+
+                // BLEND (not a hard snap): alpha==1.0 fully overwrites Pass2's rotation with Pass1's
+                // (old behavior - eliminates desync but makes the right eye feel completely frozen/
+                // lagging relative to the live animated camera for that frame, which reads as
+                // disorienting one-sided lag). A lower alpha lets Pass2 keep some of its own live
+                // rotation, splitting the residual error across both eyes instead of concentrating the
+                // full correction (and the perceptual "lag") onto the right eye alone.
+                //
+                // HARD-CUT OVERRIDE: mirrors the approach used by the existing Lua UI-fix script for
+                // cutscene camera-actor changes (ResetCutSceneCamOffset), which forces an INSTANT/full
+                // reset when the cutscene camera actor's view changes abruptly - treating a genuine
+                // camera CUT differently from continuous small drift. Blending across a real cut would
+                // render a visibly wrong intermediate pose in one eye for that frame (a brief
+                // double-image at the cut itself), which is worse than a one-frame freeze; only small,
+                // continuous per-frame divergence (VFX/skill camera motion) benefits from a partial
+                // blend. Unlike the Lua script (which only evaluates this while the view target is an
+                // actual CineCameraActor, i.e. never during normal player input), this runs every frame
+                // regardless of what's driving the camera, so a flat magnitude threshold alone was too
+                // sensitive to fast thumbstick turns. is_nsf_sync_pose_hard_cut() instead requires an
+                // abrupt SPIKE relative to the recent rolling baseline AND a raised absolute floor.
+                const bool is_hard_cut = hook_data.is_nsf_sync_pose_hard_cut((float)rot_delta, (float)pos_delta);
+
+                // TRIGGER: only report a pose-divergence event (which feeds the auto-mirror-on-motion
+                // fallback) on an actual hard-cut-grade spike, NOT on the near-zero logging threshold
+                // above. That threshold (0.001deg/0.01 units) is essentially noise-floor and fires on
+                // ordinary thumbstick turning/camera smoothing every single frame while moving, which
+                // kept re-extending the mirror's 250ms activity window for as long as - and for a
+                // while after - the player was actively turning. Because the mirror path shows an
+                // identical (non-stereo) image in both eyes, that read as a long-lived "static/frozen"
+                // right eye rather than a brief one-frame correction. Gating on the same spike detector
+                // used for the hard-cut snap ensures the mirror only engages for genuine abrupt
+                // animation/VFX camera discontinuities, not continuous player-driven motion.
+                if (is_hard_cut) {
+                    g_hook->report_pose_divergence_event();
+                }
+
+                // DIAG: is_native_stereo_fix_sync_pose_force_full_enabled() forces the full 1.0 snap
+                // unconditionally, bypassing the hard-cut spike detector entirely, so we can confirm
+                // with certainty that the sync path engages on every single Pass2 call during a
+                // reported multi-frame glitch window (e.g. UI menu open), not just on detected spikes.
+                const bool force_full = vr->is_native_stereo_fix_sync_pose_force_full_enabled();
+
+                // DIAG: gradual hard-cut convergence test - see get_nsf_gradual_convergence_alpha() for
+                // rationale. Replaces the instant blend_alpha=1.0 snap with a ramp from 0->1 over
+                // get_diag_gradual_hard_cut_convergence_duration_ms() so both eyes ease into agreement
+                // instead of one eye teleporting into place.
+                const bool use_gradual_convergence = vr->is_diag_gradual_hard_cut_convergence_enabled();
+
+                const auto blend_alpha = use_gradual_convergence
+                    ? (double)hook_data.get_nsf_gradual_convergence_alpha(is_hard_cut || force_full, vr->get_diag_gradual_hard_cut_convergence_duration_ms())
+                    : (is_hard_cut || force_full)
+                        ? 1.0
+                        : (double)vr->get_native_stereo_fix_sync_pose_blend_alpha();
+
+                if (force_full) {
+                    SPDLOG_WARN("[VR][NSF-SYNC-FORCE-FULL] frame={} rot_delta_deg={:.4f} pos_delta={:.4f} applying FULL snap (is_hard_cut={})",
+                        g_frame_count, rot_delta, pos_delta, is_hard_cut);
+                }
+
+                if (blend_alpha >= 1.0) {
+                    *rot_d = hook_data.m_nsf_sync_pose_rotation_double;
+                } else if (blend_alpha > 0.0) {
+                    rot_d->yaw = std::lerp(rot_d->yaw, hook_data.m_nsf_sync_pose_rotation_double.yaw, blend_alpha);
+                    rot_d->pitch = std::lerp(rot_d->pitch, hook_data.m_nsf_sync_pose_rotation_double.pitch, blend_alpha);
+                    rot_d->roll = std::lerp(rot_d->roll, hook_data.m_nsf_sync_pose_rotation_double.roll, blend_alpha);
+                }
+
+                // Sync the raw (pre-IPD) camera POSITION too, if enabled. This runs BEFORE the
+                // eye_separation/IPD offset math further down in this function (which reads *view_d /
+                // *view_location and subtracts a per-eye offset derived from true_index), so overwriting
+                // the raw position here does NOT collapse stereo parallax - each eye still gets its own
+                // IPD offset applied afterward on top of this now-synced base position. Same blend-
+                // alpha applies here as for rotation above.
+                if (vr->is_native_stereo_fix_sync_pose_position_enabled()) {
+                    if (blend_alpha >= 1.0) {
+                        *local_view_d = hook_data.m_nsf_sync_pose_location_double;
+                    } else if (blend_alpha > 0.0) {
+                        local_view_d->x = std::lerp(local_view_d->x, hook_data.m_nsf_sync_pose_location_double.x, blend_alpha);
+                        local_view_d->y = std::lerp(local_view_d->y, hook_data.m_nsf_sync_pose_location_double.y, blend_alpha);
+                        local_view_d->z = std::lerp(local_view_d->z, hook_data.m_nsf_sync_pose_location_double.z, blend_alpha);
+                    }
+                }
+            } else {
+                const auto rot_delta = glm::length(glm::vec3{
+                    view_rotation->yaw - hook_data.m_nsf_sync_pose_rotation.yaw,
+                    view_rotation->pitch - hook_data.m_nsf_sync_pose_rotation.pitch,
+                    view_rotation->roll - hook_data.m_nsf_sync_pose_rotation.roll});
+
+                // DIAG: NSF-POSE-DIVERGE (single-precision path). See double-precision branch above for
+                // full rationale - logs the un-applied Pass1 vs Pass2 position delta for the same frame.
+                const auto pos_delta = glm::length(*view_location - hook_data.m_nsf_sync_pose_location);
+
+                // DIAG: unconditional (throttled) trace to prove this branch is actually reached and
+                // to see the real delta magnitudes even when they stay under the warn threshold below.
+                SPDLOG_INFO_EVERY_N_SEC(1, "[VR][NSF-POSE-DIVERGE-TRACE] Pass2 reached, frame={} rot_delta_deg={:.4f} pos_delta={:.4f}",
+                    g_frame_count, rot_delta, pos_delta);
+
+                if (rot_delta > 0.001f || pos_delta > 0.01f) {
+                    SPDLOG_WARN("[VR][NSF-POSE-DIVERGE] frame={} rot_delta_deg={:.4f} pos_delta={:.4f} pass1_pos=({:.2f},{:.2f},{:.2f}) pass2_pos=({:.2f},{:.2f},{:.2f})",
+                        g_frame_count, rot_delta, pos_delta,
+                        hook_data.m_nsf_sync_pose_location.x, hook_data.m_nsf_sync_pose_location.y, hook_data.m_nsf_sync_pose_location.z,
+                        view_location->x, view_location->y, view_location->z);
+                }
+
+                // HARD-CUT OVERRIDE: see double-precision branch above for full rationale. Uses spike-
+                // relative-to-baseline + absolute-floor detection instead of a flat threshold, since a
+                // flat threshold alone misfires on fast thumbstick turns (this runs every frame
+                // regardless of what's driving the camera, unlike the Lua script's CineCameraActor gate).
+                const bool is_hard_cut = hook_data.is_nsf_sync_pose_hard_cut(rot_delta, pos_delta);
+
+                // TRIGGER: see double-precision branch above for full rationale - only report on an
+                // actual hard-cut-grade spike, not the near-zero logging threshold, so the auto-mirror
+                // fallback doesn't stay engaged (showing a flat non-stereo image) for the entire
+                // duration of ordinary thumbstick-driven camera turning.
+                if (is_hard_cut) {
+                    g_hook->report_pose_divergence_event();
+                }
+
+                // DIAG: see the matching double-precision branch above for full rationale.
+                const bool force_full = vr->is_native_stereo_fix_sync_pose_force_full_enabled();
+
+                const bool use_gradual_convergence = vr->is_diag_gradual_hard_cut_convergence_enabled();
+
+                const auto blend_alpha_f = use_gradual_convergence
+                    ? hook_data.get_nsf_gradual_convergence_alpha(is_hard_cut || force_full, vr->get_diag_gradual_hard_cut_convergence_duration_ms())
+                    : (is_hard_cut || force_full)
+                        ? 1.0f
+                        : vr->get_native_stereo_fix_sync_pose_blend_alpha();
+
+                if (force_full) {
+                    SPDLOG_WARN("[VR][NSF-SYNC-FORCE-FULL] frame={} rot_delta_deg={:.4f} pos_delta={:.4f} applying FULL snap (is_hard_cut={})",
+                        g_frame_count, rot_delta, pos_delta, is_hard_cut);
+                }
+
+                if (blend_alpha_f >= 1.0f) {
+                    *view_rotation = hook_data.m_nsf_sync_pose_rotation;
+                } else if (blend_alpha_f > 0.0f) {
+                    view_rotation->yaw = std::lerp(view_rotation->yaw, hook_data.m_nsf_sync_pose_rotation.yaw, blend_alpha_f);
+                    view_rotation->pitch = std::lerp(view_rotation->pitch, hook_data.m_nsf_sync_pose_rotation.pitch, blend_alpha_f);
+                    view_rotation->roll = std::lerp(view_rotation->roll, hook_data.m_nsf_sync_pose_rotation.roll, blend_alpha_f);
+                }
+
+                // See double-precision branch above for rationale: this runs before the later per-eye
+                // eye_separation/IPD offset is applied to *view_location, so parallax is preserved.
+                if (vr->is_native_stereo_fix_sync_pose_position_enabled()) {
+                    if (blend_alpha_f >= 1.0f) {
+                        *view_location = hook_data.m_nsf_sync_pose_location;
+                    } else if (blend_alpha_f > 0.0f) {
+                        view_location->x = std::lerp(view_location->x, hook_data.m_nsf_sync_pose_location.x, blend_alpha_f);
+                        view_location->y = std::lerp(view_location->y, hook_data.m_nsf_sync_pose_location.y, blend_alpha_f);
+                        view_location->z = std::lerp(view_location->z, hook_data.m_nsf_sync_pose_location.z, blend_alpha_f);
+                    }
+                }
+            }
+        }
+    }
+
+    // DIAG: DiagApplySyncedPoseToExcludedViewIndex. view_index=1 was excluded above from ever
+    // writing to/consuming the NSF sync-pose cache (it races with the real eye and isn't a
+    // renderable eye - see NSF-VIEWINDEX-IDENTITY: it never gets its own FSceneView, and fires a
+    // variable number of times per frame, consistent with a shadow-cascade/occlusion sub-view pass
+    // rather than a second eye). That exclusion fixed the eye blur/desync, but left this index's own
+    // pose completely untouched, so whatever shadow/culling subsystem consumes it keeps seeing
+    // whatever raw (possibly stale/mid-transition) pose the engine handed it - plausibly explaining
+    // inconsistent foliage-sway culling/shadow behavior independent of the eye-blur fix.
+    //
+    // This applies the SAME fully-converged pose the real eyes settle on (read-only: does not set
+    // have_left, does not write m_nsf_sync_pose_*) to the excluded index, so its frustum/pose stays
+    // coherent with the actual HMD pose without re-introducing the cache race. Gated so it can be
+    // disabled independently if it turns out to break/flicker culling instead of fixing it.
+    if (diag_exclude_from_sync_cache && vr->is_diag_apply_synced_pose_to_excluded_view_index_enabled() &&
+        vr->is_native_stereo_fix_enabled() && !vr->is_using_afr() && vr->is_native_stereo_fix_sync_pose_enabled() && !is_full_pass) {
+        auto& hook_data = *g_hook;
+
+        if (has_double_precision) {
+            *rot_d = hook_data.m_nsf_sync_pose_rotation_double;
+
+            if (vr->is_native_stereo_fix_sync_pose_position_enabled()) {
+                auto* local_view_d = (Vector3d*)view_location;
+                *local_view_d = hook_data.m_nsf_sync_pose_location_double;
+            }
+        } else {
+            *view_rotation = hook_data.m_nsf_sync_pose_rotation;
+
+            if (vr->is_native_stereo_fix_sync_pose_position_enabled()) {
+                *view_location = hook_data.m_nsf_sync_pose_location;
+            }
+        }
+
+        SPDLOG_INFO_EVERY_N_SEC(2, "[VR][NSF-EXCLUDED-INDEX-SYNCED] view_index={} frame={} applied cached synced pose (read-only)",
+            view_index, g_frame_count);
     }
 
     if (true_index == 0 && !is_full_pass) {
@@ -9080,6 +9787,29 @@ __forceinline void FFakeStereoRenderingHook::calculate_stereo_view_offset(
                 head_offset.x, head_offset.y, head_offset.z);
         }
 
+        // DIAG: GLITCH-EYE-DIAG window. Logs unconditionally (no throttle) for a few seconds after
+        // a glitch marker press, for BOTH eyes, so we can see the actual per-eye stereo separation
+        // vector frame-by-frame across the glitch moment. If eye_separation's magnitude collapses
+        // toward 0 (or becomes near-identical between true_index=0 and true_index=1 calls) while this
+        // window is active, the camera-level stereo math itself is failing for that VFX-heavy moment.
+        // If eye_separation stays normal/nonzero and mismatched between eyes as expected here, the
+        // camera-level math is fine and the flattened-looking VFX element must be a problem isolated
+        // to that effect's own material/shader (e.g. a camera-facing billboard computed once and
+        // shared across both eyes) rather than anything in this per-eye offset hook.
+        if (vr->is_glitch_eye_diag_window_active()) {
+            // DIAG: is_full_pass/is_using_afr/view_index are included so we can tell a real
+            // NSF gameplay Pass1/Pass2 call apart from a secondary scene-capture (portrait,
+            // minimap, reflection, VFX billboard, etc.) that Unreal also routes through this
+            // same hook and which typically presents as view_index=0/is_full_pass=true and
+            // always resolves to true_index=0 - previously this was indistinguishable from a
+            // real left-eye call and made the left/right call counts look imbalanced (e.g. 3
+            // true_index=0 logs per 1 true_index=1 log) even though NSF itself was still
+            // alternating 1:1 for the real stereo pass.
+            SPDLOG_WARN("[VR][GLITCH-EYE-DIAG] true_index={} view_index={} is_full_pass={} is_using_afr={} eye_separation=({:.4f},{:.4f},{:.4f}) len={:.4f} head_offset=({:.4f},{:.4f},{:.4f}) g_frame_count={}",
+                true_index, view_index, is_full_pass, vr->is_using_afr(), eye_separation.x, eye_separation.y, eye_separation.z, glm::length(eye_separation),
+                head_offset.x, head_offset.y, head_offset.z, g_frame_count);
+        }
+
         if (!has_double_precision) {
             if (!is_2d_screen) {
                 *view_location -= head_offset;
@@ -9103,6 +9833,25 @@ __forceinline void FFakeStereoRenderingHook::calculate_stereo_view_offset(
                 rot_d->pitch = euler.x;
                 rot_d->yaw = euler.y;
                 rot_d->roll = euler.z;
+            }
+        }
+
+        // DIAG: NSF-FINAL-EYE-POSE. Logs the FULLY RESOLVED per-eye camera position/rotation (post
+        // head_offset/eye_separation/sync-pose - i.e. exactly what each eye renders from this frame),
+        // unthrottled for both eyes every frame. See m_diag_log_final_eye_pose declaration for
+        // rationale: this lets the two eyes' pose trajectories be diffed directly across an entire
+        // multi-frame glitch window instead of a short glitch-marker capture, without needing to
+        // reproduce the issue near a button press. Deliberately verbose/unthrottled - only meant to be
+        // enabled briefly while reproducing the issue, then disabled again.
+        if (vr->is_diag_log_final_eye_pose_enabled()) {
+            if (!has_double_precision) {
+                SPDLOG_WARN("[VR][NSF-FINAL-EYE-POSE] eye={} view_index={} frame={} pos=({:.3f},{:.3f},{:.3f}) rot=({:.3f},{:.3f},{:.3f})",
+                    true_index, view_index, g_frame_count, view_location->x, view_location->y, view_location->z,
+                    view_rotation->pitch, view_rotation->yaw, view_rotation->roll);
+            } else {
+                SPDLOG_WARN("[VR][NSF-FINAL-EYE-POSE] eye={} view_index={} frame={} pos=({:.3f},{:.3f},{:.3f}) rot=({:.3f},{:.3f},{:.3f})",
+                    true_index, view_index, g_frame_count, view_d->x, view_d->y, view_d->z,
+                    rot_d->pitch, rot_d->yaw, rot_d->roll);
             }
         }
 
@@ -9234,6 +9983,10 @@ __forceinline Matrix4x4f* FFakeStereoRenderingHook::calculate_stereo_projection_
     }
 
     if (!g_framework->is_game_data_intialized()) {
+        if (vr->is_glitch_eye_diag_window_active()) {
+            SPDLOG_WARN("[VR][NSF-PROJ-BYPASS] game data not initialized, projection override SKIPPED view_index={} g_frame_count={}", view_index, g_frame_count);
+        }
+
         if (g_hook->m_calculate_stereo_projection_matrix_hook) {
             return g_hook->m_calculate_stereo_projection_matrix_hook.call<Matrix4x4f*>(stereo, out, view_index);
         }
@@ -9270,6 +10023,11 @@ __forceinline Matrix4x4f* FFakeStereoRenderingHook::calculate_stereo_projection_
     }
 
     if (VR::get()->is_using_2d_screen()) {
+        if (vr->is_glitch_eye_diag_window_active()) {
+            SPDLOG_WARN("[VR][NSF-PROJ-BYPASS] is_using_2d_screen==true, VR projection override SKIPPED view_index={} true_index_guess={} g_frame_count={}",
+                view_index, index_starts_from_one ? ((view_index + 1) % 2) : (view_index % 2), g_frame_count);
+        }
+
         float fov = 90.0f; // todo, get from FMinimalViewInfo
 
         const float width = VR::get()->get_hmd_width();
@@ -9303,6 +10061,11 @@ __forceinline Matrix4x4f* FFakeStereoRenderingHook::calculate_stereo_projection_
     if (out != nullptr) {
         auto true_index = index_starts_from_one ? ((view_index + 1) % 2) : (view_index % 2);
 
+        // REVERTED: an earlier attempt restricted the update_matrices()+projection-override block
+        // below to a "main stereo pass" view_index range, based on a hypothesis that an extra
+        // secondary view (VFX/portal capture) was corrupting the shared projection matrices.
+        // In-headset testing DISPROVED this - it caused a permanent doubled-image regression on
+        // every frame - so this is fully unconditional again, matching original behavior.
         if (vr->is_using_afr()) {
             // See the matching comment in calculate_stereo_view_offset: fold in a call-scoped
             // alternator so a stalled g_frame_count doesn't force multiple consecutive calls to
@@ -9320,7 +10083,64 @@ __forceinline Matrix4x4f* FFakeStereoRenderingHook::calculate_stereo_projection_
             ++proj_call_index;
         }
 
+        // DIAG: NSF (native_stereo_fix_enabled && !is_using_afr) projection-matrix divergence trace.
+        // calculate_stereo_view_offset's NSF-POSE-DIVERGE-TRACE proved rot/pos delta is consistently
+        // 0.0000 during the reported "zoom" artifact (menu open, conversation camera switch), which
+        // rules out position/rotation as the cause of that specific symptom. A "zoom" is by
+        // definition a projection/FOV change, and unlike position/rotation this function replaces
+        // the game's projection matrix outright with VR::get_projection_matrix(true_index) - a
+        // per-eye HMD-derived matrix that should be STABLE per eye and not tied to the live camera at
+        // all. If the two back-to-back Pass1/Pass2 calls within one NSF frame ever resolve to the
+        // SAME true_index (both 0 or both 1), or resolve to the WRONG eye relative to
+        // calculate_stereo_view_offset's true_index for the same frame, one eye would momentarily
+        // reuse the other eye's (or a stale) projection matrix - which would look exactly like a
+        // sudden zoom/snap in that eye. Track have-seen-Pass1 the same way sync-pose does and log any
+        // same-eye-twice or missing-Pass1 condition immediately.
+        if (vr->is_native_stereo_fix_enabled() && !vr->is_using_afr()) {
+            static thread_local uint32_t s_proj_diag_frame_count = 0;
+            static thread_local bool s_proj_diag_have_pass1 = false;
+            static thread_local int32_t s_proj_diag_pass1_true_index = -1;
+
+            if (g_frame_count != s_proj_diag_frame_count) {
+                s_proj_diag_frame_count = g_frame_count;
+                s_proj_diag_have_pass1 = false;
+                s_proj_diag_pass1_true_index = -1;
+            }
+
+            if (!s_proj_diag_have_pass1) {
+                s_proj_diag_have_pass1 = true;
+                s_proj_diag_pass1_true_index = true_index;
+
+                SPDLOG_INFO_EVERY_N_SEC(1, "[VR][NSF-PROJ-DIVERGE-TRACE] Pass1 frame={} true_index={} view_index={}",
+                    g_frame_count, true_index, view_index);
+            } else {
+                const bool same_eye_twice = true_index == s_proj_diag_pass1_true_index;
+
+                SPDLOG_INFO_EVERY_N_SEC(1, "[VR][NSF-PROJ-DIVERGE-TRACE] Pass2 frame={} true_index={} view_index={} pass1_true_index={} same_eye_twice={}",
+                    g_frame_count, true_index, view_index, s_proj_diag_pass1_true_index, same_eye_twice);
+
+                if (same_eye_twice) {
+                    SPDLOG_WARN("[VR][NSF-PROJ-DIVERGE] frame={} BOTH projection matrix calls resolved to true_index={} - one eye is reusing the wrong eye's projection/FOV matrix this frame",
+                        g_frame_count, true_index);
+                }
+            }
+        }
+
         auto& double_matrix = *(Matrix4x4d*)out;
+
+        // DIAG: NSF-PROJ-VALUE. Capture the RAW engine-provided projection matrix's FOV-relevant
+        // terms (the [0][0]/[1][1] scale terms directly encode horizontal/vertical FOV; a "zoom"
+        // is by definition a change in these) BEFORE we overwrite it with the fixed VR projection
+        // below. If one eye's raw matrix is mid-animation-blend (changing frame to frame) while the
+        // other is already stable, that proves the engine itself is feeding us desynced per-eye FOV
+        // data for this frame, upstream of anything we do here.
+        if (vr->is_glitch_eye_diag_window_active()) {
+            const double raw_m00 = g_hook->m_has_double_precision ? double_matrix[0][0] : (double)(*out)[0][0];
+            const double raw_m11 = g_hook->m_has_double_precision ? double_matrix[1][1] : (double)(*out)[1][1];
+
+            SPDLOG_WARN("[VR][NSF-PROJ-VALUE-RAW] frame={} true_index={} view_index={} raw_m00={:.6f} raw_m11={:.6f}",
+                g_frame_count, true_index, view_index, raw_m00, raw_m11);
+        }
 
         if (!g_hook->m_has_double_precision) {
             float old_znear = (*out)[3][2];
@@ -9337,6 +10157,21 @@ __forceinline Matrix4x4f* FFakeStereoRenderingHook::calculate_stereo_projection_
         } else {
             const auto fmat = VR::get()->get_projection_matrix((VRRuntime::Eye)(true_index));
             double_matrix = fmat;
+        }
+
+        // DIAG: NSF-PROJ-VALUE. Capture the FINAL (post-override) per-eye projection FOV terms so
+        // we can directly compare, frame-by-frame across the reported "one eye zooms back" window,
+        // whether the two eyes' FINAL matrices ever differ in a way that isn't explained by normal
+        // IPD/eye offset (i.e. m00/m11 should track HMD FOV only and be near-IDENTICAL between the
+        // two eyes on any given frame, and STABLE frame-to-frame while the HMD FOV itself is fixed).
+        // If these drift/mismatch here even though the RAW values above looked fine, the bug is in
+        // our own override/get_projection_matrix() or update_matrices() path, not the engine's data.
+        if (vr->is_glitch_eye_diag_window_active()) {
+            const double final_m00 = g_hook->m_has_double_precision ? double_matrix[0][0] : (double)(*out)[0][0];
+            const double final_m11 = g_hook->m_has_double_precision ? double_matrix[1][1] : (double)(*out)[1][1];
+
+            SPDLOG_WARN("[VR][NSF-PROJ-VALUE-FINAL] frame={} true_index={} view_index={} final_m00={:.6f} final_m11={:.6f} nearz={:.4f}",
+                g_frame_count, true_index, view_index, final_m00, final_m11, VR::get()->m_nearz);
         }
     } else {
         SPDLOG_ERROR("CalculateStereoProjectionMatrix returned nullptr!");
@@ -9514,7 +10349,7 @@ uint32_t FFakeStereoRenderingHook::get_desired_number_of_views_hook(FFakeStereoR
         return 1;
     }
 
-    if (vr->is_native_stereo_fix_enabled() && !vr->is_native_stereo_fix_mirror_enabled()) {
+    if (vr->is_native_stereo_fix_enabled() && !vr->should_mirror_right_eye_this_frame()) {
         auto rtm = g_hook->get_render_target_manager();
 
         // This vfunc runs every frame even when begin_render_viewfamily_real is not reached (e.g. the
@@ -10498,7 +11333,8 @@ bool VRRenderTargetManager_Base::need_reallocate_view_target(const sdk::FViewpor
     }
 
     if (forced || w != this->last_width || h != this->last_height) {
-        SPDLOG_INFO("Reallocating view target! {} {} -> {} {}", this->last_width, this->last_height, w, h);
+        const auto new_generation = g_hook->bump_view_target_generation();
+        SPDLOG_INFO("Reallocating view target! {} {} -> {} {} (generation -> {})", this->last_width, this->last_height, w, h, new_generation);
 
         this->last_width = w;
         this->last_height = h;
@@ -11392,8 +12228,9 @@ bool VRRenderTargetManager_Base::is_scene_capture_world_stale() const {
 }
 
 void VRRenderTargetManager_Base::destroy_scene_capture() try {
-    SPDLOG_INFO("[DIAG] destroy_scene_capture() called: scene_capture_actor={:x} in_flight_target={:x} scene_capture_target_valid={}",
-        (uintptr_t)(sdk::AActor*)this->scene_capture_actor, (uintptr_t)this->in_flight_target, this->scene_capture_target.valid());
+    const auto current_generation = g_hook != nullptr ? g_hook->get_view_target_generation() : 0;
+    SPDLOG_INFO("[DIAG] destroy_scene_capture() called (generation={}): scene_capture_actor={:x} in_flight_target={:x} scene_capture_target_valid={}",
+        current_generation, (uintptr_t)(sdk::AActor*)this->scene_capture_actor, (uintptr_t)this->in_flight_target, this->scene_capture_target.valid());
 
     if (this->scene_capture_actor != nullptr && this->in_flight_target == nullptr) {
         SPDLOG_INFO("Destroying scene capture!");
@@ -11417,6 +12254,16 @@ void VRRenderTargetManager_Base::destroy_scene_capture() try {
         this->scene_capture_target_rhi_thread = nullptr;
 
         RHIThreadWorker::get().enqueue([this]() -> void { this->scene_capture_target_rhi_thread = nullptr; });
+    } else {
+        // NOTE: destroy_scene_capture() was requested (typically alongside a view-target reallocation,
+        // generation bumped above/at the caller) but skipped its actual teardown because in_flight_target
+        // is still non-null. This means the OLD scene-capture texture/actor remains bound past the point
+        // a new generation was requested. If a frame is composited/submitted using this stale scene
+        // capture target after the reallocation, that is a candidate race for single-image ghosting/
+        // double-image artifacts. Log clearly so this can be correlated against reallocation and
+        // composite/submission generation numbers in a captured log.
+        SPDLOG_INFO("[DIAG] destroy_scene_capture() SKIPPED teardown (generation={}): in_flight_target={:x} still set - old scene capture target remains bound past this generation boundary",
+            current_generation, (uintptr_t)this->in_flight_target);
     }
 } catch (const std::exception& e) {
     SPDLOG_ERROR("[VRRenderTargetManager] Exception in destroy_scene_capture: {}", e.what());
@@ -11545,6 +12392,40 @@ bool VRRenderTargetManager_Base::create_scene_capture() try {
     static constexpr auto scene_capture_recreate_cooldown = std::chrono::milliseconds(3000);
     const auto now = std::chrono::steady_clock::now();
     const auto since_last_create = now - this->last_scene_capture_create_time;
+
+    // DIAG: the cooldown above only limits FREQUENCY, not whether the tick resumption that opened
+    // the loading-guard was real. A tick_stalled flicker (false for a single frame during heavy
+    // level-streaming churn) previously let one create_scene_capture() call slip through mid-storm,
+    // recreating the RTV/SRV descriptor heaps and rebinding textures on the very same frame the
+    // engine's own render thread was already taking multiple seconds to complete (observed hitting
+    // 3857ms for a single frame, immediately followed by Present failing with
+    // DXGI_ERROR_DEVICE_REMOVED/DEVICE_HUNG - a GPU TDR). Require the tick to have been reported
+    // non-stalled for several CONSECUTIVE checks before treating a resumption as real, mirroring the
+    // resolution-change debounce in need_reallocate_view_target() below.
+    {
+        static uint32_t s_consecutive_non_stalled_checks = 0;
+        // DIAG: raised from 5 after a rare crash (DXGI_ERROR_DEVICE_REMOVED/DEVICE_HUNG, TDR) was
+        // observed where a scene-capture-texture rebind (new SRV/RTV heap creation) landed on the
+        // very next frame after a 2072ms single-frame spike during a level transition - i.e. 5
+        // consecutive non-stalled checks was not always enough to guarantee the GPU had actually
+        // caught up before we did more descriptor heap/resource work. A higher requirement makes us
+        // wait longer after the tick looks stable before recreating scene capture resources.
+        static constexpr uint32_t required_consecutive_non_stalled_checks = 15;
+
+        if (VR::get() != nullptr && VR::get()->is_engine_tick_stalled()) {
+            s_consecutive_non_stalled_checks = 0;
+            SPDLOG_WARN("[VRRenderTargetManager] create_scene_capture() refused - engine tick is currently stalled.");
+            return false;
+        }
+
+        ++s_consecutive_non_stalled_checks;
+
+        if (s_consecutive_non_stalled_checks < required_consecutive_non_stalled_checks) {
+            SPDLOG_WARN("[VRRenderTargetManager] create_scene_capture() deferred - waiting for engine tick to stabilize ({}/{}), to avoid recreating render resources during a transient tick resumption mid level-transition.",
+                s_consecutive_non_stalled_checks, required_consecutive_non_stalled_checks);
+            return false;
+        }
+    }
 
     // Refuse to (re)create while the view-target reallocation debounce is still stabilizing on a
     // new size (e.g. a resolution change mid level-transition). Creating now would size the scene
@@ -11776,6 +12657,12 @@ bool VRRenderTargetManager_Base::create_scene_capture() try {
                                 this->in_flight_target = nullptr;
                                 this->scene_capture_ready_time = std::chrono::steady_clock::now();
 
+                                // DIAG: right-eye startup-lag investigation. Records the boot-phase state at
+                                // the exact moment the scene capture becomes "ready" - if boot phase is still
+                                // active here, the same-pass/grace-period guards will keep suppressing the
+                                // real stereoscopic path for a while longer even though this handle is valid,
+                                // which is a likely source of the right eye lagging behind on first launch.
+                                SPDLOG_INFO("[DIAG] Scene capture texture created! (boot_phase_active={})", is_boot_phase_active());
                                 SPDLOG_INFO("Scene capture texture created!");
                             });
     
@@ -11869,6 +12756,11 @@ bool VRRenderTargetManager_Base::create_scene_capture() try {
                     this->in_flight_target = nullptr;
                     this->scene_capture_target = tgt;
                     this->scene_capture_ready_time = std::chrono::steady_clock::now();
+
+                    // DIAG: right-eye startup-lag investigation. Records the boot-phase state at the
+                    // exact moment the scene capture becomes "ready" - see the sibling log at the other
+                    // scene_capture_ready_time assignment site above for the matching rationale.
+                    SPDLOG_INFO("[DIAG] Scene capture texture ready (boot_phase_active={})", is_boot_phase_active());
 
                     // DIAG: confirm the scene capture texture actually resolves to a usable
                     // FRHITexture2D/native resource at the moment it becomes "ready". If the

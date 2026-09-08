@@ -915,6 +915,50 @@ std::optional<std::reference_wrapper<XrCompositionLayerQuad>> OverlayComponent::
     layer.pose.orientation = runtimes::OpenXR::to_openxr(glm::quat_cast(glm_matrix));
     layer.pose.position = runtimes::OpenXR::to_openxr(glm_matrix[3]);
 
+    // DIAG: independent left/right UI quads (2D-screen mode uses separate UI/UI_RIGHT swapchains, each
+    // going through this function separately) can, in principle, disagree on img_aspect/present_aspect/
+    // meters_w/meters_h/pose between eyes if get_ui_draw_extent() or any of the offset values it depends
+    // on changes between the left-eye and right-eye calls within the same frame. Such a per-eye mismatch
+    // would manifest as a double-image/ghosting artifact specifically at the nasal (inner) overlap region
+    // between the two eyes' quads, which is a plausible explanation for a blur that "snaps in" exactly
+    // when the UI/quad becomes visible. Log left-eye values, then diff against them on the paired
+    // right-eye call for the same swapchain family (UI/UI_RIGHT), and warn if they differ meaningfully.
+    if (vr->is_diag_verbose_logging_enabled()) {
+        static float s_left_meters_w = -1.0f, s_left_meters_h = -1.0f, s_left_present_aspect = -1.0f;
+        static XrPosef s_left_pose{};
+        static bool s_left_valid = false;
+
+        if (is_left_eye) {
+            s_left_meters_w = meters_w;
+            s_left_meters_h = meters_h;
+            s_left_present_aspect = present_aspect;
+            s_left_pose = layer.pose;
+            s_left_valid = true;
+        } else if (s_left_valid) {
+            const auto size_diff_w = std::abs(meters_w - s_left_meters_w);
+            const auto size_diff_h = std::abs(meters_h - s_left_meters_h);
+            const auto aspect_diff = std::abs(present_aspect - s_left_present_aspect);
+
+            const auto& lp = s_left_pose.position;
+            const auto& rp = layer.pose.position;
+            const auto pos_diff = std::sqrt((lp.x - rp.x) * (lp.x - rp.x) + (lp.y - rp.y) * (lp.y - rp.y) + (lp.z - rp.z) * (lp.z - rp.z));
+
+            const auto& lo = s_left_pose.orientation;
+            const auto& ro = layer.pose.orientation;
+            // dot product of orientations; 1.0 = identical, lower = more divergent
+            const auto orient_dot = std::abs(lo.x * ro.x + lo.y * ro.y + lo.z * ro.z + lo.w * ro.w);
+
+            if (size_diff_w > 0.0001f || size_diff_h > 0.0001f || aspect_diff > 0.0001f || pos_diff > 0.0001f || orient_dot < 0.99999f) {
+                SPDLOG_WARN("[DIAG] left/right UI quad MISMATCH: size(L={:.5f}x{:.5f} R={:.5f}x{:.5f} diff={:.5f}/{:.5f}) "
+                             "aspect(L={:.5f} R={:.5f} diff={:.5f}) pos_diff={:.6f}m orient_dot={:.7f}",
+                    s_left_meters_w, s_left_meters_h, meters_w, meters_h, size_diff_w, size_diff_h,
+                    s_left_present_aspect, present_aspect, aspect_diff, pos_diff, orient_dot);
+            }
+
+            s_left_valid = false;
+        }
+    }
+
     // Check if the controller pointer intersects with the quad, and we can use this to emulate the mouse
     if (vr->is_using_controllers()) {
         // Right only for now for testing
