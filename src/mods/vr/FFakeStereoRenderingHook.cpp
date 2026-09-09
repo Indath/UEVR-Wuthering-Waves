@@ -8070,6 +8070,10 @@ bool FFakeStereoRenderingHook::setup_view_extensions() try {
                                 static std::unordered_set<uintptr_t> warned_rvas{};
                                 const auto ex_rva = exception_address - (uintptr_t)*ex_mod_precheck;
 
+                                if (g_hook != nullptr) {
+                                    g_hook->report_uaf_recovery(ex_rva);
+                                }
+
                                 if (warned_rvas.insert(ex_rva).second) {
                                     SPDLOG_WARN("[Exception Handler] Applying generalized UAF recovery in game exe at rva {:x} (base_reg={} value={:x}, load result forced to 0)",
                                         ex_rva, (int)base_reg, *gpr_table[base_reg]);
@@ -8148,6 +8152,10 @@ bool FFakeStereoRenderingHook::setup_view_extensions() try {
                             if (base_reg < 16) {
                                 static std::unordered_set<uintptr_t> warned_store_rvas{};
                                 const auto ex_rva = exception_address - (uintptr_t)*ex_mod_precheck;
+
+                                if (g_hook != nullptr) {
+                                    g_hook->report_uaf_recovery(ex_rva);
+                                }
 
                                 if (warned_store_rvas.insert(ex_rva).second) {
                                     SPDLOG_WARN("[Exception Handler] Applying generalized UAF store recovery in game exe at rva {:x} (base_reg={} value={:x}, write skipped)",
@@ -9088,6 +9096,67 @@ __forceinline void FFakeStereoRenderingHook::calculate_stereo_view_offset(
         }
     }
 
+    // DIAG: NSF-STACKWALK-INDEX1. view_index has been shown (via NSF-VIEWINDEX-IDENTITY) to be
+    // POLYMORPHIC: the exact same caller RVA has, at different points in the same session, produced
+    // both a tiled 64x64 non-stereo capture (UI/icon-like) AND a burst of 900+ calls in a single
+    // frame with no matching FSceneView construction at all (consistent with a shadow-cascade/light-
+    // view transform query). NSF-CALLER-SITE alone can't distinguish these, since it only captures
+    // the immediate return address, which both behaviors apparently share. Walk further up the stack
+    // (skipping this function and its immediate caller) to capture a short chain of return addresses,
+    // and bucket the sample by how many times view_index==1 has already fired THIS frame, so we get
+    // one sample from a low-count ("UI capture"-like) frame and one from a high-count ("shadow-view"-
+    // like, 900+/frame) frame per session, without spamming every single call.
+    if (view_index == 1 && VR::get() != nullptr && VR::get()->is_diag_log_raw_view_index_enabled()) {
+        static uint32_t s_index1_calls_this_frame = 0;
+        static uint32_t s_index1_last_frame = 0xFFFFFFFFu;
+        static bool s_logged_low_count_sample = false;
+        static bool s_logged_high_count_sample = false;
+
+        if (g_frame_count != s_index1_last_frame) {
+            s_index1_last_frame = g_frame_count;
+            s_index1_calls_this_frame = 0;
+        }
+
+        ++s_index1_calls_this_frame;
+
+        // "Low count" sample: first time we see view_index==1 fire only a handful of times in a
+        // frame (matches the tiled-64x64-capture behavior observed earlier in sessions).
+        const bool want_low_sample = !s_logged_low_count_sample && s_index1_calls_this_frame >= 2 && s_index1_calls_this_frame <= 5;
+        // "High count" sample: fires far more than a real per-eye call ever should in one frame
+        // (matches the 900+/frame no-FSceneView behavior observed later in the same session).
+        const bool want_high_sample = !s_logged_high_count_sample && s_index1_calls_this_frame >= 100;
+
+        if (want_low_sample || want_high_sample) {
+            constexpr auto max_stack_depth = 16;
+            uintptr_t stack[max_stack_depth]{};
+            const auto depth = RtlCaptureStackBackTrace(0, max_stack_depth, (void**)&stack, nullptr);
+
+            std::string chain;
+            for (auto i = 0; i < depth; ++i) {
+                const auto frame_addr = stack[i];
+                const auto module_within = utility::get_module_within(frame_addr);
+
+                if (module_within) {
+                    const auto rva = frame_addr - (uintptr_t)*module_within;
+                    chain += fmt::format("0x{:x} ", rva);
+                } else {
+                    chain += fmt::format("?0x{:x} ", frame_addr);
+                }
+            }
+
+            SPDLOG_WARN("[VR][NSF-STACKWALK-INDEX1] sample_kind={} frame={} calls_this_frame={} stack_rvas=[ {}]",
+                want_low_sample ? "LOW_COUNT" : "HIGH_COUNT", g_frame_count, s_index1_calls_this_frame, chain);
+
+            if (want_low_sample) {
+                s_logged_low_count_sample = true;
+            }
+
+            if (want_high_sample) {
+                s_logged_high_count_sample = true;
+            }
+        }
+    }
+
 #ifdef FFAKE_STEREO_RENDERING_LOG_ALL_CALLS
     SPDLOG_INFO("calculate stereo view offset called! {}", view_index);
 #else
@@ -9386,14 +9455,18 @@ __forceinline void FFakeStereoRenderingHook::calculate_stereo_view_offset(
 
                 // DIAG: unconditional (throttled) trace to prove this branch is actually reached and
                 // to see the real delta magnitudes even when they stay under the warn threshold below.
-                SPDLOG_INFO_EVERY_N_SEC(1, "[VR][NSF-POSE-DIVERGE-TRACE] Pass2 reached, frame={} rot_delta_deg={:.4f} pos_delta={:.4f}",
-                    g_frame_count, rot_delta, pos_delta);
+                // Gated behind is_diag_sync_pose_verbose_logging_enabled() - fires every Pass2 call and
+                // is only meant to be enabled briefly while reproducing/tuning, not left on constantly.
+                if (vr->is_diag_sync_pose_verbose_logging_enabled()) {
+                    SPDLOG_INFO_EVERY_N_SEC(1, "[VR][NSF-POSE-DIVERGE-TRACE] Pass2 reached, frame={} rot_delta_deg={:.4f} pos_delta={:.4f}",
+                        g_frame_count, rot_delta, pos_delta);
 
-                if (rot_delta > 0.001 || pos_delta > 0.01) {
-                    SPDLOG_WARN("[VR][NSF-POSE-DIVERGE] frame={} rot_delta_deg={:.4f} pos_delta={:.4f} pass1_pos=({:.2f},{:.2f},{:.2f}) pass2_pos=({:.2f},{:.2f},{:.2f})",
-                        g_frame_count, rot_delta, pos_delta,
-                        hook_data.m_nsf_sync_pose_location_double.x, hook_data.m_nsf_sync_pose_location_double.y, hook_data.m_nsf_sync_pose_location_double.z,
-                        local_view_d->x, local_view_d->y, local_view_d->z);
+                    if (rot_delta > 0.001 || pos_delta > 0.01) {
+                        SPDLOG_WARN("[VR][NSF-POSE-DIVERGE] frame={} rot_delta_deg={:.4f} pos_delta={:.4f} pass1_pos=({:.2f},{:.2f},{:.2f}) pass2_pos=({:.2f},{:.2f},{:.2f})",
+                            g_frame_count, rot_delta, pos_delta,
+                            hook_data.m_nsf_sync_pose_location_double.x, hook_data.m_nsf_sync_pose_location_double.y, hook_data.m_nsf_sync_pose_location_double.z,
+                            local_view_d->x, local_view_d->y, local_view_d->z);
+                    }
                 }
 
                 // BLEND (not a hard snap): alpha==1.0 fully overwrites Pass2's rotation with Pass1's
@@ -9415,7 +9488,15 @@ __forceinline void FFakeStereoRenderingHook::calculate_stereo_view_offset(
                 // regardless of what's driving the camera, so a flat magnitude threshold alone was too
                 // sensitive to fast thumbstick turns. is_nsf_sync_pose_hard_cut() instead requires an
                 // abrupt SPIKE relative to the recent rolling baseline AND a raised absolute floor.
-                const bool is_hard_cut = hook_data.is_nsf_sync_pose_hard_cut((float)rot_delta, (float)pos_delta);
+                // DIAG: post-hard-cut sensitivity boost. See is_within_post_hard_cut_window() and
+                // is_diag_post_hard_cut_sensitivity_boost_enabled() for full rationale - temporarily
+                // lowers the spike-detector's multiplier for a short window after a hard cut fires, so
+                // smaller residual jitter later in the SAME skill/dash animation also gets fully
+                // corrected, not just the single frame that originally crossed the threshold.
+                const bool use_sensitivity_boost = vr->is_diag_post_hard_cut_sensitivity_boost_enabled() &&
+                    hook_data.is_within_post_hard_cut_window(vr->get_diag_post_hard_cut_sensitivity_boost_window_ms());
+                const bool is_hard_cut = hook_data.is_nsf_sync_pose_hard_cut((float)rot_delta, (float)pos_delta,
+                    use_sensitivity_boost ? vr->get_diag_post_hard_cut_sensitivity_boost_multiplier() : 0.0f);
 
                 // TRIGGER: only report a pose-divergence event (which feeds the auto-mirror-on-motion
                 // fallback) on an actual hard-cut-grade spike, NOT on the near-zero logging threshold
@@ -9449,9 +9530,24 @@ __forceinline void FFakeStereoRenderingHook::calculate_stereo_view_offset(
                         ? 1.0
                         : (double)vr->get_native_stereo_fix_sync_pose_blend_alpha();
 
-                if (force_full) {
+                if (force_full && vr->is_diag_sync_pose_verbose_logging_enabled()) {
                     SPDLOG_WARN("[VR][NSF-SYNC-FORCE-FULL] frame={} rot_delta_deg={:.4f} pos_delta={:.4f} applying FULL snap (is_hard_cut={})",
                         g_frame_count, rot_delta, pos_delta, is_hard_cut);
+                }
+
+                // DIAG: dash-blur numeric capture. See request_dash_capture()/request_dash_capture_mark()
+                // in VR.hpp - logs every relevant value for this Pass2 evaluation, unthrottled, while a
+                // capture window is active (armed via NumPad1), and tags the exact frame NumPad2 was
+                // pressed on so the perceived-blur moment can be correlated against the surrounding data.
+                if (bool marked = false; auto seq = vr->consume_dash_capture_frame(marked)) {
+                    SPDLOG_WARN("[VR][DASH-CAPTURE]{} seq={} frame={} rot_delta_deg={:.4f} pos_delta={:.4f} "
+                                "rot_ema={:.4f} pos_ema={:.4f} is_hard_cut={} force_full={} blend_alpha={:.3f} "
+                                "pass1_rot=({:.3f},{:.3f},{:.3f}) pass2_rot_before=({:.3f},{:.3f},{:.3f})",
+                        marked ? " [MARK]" : "", *seq, g_frame_count, rot_delta, pos_delta,
+                        hook_data.m_nsf_pose_delta_rot_ema, hook_data.m_nsf_pose_delta_pos_ema,
+                        is_hard_cut, force_full, blend_alpha,
+                        hook_data.m_nsf_sync_pose_rotation_double.pitch, hook_data.m_nsf_sync_pose_rotation_double.yaw, hook_data.m_nsf_sync_pose_rotation_double.roll,
+                        rot_d->pitch, rot_d->yaw, rot_d->roll);
                 }
 
                 if (blend_alpha >= 1.0) {
@@ -9468,7 +9564,26 @@ __forceinline void FFakeStereoRenderingHook::calculate_stereo_view_offset(
                 // the raw position here does NOT collapse stereo parallax - each eye still gets its own
                 // IPD offset applied afterward on top of this now-synced base position. Same blend-
                 // alpha applies here as for rotation above.
-                if (vr->is_native_stereo_fix_sync_pose_position_enabled()) {
+                //
+                // DIAG: FIX ATTEMPT #1/#2 for dash/fast-turn blur (see DiagRotationGatedPositionSync/
+                // DiagSustainedMotionPositionSyncSuppression in VR.hpp). Real capture data proved the
+                // dash blur frames have rot_delta_deg==0.0000 (no genuine rotational mismatch) while
+                // pos_delta stays moderately elevated every frame purely from continuous motion, and
+                // the unconditional position snap below fights that normal per-eye parallax. Gate the
+                // POSITION portion only (rotation sync above is unaffected) behind these two optional,
+                // independently toggleable tests. BOTH also require pos_delta to be under the shared
+                // ceiling - some hard cuts are purely positional (huge pos_delta, near-zero rotation)
+                // and must never be suppressed just because rotation looks dash-like.
+                const bool is_low_rotation = (float)rot_delta < vr->get_diag_rotation_gated_position_sync_threshold_deg();
+                const bool is_low_position = (float)pos_delta < vr->get_diag_position_sync_suppression_pos_delta_ceiling();
+                const bool is_dash_like = is_low_rotation && is_low_position;
+                const bool suppress_by_sustained_motion = hook_data.update_and_check_sustained_motion_suppression(
+                    is_dash_like, vr->get_diag_sustained_motion_position_sync_suppression_frames())
+                    && vr->is_diag_sustained_motion_position_sync_suppression_enabled();
+                const bool suppress_by_rotation_gate = vr->is_diag_rotation_gated_position_sync_enabled() && is_dash_like;
+                const bool suppress_position_sync = suppress_by_rotation_gate || suppress_by_sustained_motion;
+
+                if (vr->is_native_stereo_fix_sync_pose_position_enabled() && !suppress_position_sync) {
                     if (blend_alpha >= 1.0) {
                         *local_view_d = hook_data.m_nsf_sync_pose_location_double;
                     } else if (blend_alpha > 0.0) {
@@ -9489,21 +9604,28 @@ __forceinline void FFakeStereoRenderingHook::calculate_stereo_view_offset(
 
                 // DIAG: unconditional (throttled) trace to prove this branch is actually reached and
                 // to see the real delta magnitudes even when they stay under the warn threshold below.
-                SPDLOG_INFO_EVERY_N_SEC(1, "[VR][NSF-POSE-DIVERGE-TRACE] Pass2 reached, frame={} rot_delta_deg={:.4f} pos_delta={:.4f}",
-                    g_frame_count, rot_delta, pos_delta);
+                // Gated behind is_diag_sync_pose_verbose_logging_enabled() - fires every Pass2 call and
+                // is only meant to be enabled briefly while reproducing/tuning, not left on constantly.
+                if (vr->is_diag_sync_pose_verbose_logging_enabled()) {
+                    SPDLOG_INFO_EVERY_N_SEC(1, "[VR][NSF-POSE-DIVERGE-TRACE] Pass2 reached, frame={} rot_delta_deg={:.4f} pos_delta={:.4f}",
+                        g_frame_count, rot_delta, pos_delta);
 
-                if (rot_delta > 0.001f || pos_delta > 0.01f) {
-                    SPDLOG_WARN("[VR][NSF-POSE-DIVERGE] frame={} rot_delta_deg={:.4f} pos_delta={:.4f} pass1_pos=({:.2f},{:.2f},{:.2f}) pass2_pos=({:.2f},{:.2f},{:.2f})",
-                        g_frame_count, rot_delta, pos_delta,
-                        hook_data.m_nsf_sync_pose_location.x, hook_data.m_nsf_sync_pose_location.y, hook_data.m_nsf_sync_pose_location.z,
-                        view_location->x, view_location->y, view_location->z);
+                    if (rot_delta > 0.001f || pos_delta > 0.01f) {
+                        SPDLOG_WARN("[VR][NSF-POSE-DIVERGE] frame={} rot_delta_deg={:.4f} pos_delta={:.4f} pass1_pos=({:.2f},{:.2f},{:.2f}) pass2_pos=({:.2f},{:.2f},{:.2f})",
+                            g_frame_count, rot_delta, pos_delta,
+                            hook_data.m_nsf_sync_pose_location.x, hook_data.m_nsf_sync_pose_location.y, hook_data.m_nsf_sync_pose_location.z,
+                            view_location->x, view_location->y, view_location->z);
+                    }
                 }
 
                 // HARD-CUT OVERRIDE: see double-precision branch above for full rationale. Uses spike-
                 // relative-to-baseline + absolute-floor detection instead of a flat threshold, since a
                 // flat threshold alone misfires on fast thumbstick turns (this runs every frame
                 // regardless of what's driving the camera, unlike the Lua script's CineCameraActor gate).
-                const bool is_hard_cut = hook_data.is_nsf_sync_pose_hard_cut(rot_delta, pos_delta);
+                const bool use_sensitivity_boost = vr->is_diag_post_hard_cut_sensitivity_boost_enabled() &&
+                    hook_data.is_within_post_hard_cut_window(vr->get_diag_post_hard_cut_sensitivity_boost_window_ms());
+                const bool is_hard_cut = hook_data.is_nsf_sync_pose_hard_cut(rot_delta, pos_delta,
+                    use_sensitivity_boost ? vr->get_diag_post_hard_cut_sensitivity_boost_multiplier() : 0.0f);
 
                 // TRIGGER: see double-precision branch above for full rationale - only report on an
                 // actual hard-cut-grade spike, not the near-zero logging threshold, so the auto-mirror
@@ -9524,9 +9646,21 @@ __forceinline void FFakeStereoRenderingHook::calculate_stereo_view_offset(
                         ? 1.0f
                         : vr->get_native_stereo_fix_sync_pose_blend_alpha();
 
-                if (force_full) {
+                if (force_full && vr->is_diag_sync_pose_verbose_logging_enabled()) {
                     SPDLOG_WARN("[VR][NSF-SYNC-FORCE-FULL] frame={} rot_delta_deg={:.4f} pos_delta={:.4f} applying FULL snap (is_hard_cut={})",
                         g_frame_count, rot_delta, pos_delta, is_hard_cut);
+                }
+
+                // DIAG: see the matching double-precision branch above for full rationale.
+                if (bool marked = false; auto seq = vr->consume_dash_capture_frame(marked)) {
+                    SPDLOG_WARN("[VR][DASH-CAPTURE]{} seq={} frame={} rot_delta_deg={:.4f} pos_delta={:.4f} "
+                                "rot_ema={:.4f} pos_ema={:.4f} is_hard_cut={} force_full={} blend_alpha={:.3f} "
+                                "pass1_rot=({:.3f},{:.3f},{:.3f}) pass2_rot_before=({:.3f},{:.3f},{:.3f})",
+                        marked ? " [MARK]" : "", *seq, g_frame_count, rot_delta, pos_delta,
+                        hook_data.m_nsf_pose_delta_rot_ema, hook_data.m_nsf_pose_delta_pos_ema,
+                        is_hard_cut, force_full, blend_alpha_f,
+                        hook_data.m_nsf_sync_pose_rotation.pitch, hook_data.m_nsf_sync_pose_rotation.yaw, hook_data.m_nsf_sync_pose_rotation.roll,
+                        view_rotation->pitch, view_rotation->yaw, view_rotation->roll);
                 }
 
                 if (blend_alpha_f >= 1.0f) {
@@ -9539,7 +9673,21 @@ __forceinline void FFakeStereoRenderingHook::calculate_stereo_view_offset(
 
                 // See double-precision branch above for rationale: this runs before the later per-eye
                 // eye_separation/IPD offset is applied to *view_location, so parallax is preserved.
-                if (vr->is_native_stereo_fix_sync_pose_position_enabled()) {
+                //
+                // DIAG: see the matching double-precision branch above for full rationale on the
+                // rotation-gate/sustained-motion position-sync suppression tests. Both also require
+                // pos_delta to be under the shared ceiling so purely-positional hard cuts (huge
+                // pos_delta, near-zero rotation) are never suppressed.
+                const bool is_low_rotation = rot_delta < vr->get_diag_rotation_gated_position_sync_threshold_deg();
+                const bool is_low_position = pos_delta < vr->get_diag_position_sync_suppression_pos_delta_ceiling();
+                const bool is_dash_like = is_low_rotation && is_low_position;
+                const bool suppress_by_sustained_motion = hook_data.update_and_check_sustained_motion_suppression(
+                    is_dash_like, vr->get_diag_sustained_motion_position_sync_suppression_frames())
+                    && vr->is_diag_sustained_motion_position_sync_suppression_enabled();
+                const bool suppress_by_rotation_gate = vr->is_diag_rotation_gated_position_sync_enabled() && is_dash_like;
+                const bool suppress_position_sync = suppress_by_rotation_gate || suppress_by_sustained_motion;
+
+                if (vr->is_native_stereo_fix_sync_pose_position_enabled() && !suppress_position_sync) {
                     if (blend_alpha_f >= 1.0f) {
                         *view_location = hook_data.m_nsf_sync_pose_location;
                     } else if (blend_alpha_f > 0.0f) {
@@ -9584,8 +9732,10 @@ __forceinline void FFakeStereoRenderingHook::calculate_stereo_view_offset(
             }
         }
 
-        SPDLOG_INFO_EVERY_N_SEC(2, "[VR][NSF-EXCLUDED-INDEX-SYNCED] view_index={} frame={} applied cached synced pose (read-only)",
-            view_index, g_frame_count);
+        if (vr->is_diag_sync_pose_verbose_logging_enabled()) {
+            SPDLOG_INFO_EVERY_N_SEC(2, "[VR][NSF-EXCLUDED-INDEX-SYNCED] view_index={} frame={} applied cached synced pose (read-only)",
+                view_index, g_frame_count);
+        }
     }
 
     if (true_index == 0 && !is_full_pass) {

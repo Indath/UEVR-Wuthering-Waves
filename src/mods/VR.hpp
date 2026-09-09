@@ -699,7 +699,7 @@ public:
     }
 
     bool is_native_stereo_fix_sync_pose_enabled() const {
-        return m_native_stereo_fix_sync_pose->value();
+        return m_native_stereo_fix_sync_pose->value() || m_diag_double_vision_fix_master->value();
     }
 
     // NOTE: position sync used to be a separate opt-in toggle from rotation sync. Direct in-headset
@@ -711,7 +711,7 @@ public:
     // toggleable - it's always applied together with rotation sync (both driven by the single
     // NativeStereoFixSyncPose toggle), since applying only one is now known to not work.
     bool is_native_stereo_fix_sync_pose_position_enabled() const {
-        return m_native_stereo_fix_sync_pose->value();
+        return m_native_stereo_fix_sync_pose->value() || m_diag_double_vision_fix_master->value();
     }
 
     // Blend factor used when forcing Pass2 (right eye) rotation/position toward Pass1 (left eye)'s
@@ -723,6 +723,10 @@ public:
     // eliminating desync - trading a smaller, more symmetric-feeling error for the previous full/frozen
     // one-eye error.
     float get_native_stereo_fix_sync_pose_blend_alpha() const {
+        if (m_diag_double_vision_fix_master->value()) {
+            return 1.0f;
+        }
+
         return m_native_stereo_fix_sync_pose_blend_alpha->value();
     }
 
@@ -741,6 +745,85 @@ public:
         return (float)m_diag_gradual_hard_cut_convergence_duration_ms->value();
     }
 
+    // DIAG: see FFakeStereoRenderingHook::is_within_post_hard_cut_window() for full rationale. Normally
+    // the full-strength sync-pose snap only applies to the single frame that crosses the hard-cut spike
+    // threshold; ordinary sub-threshold jitter during the REST of that same skill/dash/camera-transition
+    // animation falls back to the gentler blend_alpha slider. Enabling this keeps the spike detector
+    // temporarily more sensitive (lower multiplier) for get_diag_post_hard_cut_sensitivity_boost_window_ms()
+    // after a hard cut fires, so residual jitter throughout the same animation also gets fully corrected
+    // instead of just the one frame that tripped the original threshold - targeting the momentary blur
+    // that remains during dashes/fast turns even with the existing fix.
+    bool is_diag_post_hard_cut_sensitivity_boost_enabled() const {
+        return m_diag_post_hard_cut_sensitivity_boost->value();
+    }
+
+    // How long (ms) after a hard cut fires the boosted (more sensitive) spike multiplier stays active.
+    uint64_t get_diag_post_hard_cut_sensitivity_boost_window_ms() const {
+        return (uint64_t)m_diag_post_hard_cut_sensitivity_boost_window_ms->value();
+    }
+
+    // Replacement spike multiplier used while inside the post-hard-cut boost window (normally 6.0x
+    // baseline; lowering this makes the spike test trip on smaller relative deltas).
+    float get_diag_post_hard_cut_sensitivity_boost_multiplier() const {
+        return (float)m_diag_post_hard_cut_sensitivity_boost_multiplier->value() / 10.0f;
+    }
+
+    // DIAG: FIX ATTEMPT #1 for dash/fast-turn blur. Real-capture data (dash-blur capture workflow)
+    // showed the blur frames all have rot_delta_deg==0.0000 (no genuine rotational eye mismatch) while
+    // pos_delta stays moderately elevated (~15-30 units) EVERY frame because the master fix's
+    // blend_alpha=1.0 fallback keeps force-snapping Pass2's position to Pass1's now-stale cached
+    // position even when is_hard_cut is false - i.e. it's fighting normal per-eye motion parallax
+    // during fast continuous movement, not fixing a real cut. Confirmed real glitches (NumPad2 marks)
+    // instead always show substantial rot_delta_deg (2-19+ degrees). Enabling this gates the
+    // POSITION-ONLY portion of the sync (rotation sync is unaffected) behind a minimum rot_delta_deg
+    // threshold: if the current frame's rot_delta is below the threshold, the position snap/blend is
+    // skipped for that frame (falls back to Pass2's own live position), since a real hard cut always
+    // shows up rotationally too. A/B test against DiagSustainedMotionPositionSyncSuppression below and
+    // against leaving both off (previous behavior).
+    bool is_diag_rotation_gated_position_sync_enabled() const {
+        return m_diag_rotation_gated_position_sync->value();
+    }
+
+    // Minimum rot_delta_deg (see NSF-POSE-DIVERGE logging) required this frame for the position sync
+    // to still be applied while DiagRotationGatedPositionSync is enabled. Defaults to 1.0 degree -
+    // comfortably above sensor/float noise but far below the smallest real hard-cut rot_delta_deg
+    // observed in capture data (~2.4 degrees).
+    float get_diag_rotation_gated_position_sync_threshold_deg() const {
+        return (float)m_diag_rotation_gated_position_sync_threshold_deg->value() / 10.0f;
+    }
+
+    // DIAG: safety ceiling for BOTH position-sync suppression tests below. Real-world capture proved
+    // some hard cuts are PURELY positional - a large scripted position jump (e.g. a skill/teleport)
+    // with almost no camera rotation (rot_delta_deg observed as low as ~0.08-0.11 degrees, well under
+    // the rotation-gate threshold above) - which the rotation gate alone would wrongly classify as
+    // dash-like continuous motion and suppress, bringing back double vision (pos_delta observed
+    // 300-455+ units in that case, versus 2-90 units during confirmed dash-only frames). Suppression
+    // is therefore only allowed when pos_delta is ALSO below this ceiling; a large positional jump
+    // always forces the full snap regardless of how small rot_delta is. Defaults to 120 units -
+    // comfortably above the largest dash-only pos_delta observed (~90) but well below the smallest
+    // pure-position-cut pos_delta observed (~300).
+    float get_diag_position_sync_suppression_pos_delta_ceiling() const {
+        return (float)m_diag_position_sync_suppression_pos_delta_ceiling->value();
+    }
+
+    // DIAG: FIX ATTEMPT #2 for dash/fast-turn blur (alternative to #1 above, can be combined). Instead
+    // of gating on rotation every frame, this tracks how many CONSECUTIVE Pass2 calls have had
+    // rot_delta_deg below the same threshold above; once that streak reaches the configured frame
+    // count, the position-only sync snap is suppressed for the rest of the streak (treating sustained
+    // near-zero-rotation divergence as continuous player-driven motion/dash rather than a one-off cut).
+    // A single frame with rot_delta_deg above the threshold resets the streak, so a real hard cut
+    // (which always shows a rotation spike) still gets the full instant position snap immediately.
+    bool is_diag_sustained_motion_position_sync_suppression_enabled() const {
+        return m_diag_sustained_motion_position_sync_suppression->value();
+    }
+
+    // How many consecutive low-rotation Pass2 frames must elapse before the position sync is
+    // suppressed while DiagSustainedMotionPositionSyncSuppression is enabled. Defaults to 3 - enough
+    // to ignore a single-frame reporting fluke but still react within ~50-100ms of a dash starting.
+    uint32_t get_diag_sustained_motion_position_sync_suppression_frames() const {
+        return (uint32_t)m_diag_sustained_motion_position_sync_suppression_frames->value();
+    }
+
     // DIAG: normally the full blend_alpha=1.0 snap only applies on a detected hard-cut-grade spike
     // (see is_nsf_sync_pose_hard_cut()); ordinary small per-frame divergence during continuous motion
     // uses the slider's blend_alpha instead. This proved insufficient for a reported multi-frame
@@ -752,6 +835,16 @@ public:
     // single frame during the reported glitch window, not just on detected spikes.
     bool is_native_stereo_fix_sync_pose_force_full_enabled() const {
         return m_native_stereo_fix_sync_pose_force_full->value();
+    }
+
+    bool is_diag_double_vision_fix_master_enabled() const {
+        return m_diag_double_vision_fix_master->value();
+    }
+
+    // DIAG: see m_diag_sync_pose_verbose_logging declaration for rationale - gates the high-frequency
+    // NSF-POSE-DIVERGE/-TRACE, NSF-SYNC-FORCE-FULL, and NSF-EXCLUDED-INDEX-SYNCED log lines.
+    bool is_diag_sync_pose_verbose_logging_enabled() const {
+        return m_diag_sync_pose_verbose_logging->value();
     }
 
     // DIAG: gates the in-headset visual indicator (see D3D12Component's right-eye composite) that
@@ -842,6 +935,64 @@ public:
         return now_ms < deadline_ms;
     }
 
+    // DIAG: dash-blur numeric capture. Two-key workflow: press the ARM key (see
+    // m_dash_capture_arm_vkey) the instant a dash/skill camera-transition BEGINS, which starts logging
+    // every relevant NSF sync-pose value (rot/pos delta, hard-cut verdict, blend alpha, EMA baseline)
+    // EVERY SINGLE FRAME (not throttled) for the next kDashCaptureMaxFrames frames or
+    // kDashCaptureTimeoutMs, whichever comes first. Press the MARK key (see m_dash_capture_mark_vkey)
+    // the instant the visual blur is actually PERCEIVED, which stamps a distinct log line at that exact
+    // frame without stopping the capture, so the surrounding per-frame values can be correlated against
+    // the precise moment the blur was seen (not just "sometime during a ~1.5s dash").
+    static constexpr int m_dash_capture_arm_vkey = VK_NUMPAD1;
+    static constexpr int m_dash_capture_mark_vkey = VK_NUMPAD2;
+    static constexpr uint32_t kDashCaptureMaxFrames = 200;
+    static constexpr int64_t kDashCaptureTimeoutMs = 3000;
+
+    bool is_dash_capture_arm_key_down() const {
+        return GetAsyncKeyState(m_dash_capture_arm_vkey) & 0x8000;
+    }
+
+    bool is_dash_capture_mark_key_down() const {
+        return GetAsyncKeyState(m_dash_capture_mark_vkey) & 0x8000;
+    }
+
+    void request_dash_capture() {
+        m_dash_capture_frames_remaining.store(kDashCaptureMaxFrames, std::memory_order_relaxed);
+        const auto deadline_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count() + kDashCaptureTimeoutMs;
+        m_dash_capture_deadline_ms.store(deadline_ms, std::memory_order_relaxed);
+        m_dash_capture_seq.store(0, std::memory_order_relaxed);
+    }
+
+    void request_dash_capture_mark() {
+        m_dash_capture_mark_pending.store(true, std::memory_order_relaxed);
+    }
+
+    // Called once per Pass2 (right eye) NSF sync-pose evaluation. Returns the sequence index to tag
+    // this frame's log line with if the capture is still active, or std::nullopt if not capturing.
+    // marked_out is set true exactly once (the first call after request_dash_capture_mark() was called),
+    // so the caller can tag that specific frame's log line as the perceived-blur moment.
+    std::optional<uint32_t> consume_dash_capture_frame(bool& marked_out) {
+        marked_out = m_dash_capture_mark_pending.exchange(false, std::memory_order_relaxed);
+
+        const auto deadline_ms = m_dash_capture_deadline_ms.load(std::memory_order_relaxed);
+        if (deadline_ms == 0) {
+            return std::nullopt;
+        }
+
+        const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        const auto frames_remaining = m_dash_capture_frames_remaining.load(std::memory_order_relaxed);
+
+        if (now_ms >= deadline_ms || frames_remaining == 0) {
+            m_dash_capture_deadline_ms.store(0, std::memory_order_relaxed);
+            return std::nullopt;
+        }
+
+        m_dash_capture_frames_remaining.fetch_sub(1, std::memory_order_relaxed);
+        return m_dash_capture_seq.fetch_add(1, std::memory_order_relaxed);
+    }
+
     bool is_diag_log_final_eye_pose_enabled() const {
         return m_diag_log_final_eye_pose->value();
     }
@@ -872,10 +1023,14 @@ public:
     // that view_index=1 does not correspond to a visible rendered eye, and it races with the real
     // view_index=3 eye call on the same true_index, plausibly explaining eye-switching glitch reports.
     bool is_diag_exclude_view_index_from_sync_cache_enabled() const {
-        return m_diag_exclude_view_index_from_sync_cache->value();
+        return m_diag_exclude_view_index_from_sync_cache->value() || m_diag_double_vision_fix_master->value();
     }
 
     int32_t get_diag_exclude_view_index_from_sync_cache() const {
+        if (m_diag_double_vision_fix_master->value()) {
+            return 1;
+        }
+
         return m_diag_exclude_view_index_from_sync_cache_index->value();
     }
 
@@ -1298,6 +1453,12 @@ private:
     // See request_glitch_eye_diag_window()/is_glitch_eye_diag_window_active().
     std::atomic<int64_t> m_glitch_eye_diag_deadline_ms{0};
 
+    // See request_dash_capture()/request_dash_capture_mark()/consume_dash_capture_frame().
+    std::atomic<int64_t> m_dash_capture_deadline_ms{0};
+    std::atomic<uint32_t> m_dash_capture_frames_remaining{0};
+    std::atomic<uint32_t> m_dash_capture_seq{0};
+    std::atomic<bool> m_dash_capture_mark_pending{false};
+
     uint32_t m_lowest_xinput_user_index{};
 
     std::chrono::nanoseconds m_last_input_delay{};
@@ -1543,10 +1704,47 @@ private:
     // DIAG: see is_native_stereo_fix_sync_pose_force_full_enabled(). Off by default; only for deliberate
     // diagnostic re-testing to confirm the sync path engages on every frame during a reported glitch.
     const ModToggle::Ptr m_native_stereo_fix_sync_pose_force_full{ ModToggle::create(generate_name("NativeStereoFixSyncPoseForceFull"), false) };
+    // Single convenience "master" toggle for the known double-image fix combo. Enabling it forces
+    // NativeStereoFixSyncPose=true, NativeStereoFixSyncPoseBlendAlpha=1.0, and
+    // DiagExcludeViewIndexFromSyncCache=true with its index set to 1 (all applied at once via
+    // on_draw_ui's cascade logic when this toggle's checkbox is clicked) - the exact combination of
+    // settings confirmed to eliminate the reported eye-pose double-image/blur. Disabling it forces
+    // NativeStereoFixSyncPose=false and DiagExcludeViewIndexFromSyncCache=false, stopping all three
+    // from firing. The individual toggles remain in the Debug tab's NS Double Vision Diagnostics
+    // section for manual override/re-testing; this master toggle is a one-click shortcut over them.
+    const ModToggle::Ptr m_diag_double_vision_fix_master{ ModToggle::create(generate_name("DiagDoubleVisionFixMaster"), false) };
     // DIAG: see is_diag_gradual_hard_cut_convergence_enabled(). Off by default - test toggle to A/B
     // the ramped convergence against the existing instant hard-cut snap before making it the default.
     const ModToggle::Ptr m_diag_gradual_hard_cut_convergence{ ModToggle::create(generate_name("DiagGradualHardCutConvergence"), false) };
     const ModInt32::Ptr m_diag_gradual_hard_cut_convergence_duration_ms{ ModSliderInt32::create(generate_name("DiagGradualHardCutConvergenceDurationMs"), 50, 3000, 1000) };
+    // DIAG: see is_diag_post_hard_cut_sensitivity_boost_enabled(). Off by default - test toggle to A/B
+    // against the plain hard-cut-only correction before making it the default. Window defaults to 500ms
+    // (covers most skill/dash animation lengths); multiplier stored *10 as an int slider (default 20 ==
+    // 2.0x, vs. the normal 6.0x baseline) since ModSliderInt32 is the available slider type here.
+    const ModToggle::Ptr m_diag_post_hard_cut_sensitivity_boost{ ModToggle::create(generate_name("DiagPostHardCutSensitivityBoost"), false) };
+    const ModInt32::Ptr m_diag_post_hard_cut_sensitivity_boost_window_ms{ ModSliderInt32::create(generate_name("DiagPostHardCutSensitivityBoostWindowMs"), 50, 2000, 500) };
+    const ModInt32::Ptr m_diag_post_hard_cut_sensitivity_boost_multiplier{ ModSliderInt32::create(generate_name("DiagPostHardCutSensitivityBoostMultiplier"), 10, 60, 20) };
+    // DIAG: see is_diag_rotation_gated_position_sync_enabled(). Off by default - test toggle to A/B
+    // against leaving position sync unconditional and against the sustained-motion approach below.
+    // Threshold stored *10 as an int slider (default 10 == 1.0 degree) since ModSliderInt32 is the
+    // available slider type here.
+    const ModToggle::Ptr m_diag_rotation_gated_position_sync{ ModToggle::create(generate_name("DiagRotationGatedPositionSync"), false) };
+    const ModInt32::Ptr m_diag_rotation_gated_position_sync_threshold_deg{ ModSliderInt32::create(generate_name("DiagRotationGatedPositionSyncThresholdDeg"), 1, 100, 10) };
+    // DIAG: see get_diag_position_sync_suppression_pos_delta_ceiling(). Shared ceiling for both
+    // position-sync suppression tests, since a large pos_delta always indicates a real cut regardless
+    // of rotation.
+    const ModSlider::Ptr m_diag_position_sync_suppression_pos_delta_ceiling{ ModSlider::create(generate_name("DiagPositionSyncSuppressionPosDeltaCeiling"), 10.0f, 1000.0f, 120.0f) };
+    // DIAG: gates the high-frequency sync-pose logging (NSF-POSE-DIVERGE/-TRACE, NSF-SYNC-FORCE-FULL,
+    // NSF-EXCLUDED-INDEX-SYNCED) that fires every Pass2 call (throttled to 1-2/sec, but still constant
+    // spam for as long as Sync Pose is enabled) - see is_diag_sync_pose_verbose_logging_enabled().
+    // Off by default; only meant to be turned on briefly while actively reproducing/tuning the
+    // scalers above, since it otherwise floods the log with little added value once the fix combo is
+    // already confirmed working.
+    const ModToggle::Ptr m_diag_sync_pose_verbose_logging{ ModToggle::create(generate_name("DiagSyncPoseVerboseLogging"), false) };
+
+    // toggle to A/B against the plain rotation-gate approach above and against leaving both off.
+    const ModToggle::Ptr m_diag_sustained_motion_position_sync_suppression{ ModToggle::create(generate_name("DiagSustainedMotionPositionSyncSuppression"), false) };
+    const ModInt32::Ptr m_diag_sustained_motion_position_sync_suppression_frames{ ModSliderInt32::create(generate_name("DiagSustainedMotionPositionSyncSuppressionFrames"), 1, 30, 3) };
     // DIAG: in-headset visual indicator for the stale-scene-capture-freeze condition (see
     // is_scene_capture_stall_indicator_enabled()). Off by default since it's a diagnostic aid.
     const ModToggle::Ptr m_scene_capture_stall_indicator{ ModToggle::create(generate_name("SceneCaptureStallIndicator"), false) };
@@ -1700,6 +1898,14 @@ public:
             *m_diag_apply_synced_pose_to_excluded_view_index,
             *m_diag_gradual_hard_cut_convergence,
             *m_diag_gradual_hard_cut_convergence_duration_ms,
+            *m_diag_post_hard_cut_sensitivity_boost,
+            *m_diag_post_hard_cut_sensitivity_boost_window_ms,
+            *m_diag_post_hard_cut_sensitivity_boost_multiplier,
+            *m_diag_rotation_gated_position_sync,
+            *m_diag_rotation_gated_position_sync_threshold_deg,
+            *m_diag_position_sync_suppression_pos_delta_ceiling,
+            *m_diag_sustained_motion_position_sync_suppression,
+            *m_diag_sustained_motion_position_sync_suppression_frames,
             *m_desktop_fix,
             *m_enable_gui,
             *m_enable_depth,
@@ -1748,6 +1954,8 @@ public:
             *m_native_stereo_fix_sync_pose_position,
             *m_native_stereo_fix_sync_pose_blend_alpha,
             *m_native_stereo_fix_sync_pose_force_full,
+            *m_diag_double_vision_fix_master,
+            *m_diag_sync_pose_verbose_logging,
             *m_native_stereo_fix_mirror,
             *m_native_stereo_fix_auto_mirror_on_cinematic,
             *m_native_stereo_fix_auto_mirror_on_ui_blank,

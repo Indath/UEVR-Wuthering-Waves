@@ -482,6 +482,59 @@ public:
             std::chrono::steady_clock::now() - m_last_pose_divergence_time).count();
     }
 
+    // DIAG: see is_diag_post_hard_cut_sensitivity_boost_enabled() in VR.hpp. Returns true if a hard-cut-
+    // grade divergence event (see report_pose_divergence_event() above) happened within the last
+    // window_ms milliseconds, i.e. we're still inside the same skill/dash/camera-transition animation
+    // that just triggered a hard cut. Used to temporarily lower the spike-detector's threshold so
+    // smaller residual jitter during that same animation also gets fully corrected, instead of only the
+    // single frame that crossed the normal hard-cut bar.
+    bool is_within_post_hard_cut_window(uint64_t window_ms) const {
+        const auto ms_since = get_ms_since_last_pose_divergence();
+        return ms_since != UINT64_MAX && ms_since <= window_ms;
+    }
+
+    // DIAG/TRACKING: last time the generalized game-exe UAF exception recovery (see the vectored
+    // exception handler installed in setup_view_extensions()) actually fired, plus a running total
+    // and the last faulting RVA seen. A real crash was previously observed where this recovery fired
+    // (patching over an access-violating load/store in the game's own exe) but the game never
+    // actually recovered cleanly - Present stopped being called a few seconds later and the process
+    // hung forever afterward, with no separate OS crash dump because the vectored handler swallowed
+    // the exception instead of letting it terminate. Framework::hook_monitor() checks this timestamp
+    // whenever it detects a Present/engine-tick stall so the log can explicitly call out "this stall
+    // immediately followed a UAF recovery" instead of just assuming a loading screen, which is the
+    // single biggest diagnostic clue for tracking down exactly which menu/UI action is freeing the
+    // object these recoveries are patching around. Public so the free-standing vectored exception
+    // handler (installed via a plain lambda, not a member function) and Framework::hook_monitor() can
+    // both reach it through g_hook / VR::get()->get_fake_stereo_hook().
+    std::atomic<uint64_t> m_last_uaf_recovery_time_us{0};
+    std::atomic<uint64_t> m_uaf_recovery_count{0};
+    std::atomic<uintptr_t> m_last_uaf_recovery_rva{0};
+
+    // Records that a UAF recovery just fired at the given module-relative RVA. Safe to call from the
+    // vectored exception handler (signal-handler-like context) since it only touches atomics/relaxed
+    // ops - no locks, no allocations beyond what the caller already does for logging.
+    void report_uaf_recovery(uintptr_t rva) {
+        const auto now_us = (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        m_last_uaf_recovery_time_us.store(now_us, std::memory_order_relaxed);
+        m_last_uaf_recovery_rva.store(rva, std::memory_order_relaxed);
+        m_uaf_recovery_count.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    // Returns the number of milliseconds since the last UAF recovery fired, or -1 if none has fired yet.
+    int64_t get_ms_since_last_uaf_recovery() const {
+        const auto last_us = m_last_uaf_recovery_time_us.load(std::memory_order_relaxed);
+
+        if (last_us == 0) {
+            return -1;
+        }
+
+        const auto now_us = (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+
+        return (int64_t)((now_us - last_us) / 1000);
+    }
+
     // The engine's own AdjustViewRect call decides, independently of D3D12Component/D3D11Component's
     // frame-parity-based is_left_eye_frame classification, which physical x-offset half of the
     // double-wide backbuffer each eye's scene gets rendered into. These two "which eye is this"
@@ -777,8 +830,12 @@ private:
     // Returns true if the given per-frame rotation/position delta should be treated as a hard camera
     // cut (full instant snap) rather than continuous motion (blended). Updates the rolling EMA
     // baseline as a side effect, so this must be called at most once per frame from the NSF sync-pose
-    // branch.
-    bool is_nsf_sync_pose_hard_cut(float rot_delta, float pos_delta) {
+    // branch. spike_multiplier_override, when > 0, replaces the default kSpikeMultiplier - used by the
+    // post-hard-cut sensitivity boost (see is_diag_post_hard_cut_sensitivity_boost_enabled() in VR.hpp)
+    // to temporarily make the spike test more sensitive for a short window right after a hard cut fires,
+    // so smaller residual jitter during the same skill/dash animation also gets fully corrected instead
+    // of falling back to the gentler blend_alpha.
+    bool is_nsf_sync_pose_hard_cut(float rot_delta, float pos_delta, float spike_multiplier_override = 0.0f) {
         constexpr float kEmaAlpha = 0.1f;
         constexpr float kSpikeMultiplier = 6.0f;
         constexpr float kMinBaselineRot = 2.0f;   // degrees, avoids div-by-near-zero baseline spikes
@@ -787,12 +844,14 @@ private:
         constexpr float kHardCutPosFloor = 80.0f; // units - raised safety-net floor
         constexpr uint32_t kMinSamplesForSpike = 10;
 
+        const auto spike_multiplier = spike_multiplier_override > 0.0f ? spike_multiplier_override : kSpikeMultiplier;
+
         const auto rot_baseline = (std::max)(m_nsf_pose_delta_rot_ema, kMinBaselineRot);
         const auto pos_baseline = (std::max)(m_nsf_pose_delta_pos_ema, kMinBaselinePos);
 
         const bool has_enough_samples = m_nsf_pose_delta_sample_count >= kMinSamplesForSpike;
         const bool is_spike = has_enough_samples &&
-            (rot_delta > rot_baseline * kSpikeMultiplier || pos_delta > pos_baseline * kSpikeMultiplier);
+            (rot_delta > rot_baseline * spike_multiplier || pos_delta > pos_baseline * spike_multiplier);
         const bool is_over_floor = rot_delta > kHardCutRotFloor || pos_delta > kHardCutPosFloor;
 
         // Update the rolling baseline AFTER evaluating this frame so the spike itself doesn't get
@@ -842,6 +901,28 @@ private:
         }
 
         return elapsed_ms / duration_ms;
+    }
+
+    // DIAG: sustained-motion counter for position-only sync suppression. Counts consecutive Pass2
+    // calls where rot_delta stayed at/below the configured gate threshold (i.e. no genuine rotational
+    // divergence, consistent with a dash/continuous-motion positional offset rather than a real camera
+    // cut). See DiagSustainedMotionPositionSyncSuppression in VR.hpp and
+    // update_and_check_sustained_motion_suppression() below.
+    uint32_t m_nsf_low_rot_sustained_frames{0};
+
+    // Must be called at most once per Pass2 call per frame (mirrors is_nsf_sync_pose_hard_cut()).
+    // Returns true once is_low_rotation has been true for sustained_frames_threshold consecutive
+    // frames - i.e. the ongoing pos_delta looks like continuous player-driven motion (dash/fast turn)
+    // rather than a one-off hard cut, so the caller should suppress the position-only sync snap for
+    // this frame even though a moderate pos_delta is still present.
+    bool update_and_check_sustained_motion_suppression(bool is_low_rotation, uint32_t sustained_frames_threshold) {
+        if (is_low_rotation) {
+            ++m_nsf_low_rot_sustained_frames;
+        } else {
+            m_nsf_low_rot_sustained_frames = 0;
+        }
+
+        return sustained_frames_threshold > 0 && m_nsf_low_rot_sustained_frames >= sustained_frames_threshold;
     }
 
     Rotator<float> m_last_pre_rotation{};

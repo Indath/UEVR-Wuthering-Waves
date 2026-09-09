@@ -180,6 +180,36 @@ void Framework::hook_monitor() {
             SPDLOG_INFO_EVERY_N_SEC(1, "Framework::hook_monitor(): present stalled for {}ms (has_last_chance={})",
                 std::chrono::duration_cast<std::chrono::milliseconds>(now - m_last_present_time).count(), m_has_last_chance);
 
+            // DIAG: cross-reference this stall against the generalized game-exe UAF exception recovery
+            // (see FFakeStereoRenderingHook's vectored exception handler / report_uaf_recovery()). A
+            // real hang was previously observed where that recovery fired (patching over an access-
+            // violating load/store in the game's own exe, e.g. from opening a menu) but the game never
+            // actually recovered cleanly - Present simply stopped being called a few seconds later and
+            // never resumed, with no separate OS crash dump because the vectored handler swallowed the
+            // exception instead of letting it terminate. Logging this here turns "unexplained stall,
+            // assumed loading screen" into "stall started ~Xms after a UAF recovery at rva 0x...", which
+            // is the single biggest clue for narrowing down which menu/UI action frees the object these
+            // recoveries are patching around.
+            {
+                auto vr_for_uaf_check = VR::get();
+
+                if (vr_for_uaf_check != nullptr && vr_for_uaf_check->get_fake_stereo_hook() != nullptr) {
+                    auto* hook_for_uaf_check = vr_for_uaf_check->get_fake_stereo_hook().get();
+                    const auto ms_since_recovery = hook_for_uaf_check->get_ms_since_last_uaf_recovery();
+
+                    // Only worth flagging if the recovery happened recently relative to when this
+                    // stall actually started (i.e. it's plausibly the cause, not an unrelated one from
+                    // much earlier in the session).
+                    if (ms_since_recovery >= 0 &&
+                        (uint64_t)ms_since_recovery <= (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(now - m_last_present_time).count() + 2000) {
+                        SPDLOG_WARNING_EVERY_N_SEC(1, "Framework::hook_monitor(): this stall began ~{}ms after the last UAF exception recovery "
+                            "(rva={:x}, total recoveries this session={}) - likely cause of the hang, not a normal loading screen",
+                            ms_since_recovery, hook_for_uaf_check->m_last_uaf_recovery_rva.load(std::memory_order_relaxed),
+                            hook_for_uaf_check->m_uaf_recovery_count.load(std::memory_order_relaxed));
+                    }
+                }
+            }
+
             // Present itself has stopped being called for a long time. Regardless of whether this
             // turns out to be a legitimate loading screen (game thread tick also stalled) or a hang
             // on the render/RHI thread specifically (e.g. stuck inside depth texture reallocation,
