@@ -285,6 +285,18 @@ public:
         return m_diag_verbose_logging;
     }
 
+    bool is_diag_log_pose_refresh_timing_enabled() const {
+        return m_diag_log_pose_refresh_timing;
+    }
+
+    void set_diag_log_pose_refresh_timing(bool value) {
+        m_diag_log_pose_refresh_timing = value;
+    }
+
+    uint64_t get_diag_pose_refresh_call_count() const {
+        return m_diag_pose_refresh_call_count;
+    }
+
     int get_diag_nsf_pass2_frame_count_mode() const {
         return m_diag_nsf_pass2_frame_count_mode;
     }
@@ -1162,6 +1174,19 @@ public:
         return m_disable_lgui_ui_redirect->value();
     }
 
+    // DIAG: toggles which recovery strategy the generalized game-exe UAF exception handler
+    // (FFakeStereoRenderingHook.cpp) uses for WRITE access violations on the known stale/freed-object
+    // fault family. "Skip the write" (legacy behavior, this ON) let the game keep running through most
+    // occurrences and was stable in the majority of sessions, but was later observed to occasionally
+    // convert what would have been a crash into a permanent hang (the skipped write turned out to be
+    // load-bearing for game-thread progress in that instance). "Let it crash" (this OFF) removes that
+    // mitigation so those faults propagate as a real, immediate, diagnosable crash instead. Default ON
+    // to preserve the previously stable behavior; turn OFF only if you want a full crash dump for a
+    // specific repro instead of a possible hang.
+    bool is_lgui_uaf_store_recovery_disabled() const {
+        return m_disable_lgui_uaf_store_recovery->value();
+    }
+
     // DIAG: A/B test to determine whether the runtime's own depth-based compositor reprojection
     // (submitted via XR_KHR_composition_layer_depth, see OpenXR::end_frame) is responsible for a
     // transient double-image/ghosting artifact seen only in-headset (not in screenshots) during
@@ -1659,6 +1684,9 @@ private:
     const ModToggle::Ptr m_ghosting_fix{ ModToggle::create(generate_name("GhostingFix"), false) };
     // DIAG/PERF: see is_lgui_ui_redirect_disabled().
     const ModToggle::Ptr m_disable_lgui_ui_redirect{ ModToggle::create(generate_name("DisableLGUIUIRedirect"), false) };
+    // DIAG: see is_lgui_uaf_store_recovery_disabled(). Default ON (recovery active) to match the
+    // legacy behavior that was stable in most sessions before the "let it crash" alternative existed.
+    const ModToggle::Ptr m_disable_lgui_uaf_store_recovery{ ModToggle::create(generate_name("DisableLGUIUafStoreRecovery"), false) };
     // DIAG: see is_depth_submission_disabled().
     const ModToggle::Ptr m_disable_depth_submission{ ModToggle::create(generate_name("DisableDepthSubmission"), false) };
     const ModToggle::Ptr m_native_stereo_fix{ ModToggle::create(generate_name("NativeStereoFix"), false) };
@@ -1826,6 +1854,12 @@ private:
     bool m_diag_force_afr_off{false}; // definitely should not be persistent
     bool m_diag_disable_forced_second_draw{false}; // definitely should not be persistent
     bool m_diag_verbose_logging{false}; // gates high-frequency [DIAG]/[diag] debug logs added while investigating Synced Sequential (AFR) issues; not useful for Native Stereo Fix debugging; definitely should not be persistent
+    // DIAG: logs every update_hmd_state() call with a monotonic counter and requested frame count, to
+    // correlate against the matching [DIAG] NSF-POSE-REFRESH-RACE log in calculate_stereo_view_offset_
+    // and confirm whether a pose refresh can land in between a same-frame left/right eye call pair.
+    // Not persistent.
+    bool m_diag_log_pose_refresh_timing{false};
+    uint64_t m_diag_pose_refresh_call_count{0};
     // Default 0xFB: F2 (a 0/1 "secondary view" flag @0x2ec in WuWa) is NOT flipped. Flipping it made Pass 2 build far
     // shadow cascades/caster lists with left-eye bounds while rendering the right eye -> far shadows flickering between eyes.
     int m_diag_nsf_pass2_eye_field_mask{0xFB}; // bisect mask over the runtime-discovered eye identity fields flipped by the right-eye shadow fix; not persistent
@@ -1943,6 +1977,7 @@ public:
             *m_custom_z_near_enabled,
             *m_ghosting_fix,
             *m_disable_lgui_ui_redirect,
+            *m_disable_lgui_uaf_store_recovery,
             *m_disable_depth_submission,
             *m_native_stereo_fix,
             *m_native_stereo_fix_same_pass,

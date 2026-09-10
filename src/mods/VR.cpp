@@ -1693,6 +1693,17 @@ void VR::update_hmd_state(bool from_view_extensions, uint32_t frame_count) {
 
     std::scoped_lock _{m_reinitialize_mtx};
 
+    // DIAG: correlate update_hmd_state() call timing against left/right eye render calls (see
+    // calculate_stereo_view_offset_'s matching [DIAG] NSF-POSE-REFRESH-RACE log) to confirm whether
+    // a pose refresh can land in between a same-frame eye pair, which would explain the double-vision/
+    // ghosting symptom identically for both NSF and Scene View compatibility (both just read whatever
+    // this function last wrote into the shared pose_mtx-protected snapshot).
+    if (m_diag_log_pose_refresh_timing) {
+        ++m_diag_pose_refresh_call_count;
+        SPDLOG_INFO("[VR][NSF-POSE-REFRESH-RACE] update_hmd_state call #{} from_view_extensions={} requested_frame_count={}",
+            m_diag_pose_refresh_call_count, from_view_extensions, frame_count);
+    }
+
     auto runtime = get_runtime();
     if (m_uncap_framerate->value()) {
         sdk::set_cvar_data_float(L"Engine", L"t.MaxFPS", 500.0f);
@@ -3041,6 +3052,19 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
                                "The in-VR UI quad will go blank/stale while this is enabled.");
         }
 
+        m_disable_lgui_uaf_store_recovery->draw("DIAG: Disable LGUI UAF Store Recovery (crash-fast vs. hang-avoidance)");
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Controls how the generalized game-exe UAF exception handler reacts to a WRITE\n"
+                               "access violation on the known stale/freed-object fault family. OFF (default)\n"
+                               "keeps the legacy 'skip the write' recovery, which let the game keep running\n"
+                               "through most occurrences and was stable in the majority of sessions. Turning\n"
+                               "this ON removes that recovery so those faults propagate as a real, immediate\n"
+                               "crash instead - useful if you'd rather get a diagnosable crash dump for a\n"
+                               "specific repro than risk the skipped write later causing a permanent hang\n"
+                               "(observed in one session: the write turned out to be load-bearing for\n"
+                               "game-thread progress, and skipping it stalled forever instead of crashing).");
+        }
+
         m_disable_depth_submission->draw("DIAG: Disable Depth Submission (compositor reprojection A/B test)");
         if (ImGui::IsItemHovered()) {
             ImGui::SetTooltip("Stops submitting a depth layer (XR_KHR_composition_layer_depth) to the runtime's\n"
@@ -3280,6 +3304,12 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
         ImGui::Checkbox("DIAG: Force is_using_afr() off", &m_diag_force_afr_off);
         ImGui::Checkbox("DIAG: Disable forced 2nd-eye draw", &m_diag_disable_forced_second_draw);
         ImGui::Checkbox("DIAG: Verbose Sync/Stall Logging", &m_diag_verbose_logging);
+        ImGui::Checkbox("DIAG: Log Pose-Refresh Timing (NSF/SVC race)", &m_diag_log_pose_refresh_timing);
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Logs every update_hmd_state() call plus per-eye pose-read counters in calculate_stereo_view_offset_ "
+                "to detect whether the shared HMD pose snapshot gets refreshed in between a same-frame left/right eye pair "
+                "(would affect NSF and Scene View compatibility identically). Look for [NSF-POSE-REFRESH-RACE] warnings.");
+        }
         ImGui::Combo("DIAG: NSF Pass2 Frame Count Mode (shadow test)", &m_diag_nsf_pass2_frame_count_mode, "Decrement (default)\0None\0Increment\0");
         if (ImGui::Button("DIAG: NSF Frame-Diff Logger (capture ~60 frames)")) {
             m_diag_nsf_frame_diff_logger = true;

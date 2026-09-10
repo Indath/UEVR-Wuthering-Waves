@@ -3012,8 +3012,8 @@ struct SceneViewExtensionAnalyzer {
                             }
 
                             if (func_next != nullptr) {
-                                if (func.times_frame_count_correct_a2 >= 50 && 
-                                    func_next->times_frame_count_correct_a3 >= 50 && 
+                                if (func.times_frame_count_correct_a2 >= 10 && 
+                                    func_next->times_frame_count_correct_a3 >= 10 && 
                                     func.frame_count_offset_a2 == func_next->frame_count_offset_a3 &&
                                     std::abs((int32_t)func.frame_count_a2 - (int32_t)func_next->frame_count_a3) <= 3) // In some games, the frame delta is really high but the same offset (so, it's wrong)
                                 {
@@ -3942,6 +3942,258 @@ struct LguiSwapState {
 };
 static LguiSwapState g_lgui_swap{};
 
+// LIGHTWEIGHT, LOCK-FREE diagnostic snapshot of the LGUI redirect pipeline's state, updated every time a redirect
+// happens (see LGUI_PATCH_A3_REFS below) and read by the vectored exception handler when ANY unrecovered crash
+// occurs (not just ones already known to be UI-related). This is what lets us answer "was this crash related to
+// the UI redirect?" directly from a single log, instead of needing another back-and-forth log-diffing session:
+// if a crash's timestamp lines up with a recent g_lgui_last_redirect_time_us and a non-trivial
+// g_lgui_redirect_count_this_frame, the UI redirect pipeline is almost certainly implicated.
+static std::atomic<uint64_t> g_lgui_last_redirect_time_us{0};
+static std::atomic<uint64_t> g_lgui_last_redirect_a3{0};
+static std::atomic<uint32_t> g_lgui_redirect_count_this_frame_diag{0};
+static std::atomic<uint32_t> g_lgui_shadow_pool_size_diag{0};
+static std::atomic<uint64_t> g_lgui_total_redirect_calls{0};
+
+// ==== a3 ADDRESS-LIFECYCLE REGISTRY (crash-correlation diagnostic) ================================
+// Goal: turn "we think the crash is a stale/reused a3 pointer" from a guess into a fact. Every a3
+// pointer we ever redirect gets a permanent history entry (first-seen frame/time, last-seen frame/time,
+// how many times we redirected it, and whether it's currently considered "reclaimed" by the shadow-copy
+// pool sweep). When ANY crash reaches the vectored exception handler, we look up the FAULTING ADDRESS
+// (and, separately, the address currently in g_lgui_last_redirect_a3) against this registry and log a
+// definitive verdict: was the faulting/last-redirected pointer a KNOWN a3 we've seen, is it currently
+// marked reclaimed (i.e. we believe it's stale), and how long ago was it last touched. This answers
+// "is a real UE object at this exact address being reused (same address, new object) while some other
+// pass still holds a reference to the old one" - the classic UAF-via-address-reuse pattern - directly
+// from the log, instead of inferring it from indirect timing evidence.
+//
+// Kept intentionally cheap: a single mutex-guarded map, only touched (a) once per distinct a3 per
+// redirect (not per frame) and (b) once per crash (an already-slow-path event). Never touched on the
+// hot per-call path when a3 is already known this frame - see lgui_note_a3_seen() early-out below.
+struct LguiA3History {
+    uint64_t first_seen_frame{0};
+    uint64_t last_seen_frame{0};
+    uint64_t first_seen_time_us{0};
+    uint64_t last_seen_time_us{0};
+    uint64_t redirect_count{0};
+    uint32_t last_extent_w{0}, last_extent_h{0};
+    bool reclaimed{false};        // set true when the shadow-copy pool sweep evicts this a3's copy
+    uint64_t reclaimed_time_us{0};
+};
+static std::mutex g_lgui_a3_history_mutex{};
+static std::unordered_map<uintptr_t, LguiA3History> g_lgui_a3_history{};
+
+static uint64_t lgui_now_us() {
+    return (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+// Records/updates a3's history entry. Called once per redirect (cheap: one mutex lock, one map lookup).
+static void lgui_note_a3_seen(uintptr_t a3_key, uint64_t frame, int32_t w, int32_t h) {
+    std::lock_guard<std::mutex> lock(g_lgui_a3_history_mutex);
+    auto& hist = g_lgui_a3_history[a3_key];
+    const auto now = lgui_now_us();
+    if (hist.first_seen_time_us == 0) {
+        hist.first_seen_frame = frame;
+        hist.first_seen_time_us = now;
+    } else if (hist.reclaimed) {
+        // ADDRESS REUSE DETECTED: this a3 pointer was previously reclaimed (considered dead/stale by our
+        // sweep) and has now reappeared. Since the shadow-copy pool only reclaims after ~3s of total
+        // silence for that exact pointer, a reappearance almost certainly means the ENGINE reused the
+        // same heap address for a brand-new, unrelated FRDGTexture object - a textbook precondition for
+        // a use-after-free in any OTHER code (e.g. the game's own menu-blur pass) that still holds a
+        // pointer/index referencing the old object at this address.
+        SPDLOG_WARN("[LGUI_A3_LIFECYCLE] address REUSE: a3={:x} was reclaimed {}ms ago and has reappeared "
+                    "(seen {} times previously, first seen frame {}) - engine likely allocated a new object at a freed address",
+            a3_key, (now - hist.reclaimed_time_us) / 1000, hist.redirect_count, hist.first_seen_frame);
+        hist.reclaimed = false;
+        hist.first_seen_frame = frame; // treat as a new "generation" for lifetime purposes
+        hist.first_seen_time_us = now;
+        hist.redirect_count = 0;
+    }
+    hist.last_seen_frame = frame;
+    hist.last_seen_time_us = now;
+    hist.last_extent_w = (uint32_t)w;
+    hist.last_extent_h = (uint32_t)h;
+    ++hist.redirect_count;
+}
+
+static void lgui_note_a3_reclaimed(uintptr_t a3_key) {
+    std::lock_guard<std::mutex> lock(g_lgui_a3_history_mutex);
+    auto it = g_lgui_a3_history.find(a3_key);
+    if (it != g_lgui_a3_history.end()) {
+        it->second.reclaimed = true;
+        it->second.reclaimed_time_us = lgui_now_us();
+    }
+}
+
+// Crash-time lookup: never allocates, bounded mutex hold, safe to call from the exception handler.
+// Returns a human-readable verdict string describing what we know about this exact address.
+static std::string lgui_a3_history_lookup(uintptr_t addr) {
+    std::lock_guard<std::mutex> lock(g_lgui_a3_history_mutex);
+    auto it = g_lgui_a3_history.find(addr);
+    if (it == g_lgui_a3_history.end()) {
+        return "not a known LGUI a3 address";
+    }
+    const auto& h = it->second;
+    const auto now = lgui_now_us();
+    return fmt::format("KNOWN a3 (redirected {} times, first_seen_frame={}, last_seen={}ms ago, extent={}x{}, reclaimed={}{})",
+        h.redirect_count, h.first_seen_frame, (now - h.last_seen_time_us) / 1000, h.last_extent_w, h.last_extent_h,
+        h.reclaimed, h.reclaimed ? fmt::format(" ({}ms ago)", (now - h.reclaimed_time_us) / 1000) : "");
+}
+
+// CLASS-IDENTIFICATION HELPER: shipping builds strip RTTI/symbol names, so we cannot print a human
+// readable class name for whatever object a crash-time GPR points at. What we CAN do cheaply and safely
+// is treat the pointer as a possible polymorphic C++ object (vtable ptr in the first 8 bytes), validate
+// that the vtable itself looks plausible (readable, resolves into the game exe's .rdata/.text, and its
+// own first entry is a readable code pointer into the game exe), and report the vtable's RVA. Since
+// vtables are unique per-class even when stripped, the SAME rva logged across multiple crashes/sessions
+// identifies "the same class of object" without knowing its name - and the rva can be looked up exactly
+// once in a disassembler (IDA/Ghidra) to attach a real name permanently to a lookup table here. This is
+// the missing piece that turns "some corrupted object" into "a specific, nameable, reproducible class".
+static std::string lgui_fingerprint_object(uintptr_t addr) {
+    if (addr == 0 || IsBadReadPtr((void*)addr, sizeof(void*))) {
+        return "unreadable";
+    }
+
+    const auto vtable_ptr = *(uintptr_t*)addr;
+
+    if (vtable_ptr == 0 || IsBadReadPtr((void*)vtable_ptr, sizeof(void*))) {
+        return fmt::format("no plausible vtable (first_qword={:x})", vtable_ptr);
+    }
+
+    const auto first_vfunc = *(uintptr_t*)vtable_ptr;
+    const auto vtable_mod = utility::get_module_within((void*)vtable_ptr);
+    const auto vfunc_mod = utility::get_module_within((void*)first_vfunc);
+
+    if (!vtable_mod.has_value() || !vfunc_mod.has_value()) {
+        return fmt::format("vtable_candidate={:x} first_vfunc={:x} (not resolvable to any loaded module - likely not a real object)",
+            vtable_ptr, first_vfunc);
+    }
+
+    const auto vtable_mod_path = utility::get_module_path(*vtable_mod).value_or("<unknown>");
+    const auto vfunc_mod_path = utility::get_module_path(*vfunc_mod).value_or("<unknown>");
+    const auto vtable_rva = vtable_ptr - (uintptr_t)*vtable_mod;
+    const auto vfunc_rva = first_vfunc - (uintptr_t)*vfunc_mod;
+
+    // Dump a handful of raw fields after the vtable too - even without a class name, the byte pattern
+    // (e.g. an embedded TArray Data/Num/Max triplet, or an FName-shaped int32 pair) is often recognizable
+    // and helps correlate against UE source layouts by hand.
+    std::string fields;
+    for (uint32_t off = 8; off <= 0x38; off += 8) {
+        if (!IsBadReadPtr((void*)(addr + off), sizeof(void*))) {
+            fields += fmt::format(" +{:#x}={:x}", off, *(uint64_t*)(addr + off));
+        }
+    }
+
+    return fmt::format("vtable_rva={}+{:x} first_vfunc_rva={}+{:x}{}",
+        vtable_mod_path, vtable_rva, vfunc_mod_path, vfunc_rva, fields);
+}
+
+// CREATION-RATE / MENU-CHURN diagnostic: tracks how many BRAND NEW distinct a3 pointers appear per
+// real-world second. A stable HUD-only frame should mint very few new a3 objects per second (ideally
+// near 0 in steady state); a spike is a direct, objective signal that something (e.g. opening/closing a
+// menu, nested popups, nested submenus) is causing LGUI/RDG to allocate a burst of new render-target
+// objects rather than reusing existing ones. Logged once per rolling 1-second window, not per event, so
+// it's cheap and easy to correlate against manual repro timestamps.
+static std::atomic<uint64_t> g_lgui_new_a3_this_window{0};
+static std::atomic<uint64_t> g_lgui_window_start_time_us{0};
+
+static void lgui_note_new_a3_for_rate_tracking() {
+    const auto now = lgui_now_us();
+    auto window_start = g_lgui_window_start_time_us.load(std::memory_order_relaxed);
+    if (window_start == 0) {
+        g_lgui_window_start_time_us.store(now, std::memory_order_relaxed);
+        g_lgui_new_a3_this_window.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    const auto elapsed_ms = (now - window_start) / 1000;
+    if (elapsed_ms >= 1000) {
+        const auto count = g_lgui_new_a3_this_window.exchange(1, std::memory_order_relaxed);
+        g_lgui_window_start_time_us.store(now, std::memory_order_relaxed);
+        // Threshold chosen well above the expected steady-state baseline (roughly 1 per eye per legitimate
+        // popup/menu open) so this only fires on genuine churn spikes, not routine 1-2/sec background noise.
+        constexpr uint64_t LGUI_A3_CHURN_SPIKE_THRESHOLD = 5;
+        if (count >= LGUI_A3_CHURN_SPIKE_THRESHOLD) {
+            SPDLOG_WARN("[LGUI_A3_CHURN] {} new distinct a3 render targets created in the last ~{}ms - "
+                        "possible menu/popup transition causing a burst of new RDG texture allocations",
+                count, elapsed_ms);
+        }
+    } else {
+        g_lgui_new_a3_this_window.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+// ==== RHI RESOURCE STABILITY TRACKING (render-target instability diagnostic) ======================
+// The a3 pointer (FRDGTexture wrapper) churning at hundreds of distinct addresses per session does NOT
+// by itself prove anything is wrong: Unreal's RDG system creates a fresh lightweight FRDGTexture wrapper
+// object EVERY FRAME even when it wraps the exact same underlying GPU resource (a pooled RHI texture) -
+// that's normal, expected per-frame allocator churn, not a leak or instability. What WOULD be a genuine
+// render-target instability is if the underlying RHI resource itself (a3+RDG_RESOURCE_RHI_OFF, the real
+// GPU texture) is ALSO being recreated over and over, rather than being one of a small, stable set of
+// pooled resources reused frame to frame. This tracker answers exactly that: it records every distinct
+// RHI resource pointer we observe (captured BEFORE we overwrite it with ui_target in the shadow copy),
+// how many distinct a3 wrappers have pointed at it, and its extent - then periodically reports how many
+// distinct underlying RHI resources are in play. A small, stable count (e.g. 2-8, matching eyes/menu
+// layers) = normal wrapper churn, nothing to fix. A count that climbs into the hundreds alongside the a3
+// churn = the actual GPU render targets themselves are being recreated, which IS a genuine instability
+// (extra GPU memory churn, and a more plausible source of the "other pass touches a stale reference"
+// crash family, since RHI resource recreation - unlike RDG wrapper recreation - actually frees/reallocates
+// real GPU-backed memory that other code may still reference).
+struct LguiRhiInfo {
+    uint32_t index;
+    uint64_t first_seen_frame{0};
+    uint64_t last_seen_frame{0};
+    uint64_t wrapper_count{0}; // how many distinct a3 FRDGTexture wrappers have pointed at this RHI resource
+    int32_t last_w{0}, last_h{0};
+};
+static std::mutex g_lgui_rhi_mutex{};
+static std::unordered_map<uintptr_t, LguiRhiInfo> g_lgui_rhi_registry{};
+static uint32_t g_lgui_rhi_next_index = 0;
+static uint64_t g_lgui_rhi_last_report_frame = 0;
+
+static void lgui_note_rhi_resource(uintptr_t rhi_ptr, uint64_t frame, int32_t w, int32_t h) {
+    if (rhi_ptr == 0) return;
+
+    std::lock_guard<std::mutex> lock(g_lgui_rhi_mutex);
+    auto& info = g_lgui_rhi_registry[rhi_ptr];
+    const bool is_new = (info.first_seen_frame == 0);
+    if (is_new) {
+        info.index = g_lgui_rhi_next_index++;
+        info.first_seen_frame = frame;
+        SPDLOG_INFO("[LGUI_RHI_STABILITY] new underlying RHI resource idx={} ptr={:x} extent={}x{} (first seen frame {})",
+            info.index, rhi_ptr, w, h, frame);
+    }
+    info.last_seen_frame = frame;
+    info.last_w = w;
+    info.last_h = h;
+    ++info.wrapper_count;
+
+    // Periodic report (~every 300 frames, independent of the a3 identity snapshot) so this can be read
+    // in isolation: "how many distinct GPU-backed render targets has LGUI's UI actually used recently".
+    if (frame - g_lgui_rhi_last_report_frame >= 300) {
+        g_lgui_rhi_last_report_frame = frame;
+        size_t active_count = 0;
+        uint64_t max_wrapper_count = 0;
+        for (auto& [ptr, i] : g_lgui_rhi_registry) {
+            if (frame - i.last_seen_frame < 300) ++active_count;
+            max_wrapper_count = std::max(max_wrapper_count, i.wrapper_count);
+        }
+        SPDLOG_INFO("[LGUI_RHI_STABILITY] snapshot: {} distinct RHI resources total, {} active in last 5s, "
+                    "highest per-resource wrapper reuse count={} (low count here = a3 churn is JUST wrapper "
+                    "recycling, not real render-target recreation)",
+            g_lgui_rhi_registry.size(), active_count, max_wrapper_count);
+    }
+}
+
+// vectored exception handler (only reads a relaxed atomic).
+static int64_t lgui_ms_since_last_redirect() {
+    const auto last_us = g_lgui_last_redirect_time_us.load(std::memory_order_relaxed);
+    if (last_us == 0) return -1;
+    const auto now_us = (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    return (int64_t)((now_us - last_us) / 1000);
+}
+
 // Diagnostic only, kept deliberately cheap: dump the LGUI pass object (lambda captures live inline in TRDGLambdaPass) and
 // flag any qword equal to the textures we know about. No recursion / deep scanning: that stalled the render thread.
 static bool lgui_copy_pass_seh(void* pass, uintptr_t* out, int count) {
@@ -4376,6 +4628,93 @@ static void* lgui_slot24_hook(void* self, void* a2, void* a3, void* a4, void* a5
     static uint32_t call_count = 0;
     const auto n = call_count++;
 
+    // Same value as TEX_EXTENT_OFF declared further below (FRDGTexture::Desc.Extent); duplicated here
+    // under a distinct name since the identity-listing block below runs before that declaration is in scope.
+    constexpr uint32_t TEX_EXTENT_OFF_DIAG = 0x54;
+
+    // ==== LGUI IDENTITY LISTING (read-only diagnostic) ==============================================
+    // We cannot tell LGUI's draws apart semantically (HUD vs. HP bars vs. popup vs. cutscene letterbox
+    // bars all funnel through this same slot-24 hook). The best we can do without guessing is give every
+    // distinct "self" (view-extension instance, i.e. which LGUI object is drawing) and every distinct
+    // "a3" (the render target it's drawing into) a small, STABLE, session-scoped index the first time we
+    // see it, then periodically log the full set of indices currently active along with identifying
+    // stats (size/aspect for a3, call frequency for self). This lets a suppression toggle later reference
+    // "index 2" instead of a raw pointer, and lets you correlate "index 2 stopped/started appearing" with
+    // "the cutscene box appeared/disappeared" or "HP bars started following the HUD" without touching
+    // behavior at all yet.
+    constexpr bool LGUI_DIAG_LIST_IDENTITIES = true;
+    if (LGUI_DIAG_LIST_IDENTITIES) {
+        struct LguiSelfInfo {
+            uint32_t index;
+            uintptr_t vtable;
+            uint64_t call_count{0};
+            uint64_t last_seen_frame{0};
+        };
+        struct LguiA3Info {
+            uint32_t index;
+            uint64_t call_count{0};
+            uint64_t last_seen_frame{0};
+            int32_t last_w{0}, last_h{0};
+        };
+
+        static std::unordered_map<uintptr_t, LguiSelfInfo> s_lgui_self_ids{};
+        static std::unordered_map<uintptr_t, LguiA3Info> s_lgui_a3_ids{};
+        static uint32_t s_lgui_next_self_id = 0;
+        static uint32_t s_lgui_next_a3_id = 0;
+        static uint64_t s_lgui_ident_last_log_frame = 0;
+
+        const auto ident_frame = (uint64_t)VR::get()->get_frame_count();
+
+        auto& self_info = s_lgui_self_ids[(uintptr_t)self];
+        const bool self_is_new = (self_info.call_count == 0 && self_info.last_seen_frame == 0);
+        if (self_is_new) {
+            self_info.index = s_lgui_next_self_id++;
+            self_info.vtable = vtable;
+            SPDLOG_INFO("[LGUI_IDENT] new self instance idx={} self={:x} vtable_rva={:x}",
+                self_info.index, (uintptr_t)self,
+                utility::get_module_within((void*)vtable).has_value()
+                    ? vtable - (uintptr_t)*utility::get_module_within((void*)vtable) : vtable);
+        }
+        ++self_info.call_count;
+        self_info.last_seen_frame = ident_frame;
+
+        if (a3 != nullptr && !IsBadReadPtr(a3, TEX_EXTENT_OFF_DIAG + 8)) {
+            auto& a3_info = s_lgui_a3_ids[(uintptr_t)a3];
+            const bool a3_is_new = (a3_info.call_count == 0 && a3_info.last_seen_frame == 0);
+            const auto a3_w = *(int32_t*)((uintptr_t)a3 + TEX_EXTENT_OFF_DIAG);
+            const auto a3_h = *(int32_t*)((uintptr_t)a3 + TEX_EXTENT_OFF_DIAG + 4);
+            if (a3_is_new) {
+                a3_info.index = s_lgui_next_a3_id++;
+                SPDLOG_INFO("[LGUI_IDENT] new a3 target idx={} a3={:x} self_idx={} extent={}x{}",
+                    a3_info.index, (uintptr_t)a3, self_info.index, a3_w, a3_h);
+            }
+            ++a3_info.call_count;
+            a3_info.last_seen_frame = ident_frame;
+            a3_info.last_w = a3_w;
+            a3_info.last_h = a3_h;
+        }
+
+        // Periodic full listing (~every 5s at 60fps) of everything seen recently, so you can correlate an
+        // on-screen symptom (cutscene box, floating HP bar) against which indices are currently active.
+        if (ident_frame - s_lgui_ident_last_log_frame >= 300) {
+            s_lgui_ident_last_log_frame = ident_frame;
+
+            std::string self_list{};
+            for (auto& [ptr, info] : s_lgui_self_ids) {
+                const bool active_recently = (ident_frame - info.last_seen_frame) < 300;
+                self_list += fmt::format("idx{}:{}calls{} ", info.index, active_recently ? "*" : "", info.call_count);
+            }
+
+            std::string a3_list{};
+            for (auto& [ptr, info] : s_lgui_a3_ids) {
+                const bool active_recently = (ident_frame - info.last_seen_frame) < 300;
+                a3_list += fmt::format("idx{}:{}{}x{}calls{} ", info.index, active_recently ? "*" : "", info.last_w, info.last_h, info.call_count);
+            }
+
+            SPDLOG_INFO("[LGUI_IDENT] snapshot: self_instances=[{}] a3_targets=[{}] ('*' = active in last 5s)", self_list, a3_list);
+        }
+    }
+
     // ==== LGUI DIAGNOSTIC TOGGLE ====================================================================
     // Master switch for the EXPENSIVE per-draw LGUI diagnostics on the render thread: the a2 eye-size
     // "residue" scan (walks up to 0x2000 bytes every qualifying draw building a big std::string) and the
@@ -4721,49 +5060,57 @@ static void* lgui_slot24_hook(void* self, void* a2, void* a3, void* a4, void* a5
     // must gate HERE, not just at the copy/present site in D3D12Component.cpp, otherwise LGUI still gets redirected
     // (and still pays whatever cost that causes) even though nothing ever copies ui_target back into the VR view,
     // leaving the UI blank instead of falling back to its original (HMD-stuck) render path.
-    // GUARD (nested-submenu crash): the redirect below hands LGUI a shadow copy of `a3` and patches every a2 slot
-    // that points at it, then relies on that shadow copy staying valid until RDG's deferred Execute for THIS pass
-    // runs (which can happen off a worker thread, well after this function returns). That is only safe if the
-    // number of distinct `a3` values redirected per frame is bounded - the copy/eviction logic (below) assumes
-    // stale slots are only ever reclaimed by a NEW frame's a3, not by extra, concurrent a3s from ADDITIONAL UI
-    // layers within the SAME frame. Stereo rendering legitimately produces up to 2 distinct a3 values per frame
-    // (one LGUI pass per eye), so limiting to a single a3/frame incorrectly blocked the second eye's redirect,
-    // leaving that eye's UI drawn into its real (un-redirected) per-eye scene texture - i.e. still attached to
-    // the HMD, at its original scale, and outside the quad layer's input routing (the "double UI, one eye stuck
-    // to HMD" regression). Opening a submenu inside a submenu instead adds a 3rd+ concurrent RDG pass (an
-    // additional FRDGTexture/a3) before an earlier pass's Execute has consumed its shadow copy, so patching that
-    // extra a3's refs can shift/evict a slot an earlier pass's still-pending Execute is about to read - the
-    // read/write access-violation family observed (rva 0x23e1f8xx/0x23e2aaxx, faulting near +0xd0 into a shadow
-    // copy). Allow up to 4 distinct a3 values per frame (2 eyes + nested popup/submenu passes); any additional
-    // a3 this frame is left untouched (falls back to its normal, un-redirected render path) instead of risking
-    // that corruption. This is paired with execute-safe slot eviction below (slots used in the current or
-    // immediately preceding frame are never reclaimed), which is what makes raising this cap safe.
+    // HISTORY (nested-submenu crash / cutscene letterbox asymmetry): the redirect below hands LGUI a shadow copy of
+    // `a3` and patches every a2 slot that points at it, then relies on that shadow copy staying valid until RDG's
+    // deferred Execute for THIS pass runs (which can happen off a worker thread, well after this function returns).
+    // This used to be backed by a FIXED-SIZE slot array (originally a 32-slot ring buffer, later a 64-slot LRU pool)
+    // gated by an artificial "max distinct a3 values per frame" cap (1 -> 2 -> 4 over the course of this debugging
+    // session). Each time the cap was hit, that cap number turned out to be wrong for some legitimate case (2 eyes,
+    // then nested popups/submenus, then cutscene letterbox bars), and the extra a3 was silently left un-redirected
+    // -> inconsistent per-eye/per-content HMD-attached UI. Bumping the cap further is whack-a-mole; the actual
+    // number of concurrent a3 values LGUI can produce in one frame is content-dependent and not something we can
+    // reliably predict.
+    //
+    // FIX: replace the fixed-size slot pool with a fully DYNAMIC per-a3 shadow-copy pool (see lgui_copy_pool below):
+    // every distinct a3 seen gets its own persistent heap buffer, keyed by the a3 pointer, with no cap and no
+    // "leave it un-redirected" fallback. Buffers are reclaimed only once we can positively confirm they are no
+    // longer the newest copy for that a3 pointer AND enough frames have passed that any deferred Execute for the
+    // owning pass must have already run (see LGUI_COPY_STALE_FRAMES below) - this replaces the old clock-tick
+    // "execute-safe window" heuristic with an actual frame-count-based staleness check, which is both simpler to
+    // reason about and immune to the cap-dependent corner cases above.
     static uint64_t s_lgui_redirect_frame = UINT64_MAX;
-    static constexpr size_t LGUI_MAX_REDIRECTS_PER_FRAME = 4;
-    static std::array<uintptr_t, LGUI_MAX_REDIRECTS_PER_FRAME> s_lgui_redirect_a3_this_frame{};
     static size_t s_lgui_redirect_count_this_frame = 0;
+    static size_t s_lgui_redirect_high_water = 0;
     const auto lgui_current_frame = (uint64_t)VR::get()->get_frame_count();
 
     if (lgui_current_frame != s_lgui_redirect_frame) {
+        // DIAGNOSTIC: track the high-water mark of distinct a3 values redirected in a single frame. This directly
+        // answers "how many concurrent UI draws does this content actually produce" for any future regression,
+        // without needing another A/B session - just grep [LGUI_REDIRECT_STATS] in the log.
+        if (s_lgui_redirect_count_this_frame > s_lgui_redirect_high_water) {
+            s_lgui_redirect_high_water = s_lgui_redirect_count_this_frame;
+            SPDLOG_INFO("[LGUI_REDIRECT_STATS] new high-water mark: {} distinct a3 values redirected in frame {}",
+                s_lgui_redirect_count_this_frame, s_lgui_redirect_frame);
+        }
         s_lgui_redirect_frame = lgui_current_frame;
-        s_lgui_redirect_a3_this_frame.fill(0);
         s_lgui_redirect_count_this_frame = 0;
     }
 
-    bool lgui_a3_allowed_this_frame = false;
-    bool lgui_a3_already_registered_this_frame = false;
-    for (size_t i = 0; i < s_lgui_redirect_count_this_frame; ++i) {
-        if (s_lgui_redirect_a3_this_frame[i] == (uintptr_t)a3) {
-            lgui_a3_allowed_this_frame = true;
-            lgui_a3_already_registered_this_frame = true;
-            break;
+    // DIAG: log every transition of the redirect-disable toggle (edge-triggered) so crash logs can be
+    // correlated against "was the redirect pipeline active at this timestamp" without guessing from
+    // context. Without this, a session that toggles the DIAG option mid-run produces a log where UAF
+    // recovery events cannot be attributed to redirect-on vs redirect-off periods.
+    {
+        static bool s_lgui_redirect_disabled_last = false;
+        const bool lgui_redirect_disabled_now = VR::get()->is_lgui_ui_redirect_disabled();
+        if (lgui_redirect_disabled_now != s_lgui_redirect_disabled_last) {
+            SPDLOG_WARN("[LGUI_REDIRECT_TOGGLE] redirect pipeline is now {} (frame={})",
+                lgui_redirect_disabled_now ? "DISABLED" : "ENABLED", lgui_current_frame);
+            s_lgui_redirect_disabled_last = lgui_redirect_disabled_now;
         }
     }
-    if (!lgui_a3_allowed_this_frame && s_lgui_redirect_count_this_frame < LGUI_MAX_REDIRECTS_PER_FRAME) {
-        lgui_a3_allowed_this_frame = true;
-    }
 
-    if (LGUI_PATCH_A3_REFS && !VR::get()->is_lgui_ui_redirect_disabled() && lgui_a3_allowed_this_frame &&
+    if (LGUI_PATCH_A3_REFS && !VR::get()->is_lgui_ui_redirect_disabled() &&
         g_hook != nullptr && g_hook->get_render_target_manager() != nullptr &&
         a2 != nullptr && !IsBadReadPtr(a2, 0x1000) && a3 != nullptr && !IsBadReadPtr(a3, 0x200))
     {
@@ -4778,96 +5125,104 @@ static void* lgui_slot24_hook(void* self, void* a2, void* a3, void* a4, void* a5
             if (ui_w >= 64 && ui_w <= 16384 && ui_h >= 64 && ui_h <= 16384) {
                 // Copy is padded so readers touching fields past what we duplicated still land in valid (zeroed) memory.
                 //
-                // ROOT CAUSE (submenu-open crash/hang): this used to be a fixed 32-slot ring buffer indexed purely
-                // by a rolling per-call counter (`copies[copy_idx++ % COPY_COUNT]`), with NO relationship to how
-                // long any given frame's `a3` (FRDGTexture) shadow copy might still be referenced by other deferred
-                // render-graph passes. Opening this specific nested submenu adds extra deferred UI passes that
-                // capture and read back one of these patched pointers (see LGUI_PATCH_A3_REFS below) more than 32
-                // draw calls later. By then the ring buffer slot had already been recycled and overwritten by an
-                // unrelated later frame's RDG texture data - not freed memory, but silently stale/wrong-frame data
-                // (mismatched vtable pointer, RHI resource, extent, etc.), which is why crash addresses/values
-                // varied so much between runs. The previous developer's own comment above already diagnosed this:
-                // "some other pass reads the stale copy through one of these slots".
+                // HISTORY: this was originally a fixed 32-slot ring buffer indexed by a rolling per-call counter
+                // (crash: stale slots overwritten by unrelated frames' data before a deferred pass read them back),
+                // then a fixed 64-slot map keyed by the real a3 pointer with LRU + a clock-tick "execute-safe window"
+                // for eviction, gated behind an artificial per-frame cap on distinct a3 values (1 -> 2 -> 4). Each
+                // cap value eventually proved wrong for some legitimate case (2 eyes, nested popups/submenus,
+                // cutscene letterbox bars), silently leaving the excess a3 un-redirected instead of failing loudly.
                 //
-                // FIX: key the shadow copy by the real `a3` pointer instead of a rolling counter, so the SAME
-                // source texture always maps to the SAME persistent shadow copy buffer for as long as that a3
-                // object exists (we simply refresh its contents every frame instead of relocating it), and only
-                // reclaim/reuse a slot for a genuinely different a3 once we've evicted the oldest live entry, not
-                // on a fixed cadence unrelated to how long other passes keep referencing it.
+                // FIX: fully dynamic per-a3 shadow-copy pool, no cap. Every distinct a3 pointer gets its own
+                // persistent heap buffer (lgui_copy_pool), keyed by the a3 pointer, allocated lazily and reused
+                // for as long as that a3 object keeps appearing. Entries are reclaimed only once BOTH: (a) they
+                // were not refreshed for at least LGUI_COPY_STALE_FRAMES engine frames (so any deferred RDG
+                // Execute that captured the buffer has had many frames to run - real UE4/5 RDG passes execute
+                // within the same frame or the very next one, never frames later), and (b) a periodic sweep runs
+                // (not on every call) so we're not doing a full map scan per UI draw.
+                struct LguiCopySlot {
+                    std::unique_ptr<uint8_t[]> data;
+                    uint64_t last_used_frame{0};
+                };
                 constexpr size_t COPY_SIZE = 0x200;
                 constexpr size_t COPY_STRIDE = 0x800;
-                constexpr size_t COPY_COUNT = 64;
-                static uint8_t copies[COPY_COUNT][COPY_STRIDE]{};
-                static std::array<uintptr_t, COPY_COUNT> copy_owner{};      // a3 pointer currently occupying this slot (0 = free)
-                static std::array<uint64_t, COPY_COUNT> copy_last_used{};   // monotonic "frame" stamp of last use, for LRU eviction
-                static std::unordered_map<uintptr_t, size_t> copy_slot_by_owner{};
-                static uint64_t copy_clock = 0;
-                ++copy_clock;
+                constexpr uint64_t LGUI_COPY_STALE_FRAMES = 180; // ~3s at 60fps; generous vs. RDG's same/next-frame execute
+                static std::unordered_map<uintptr_t, LguiCopySlot> lgui_copy_pool{};
+                static uint64_t lgui_copy_pool_last_sweep_frame = 0;
+                static size_t lgui_copy_pool_high_water = 0;
 
                 const auto a3_key = (uintptr_t)a3;
-                size_t slot;
+                auto& slot_entry = lgui_copy_pool[a3_key]; // default-constructs (data == nullptr) on first use for this a3
 
-                if (const auto it = copy_slot_by_owner.find(a3_key); it != copy_slot_by_owner.end()) {
-                    slot = it->second;
-                } else {
-                    // Find a free slot, or evict the least-recently-used occupied one that is EXECUTE-SAFE to
-                    // reclaim, i.e. not still owned by a pass whose deferred RDG Execute may still be pending
-                    // for the current or immediately preceding "copy_clock" tick. copy_clock advances once per
-                    // redirect call (not once per frame), so a slot last touched within
-                    // LGUI_SLOT_EXECUTE_SAFE_WINDOW ticks of "now" is treated as still potentially in flight and
-                    // is skipped for eviction. This is what makes raising LGUI_MAX_REDIRECTS_PER_FRAME above 2
-                    // safe: nested popup/submenu passes can no longer steal a slot out from under an earlier
-                    // pass's still-pending Execute (the crash/corruption this whole scheme guards against).
-                    constexpr uint64_t LGUI_SLOT_EXECUTE_SAFE_WINDOW = COPY_COUNT * 2;
-                    slot = SIZE_MAX;
-                    uint64_t oldest = UINT64_MAX;
-                    bool found_free = false;
+                if (slot_entry.data == nullptr) {
+                    slot_entry.data = std::make_unique<uint8_t[]>(COPY_STRIDE);
 
-                    for (size_t i = 0; i < COPY_COUNT; ++i) {
-                        if (copy_owner[i] == 0) {
-                            slot = i;
-                            found_free = true;
-                            break;
-                        }
-                        const bool recently_used = (copy_clock - copy_last_used[i]) < LGUI_SLOT_EXECUTE_SAFE_WINDOW;
-                        if (recently_used) continue; // not execute-safe to reclaim yet
-                        if (copy_last_used[i] < oldest) {
-                            oldest = copy_last_used[i];
-                            slot = i;
-                        }
+                    // CHURN/REUSE DIAGNOSTIC: record this a3 in the permanent address-lifecycle registry (detects
+                    // reclaimed-address reuse - see lgui_note_a3_seen) and bump the per-second creation-rate
+                    // counter (detects menu/popup-driven allocation bursts - see lgui_note_new_a3_for_rate_tracking).
+                    // Both are O(1)/cheap and only run on first-sight of a given a3, not the hot per-call path.
+                    lgui_note_a3_seen(a3_key, lgui_current_frame, ui_w, ui_h);
+                    lgui_note_new_a3_for_rate_tracking();
+
+                    if (lgui_copy_pool.size() > lgui_copy_pool_high_water) {
+                        lgui_copy_pool_high_water = lgui_copy_pool.size();
+                        // DIAGNOSTIC: tracks the true concurrent-a3 pool size over time (superset of the
+                        // per-frame high-water mark logged above, since entries can persist across frames while
+                        // still "in flight"). If this climbs unboundedly instead of settling, that itself is a
+                        // signal something is failing to ever be recognized as stale (leak), which is exactly
+                        // the kind of root cause we want visible before it manifests as an OOM/crash.
+                        SPDLOG_INFO("[LGUI_REDIRECT_STATS] shadow-copy pool grew to {} live entries (a3={:x})", lgui_copy_pool.size(), a3_key);
                     }
-
-                    if (slot == SIZE_MAX) {
-                        // Every slot is still within the execute-safe window (extremely unlikely given
-                        // COPY_COUNT=64 vs. a cap of 4 redirects/frame). Fall back to strict LRU rather than
-                        // dropping this redirect, since that would be worse than the small residual risk.
-                        slot = 0;
-                        oldest = copy_last_used[0];
-                        for (size_t i = 1; i < COPY_COUNT; ++i) {
-                            if (copy_last_used[i] < oldest) {
-                                oldest = copy_last_used[i];
-                                slot = i;
-                            }
-                        }
-                        found_free = false;
-                    }
-
-                    if (!found_free) {
-                        copy_slot_by_owner.erase(copy_owner[slot]);
-                    }
-
-                    copy_owner[slot] = a3_key;
-                    copy_slot_by_owner[a3_key] = slot;
                 }
 
-                copy_last_used[slot] = copy_clock;
-                auto copy = copies[slot];
+                slot_entry.last_used_frame = lgui_current_frame;
+
+                // Periodic sweep (not every call) to reclaim entries that have gone stale, i.e. their a3 pointer
+                // has not been redirected again in a long time. This is intentionally conservative: RDG passes
+                // execute same-frame or next-frame in every version we've observed, so anything untouched for
+                // LGUI_COPY_STALE_FRAMES frames is certainly done, and we log every reclaim so a future
+                // regression that needs an even longer window is immediately visible in the log instead of
+                // silently causing a new UAF.
+                if (lgui_current_frame != lgui_copy_pool_last_sweep_frame) {
+                    lgui_copy_pool_last_sweep_frame = lgui_current_frame;
+
+                    for (auto it = lgui_copy_pool.begin(); it != lgui_copy_pool.end();) {
+                        if (lgui_current_frame - it->second.last_used_frame > LGUI_COPY_STALE_FRAMES) {
+                            SPDLOG_INFO("[LGUI_REDIRECT_STATS] reclaiming stale shadow copy for a3={:x} (idle {} frames, pool size {} -> {})",
+                                it->first, lgui_current_frame - it->second.last_used_frame, lgui_copy_pool.size(), lgui_copy_pool.size() - 1);
+                            lgui_note_a3_reclaimed(it->first);
+                            it = lgui_copy_pool.erase(it);
+                        } else {
+                            ++it;
+                        }
+                    }
+                }
+
+                auto copy = slot_entry.data.get();
                 memset(copy, 0, COPY_STRIDE);
                 memcpy(copy, a3, COPY_SIZE);
-                *(void**)(copy + RDG_RESOURCE_RHI_OFF) = ui_target;
-                if (!lgui_a3_already_registered_this_frame) {
-                    s_lgui_redirect_a3_this_frame[s_lgui_redirect_count_this_frame++] = a3_key;
+                // RENDER-TARGET STABILITY: capture the real underlying RHI resource pointer BEFORE we
+                // overwrite it with ui_target below. This is what distinguishes benign per-frame RDG
+                // wrapper churn (a3 itself) from actual render-target recreation (this pointer changing).
+                {
+                    const auto rt_ui_w = (ui_target != nullptr && !IsBadReadPtr(ui_target, 0x60)) ? *(int32_t*)((uintptr_t)ui_target + 0x54) : 0;
+                    const auto rt_ui_h = (ui_target != nullptr && !IsBadReadPtr(ui_target, 0x60)) ? *(int32_t*)((uintptr_t)ui_target + 0x58) : 0;
+                    lgui_note_rhi_resource(*(uintptr_t*)((uintptr_t)a3 + RDG_RESOURCE_RHI_OFF), lgui_current_frame, rt_ui_w, rt_ui_h);
                 }
+                *(void**)(copy + RDG_RESOURCE_RHI_OFF) = ui_target;
+                ++s_lgui_redirect_count_this_frame;
+
+                // Update the lock-free diagnostic snapshot the crash handler reads (see declaration near
+                // g_lgui_swap above). Deliberately cheap: 5 relaxed atomic stores, no locks/allocations.
+                {
+                    const auto now_us = (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch()).count();
+                    g_lgui_last_redirect_time_us.store(now_us, std::memory_order_relaxed);
+                    g_lgui_last_redirect_a3.store(a3_key, std::memory_order_relaxed);
+                    g_lgui_redirect_count_this_frame_diag.store((uint32_t)s_lgui_redirect_count_this_frame, std::memory_order_relaxed);
+                    g_lgui_shadow_pool_size_diag.store((uint32_t)lgui_copy_pool.size(), std::memory_order_relaxed);
+                    g_lgui_total_redirect_calls.fetch_add(1, std::memory_order_relaxed);
+                }
+
                 g_lgui_swap.rdg_texture = a3;
                 g_lgui_swap.shadow_copy = copy;
                 g_lgui_swap.ui_target = ui_target;
@@ -6164,6 +6519,52 @@ static void resolve_live(sdk::FSceneViewFamily* family, sdk::FSceneView* v0, sdk
     }
 }
 
+// The initial eye_fields snapshot above is captured on whatever frame the stereo pass offset first
+// resolves - typically during the loading screen / very first frames after attach. Some of those
+// offsets legitimately stop differing once real gameplay starts (loading-screen-only state settles),
+// which permanently starves the right-eye shadow fix of fields to flip for the rest of the session
+// (it only ever iterates the frozen initial list) - the only recovery was a full game restart.
+// Periodically re-scan and refresh the field list using live gameplay views instead of trusting the
+// first snapshot forever, so the shadow fix keeps working as the game state evolves.
+static inline std::chrono::steady_clock::time_point last_eye_fields_refresh{};
+
+static void refresh_eye_fields(sdk::FSceneView* v0, sdk::FSceneView* v1) {
+    if (!live_stereo_pass_offset || v0 == nullptr || v1 == nullptr) return;
+    if (IsBadReadPtr(v0, 0x1000) || IsBadReadPtr(v1, 0x1000)) return;
+
+    const auto now = std::chrono::steady_clock::now();
+    if (last_eye_fields_refresh.time_since_epoch().count() != 0 &&
+        now - last_eye_fields_refresh < std::chrono::seconds(2)) {
+        return;
+    }
+    last_eye_fields_refresh = now;
+
+    std::vector<EyeField> refreshed{};
+    std::string s2{};
+    for (uint32_t i = 0; i + 4 <= 0x1000; i += 4) {
+        const auto a = *(uint32_t*)((uintptr_t)v0 + i);
+        const auto b = *(uint32_t*)((uintptr_t)v1 + i);
+        if (a == b || a >= 8 || b >= 8) continue;
+
+        bool pointer_like = false;
+        if ((i % 8) == 0 && i + 8 <= 0x1000) {
+            const auto ha = *(uint32_t*)((uintptr_t)v0 + i + 4);
+            const auto hb = *(uint32_t*)((uintptr_t)v1 + i + 4);
+            pointer_like = ha != 0 || hb != 0;
+        }
+        if (pointer_like || b == 0) continue;
+
+        refreshed.push_back({i, a, b});
+        s2 += fmt::format("F{}={:x}:{}->{} ", refreshed.size() - 1, i, a, b);
+    }
+
+    if (refreshed.size() != eye_fields.size()) {
+        SPDLOG_INFO("[VR] sceneview_xref: eye identity fields refreshed ({} -> {} fields): {}",
+            eye_fields.size(), refreshed.size(), s2);
+        eye_fields = std::move(refreshed);
+    }
+}
+
 // Called after the original constructor has run for a full-size game view. Maps the live offsets
 // (resolved above) back into FSceneViewInitOptions by VALUE: the constructor copies Family and
 // StereoPass verbatim from the init options, so whatever the constructed view holds at the live
@@ -6412,9 +6813,55 @@ sdk::FSceneView* FFakeStereoRenderingHook::sceneview_constructor(sdk::FSceneView
 
     last_frame_count = g_frame_count;
 
-    const auto true_index = vr->is_using_afr() ? (g_frame_count + last_index) % 2 : last_index;
+    // Eye identity was previously inferred purely from constructor call order (last_index),
+    // which assumes exactly two FSceneView constructions per frame in strict Left-then-Right
+    // order. Any extra, non-stereo FSceneView construction in between (shadow depth passes,
+    // reflection captures, scene-capture actors) desyncs that counter, causing the wrong eye's
+    // HMD pose to be written into the real second eye - observed as the left eye "sticking" to
+    // the HMD under Scene View Extension / SplitScreen compatibility. When sceneview_xref has
+    // resolved this engine's live StereoPass encoding, read the pass directly off this view's
+    // own init options instead of trusting the call-order counter.
+    uint32_t true_index = vr->is_using_afr() ? (g_frame_count + last_index) % 2 : last_index;
 
-    if (vr->is_splitscreen_compatibility_enabled() || vr->is_sceneview_compatibility_enabled()) {
+    // Set whenever the live StereoPass encoding has been resolved AND this specific call's
+    // raw stereo pass did NOT match either known eye value - i.e. this FSceneView construction
+    // is confirmed to NOT be one of the two real stereo eyes (shadow depth pass, reflection
+    // capture, scene-capture actor, etc. sharing this same hooked constructor). Previously this
+    // case silently fell through and kept the call-order-derived true_index, which let these
+    // ambiguous/non-eye calls masquerade as a real eye and steal the manual pose-write below -
+    // observed in logs as the manual write only ever firing for true_index=1 (right eye) for the
+    // entire session, starving the left eye of its pose update and making it appear "stuck" to
+    // raw HMD-forward. Now tracked explicitly so the manual write can be skipped for these calls
+    // entirely instead of guessing an eye for them.
+    bool is_confirmed_non_eye_pass = false;
+
+    if (sceneview_xref::live_stereo_pass_offset.has_value() && !vr->is_using_afr()) {
+        const auto raw_stereo_pass = (uint32_t)(int32_t)init_options->get_stereo_pass();
+
+        // DIAG: init_options->get_stereo_pass() reads FSceneViewInitOptionsBase::s_stereo_pass_offset,
+        // which is resolved by a completely SEPARATE struct-offset-math heuristic in FSceneView.cpp
+        // (relative to FSceneViewInitOptions's own view_family/scene_state offsets). This is a
+        // different struct/offset than sceneview_xref::live_stereo_pass_offset, which is found by
+        // diffing the constructed FSceneView objects directly. Comparing raw_stereo_pass against
+        // sceneview_xref::stereo_pass_left/right is only valid if these two independently-resolved
+        // offsets happen to encode the same value - log every distinct value seen to verify this.
+        static std::unordered_set<uint32_t> s_seen_raw_stereo_pass_values{};
+        if (s_seen_raw_stereo_pass_values.insert(raw_stereo_pass).second) {
+            SPDLOG_WARN("[VR][SVC-RAW-STEREO-PASS] new raw_stereo_pass value seen: {} (init_options_offset={:x}) vs sceneview_xref left={} right={} (live_offset={:x})",
+                raw_stereo_pass, sdk::FSceneViewInitOptionsBase::get_stereo_pass_offset().value_or(0xFFFFFFFF),
+                sceneview_xref::stereo_pass_left, sceneview_xref::stereo_pass_right, *sceneview_xref::live_stereo_pass_offset);
+        }
+
+        if (raw_stereo_pass == sceneview_xref::stereo_pass_left) {
+            true_index = 0;
+        } else if (raw_stereo_pass == sceneview_xref::stereo_pass_right) {
+            true_index = 1;
+        } else {
+            is_confirmed_non_eye_pass = true;
+        }
+    }
+
+    if (!is_confirmed_non_eye_pass && (vr->is_splitscreen_compatibility_enabled() || vr->is_sceneview_compatibility_enabled())) {
         int32_t w = vr->get_hmd_width();
         int32_t h = vr->get_hmd_height();
 
@@ -7090,6 +7537,10 @@ void FFakeStereoRenderingHook::begin_render_viewfamily_real(
         // down the live FSceneView field offsets by value (see sceneview_xref).
         sceneview_xref::resolve_live(view_family, view_0, view_1);
 
+        // The initial eye_fields snapshot above can go stale once real gameplay starts (see comment
+        // on refresh_eye_fields); keep it in sync with live gameplay views on a throttled cadence.
+        sceneview_xref::refresh_eye_fields(view_0, view_1);
+
         auto runtime = vr->get_runtime();
         const auto frame_count = runtime->internal_frame_count;
 
@@ -7297,26 +7748,41 @@ void FFakeStereoRenderingHook::begin_render_viewfamily_real(
         // at runtime by sceneview_xref; camera/rects untouched) and restore afterwards. Both the enum
         // and its cached copy must be flipped for the engine to honor it.
         auto pass2_view = views.data[0];
+        auto pass1_view = views.data[1];
         std::vector<std::pair<uint32_t*, uint32_t>> pass2_restore{};
 
-        if (vr->is_native_stereo_fix_right_eye_shadows_enabled() && pass2_view != nullptr && nsf_pass2_hacks_safe_this_frame) {
+        if (vr->is_native_stereo_fix_right_eye_shadows_enabled() && pass2_view != nullptr && pass1_view != nullptr && nsf_pass2_hacks_safe_this_frame) {
             const auto& fields = sceneview_xref::eye_fields;
 
             if (!fields.empty()) {
                 const auto mask = vr->get_diag_nsf_pass2_eye_field_mask();
 
+                // FIX: previously wrote the STATIC f.left constant captured once by sceneview_xref's
+                // one-time snapshot diff. That snapshot has no semantic understanding of what each
+                // field actually is, so trusting its constant value forever is fragile: if a field's
+                // legitimate value drifts frame-to-frame for reasons unrelated to eye identity, the
+                // stale constant either silently stops matching (fix stops applying, shadows stay
+                // broken) or gets written anyway despite no longer being the correct "left eye" value
+                // for this frame (corrupting live state and sometimes breaking NSF shadows entirely).
+                // Instead, re-derive the correct value every frame directly from the live left-eye
+                // view (pass1_view) at the same offset, and only write it into pass2 when the two
+                // eyes' live values actually still differ right now - this self-corrects for any
+                // per-frame drift instead of betting on the snapshot staying valid indefinitely.
                 for (size_t i = 0; i < fields.size(); ++i) {
                     if (i < 32 && (mask & (1u << i)) == 0) continue;
                     const auto& f = fields[i];
-                    auto p = (uint32_t*)((uintptr_t)pass2_view + f.offset);
-                    if (*p == f.right) {
-                        pass2_restore.emplace_back(p, *p);
-                        *p = f.left;
+                    auto p_right = (uint32_t*)((uintptr_t)pass2_view + f.offset);
+                    auto p_left = (uint32_t*)((uintptr_t)pass1_view + f.offset);
+                    const auto live_left_value = *p_left;
+
+                    if (*p_right != live_left_value) {
+                        pass2_restore.emplace_back(p_right, *p_right);
+                        *p_right = live_left_value;
                     }
                 }
 
-                SPDLOG_INFO_EVERY_N_SEC(2, "[VR] NSF right-eye shadow fix: view={:x} flipped {}/{} eye fields (mask={:x})",
-                    (uintptr_t)pass2_view, pass2_restore.size(), fields.size(), mask);
+                SPDLOG_INFO_EVERY_N_SEC(2, "[VR] NSF right-eye shadow fix: view={:x} flipped {}/{} eye fields live from pass1={:x} (mask={:x})",
+                    (uintptr_t)pass2_view, pass2_restore.size(), fields.size(), (uintptr_t)pass1_view, mask);
             } else {
                 SPDLOG_INFO_EVERY_N_SEC(2, "[VR] NSF right-eye shadow fix: eye fields not yet resolved by sceneview_xref (view={:x})", (uintptr_t)pass2_view);
             }
@@ -8025,6 +8491,249 @@ bool FFakeStereoRenderingHook::setup_view_extensions() try {
         if (exception->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
             const auto exception_address = exception->ContextRecord->Rip;
 
+            // TARGETED DIAGNOSTIC: dump a disassembly/context window around the known crash rva family
+            // (0x23e1f889 and its observed derivatives 0x23e1f90e / 0x23e1f91a / 0x23e2aa86, ...) the very
+            // first time each such rva is hit. This runs BEFORE the generalized recovery below (which just
+            // skips the bad instruction) so we capture the exact byte-for-byte instruction shape, a window
+            // of surrounding code, and full register state for offline analysis - the generalized recovery
+            // path only ever logs the single faulting instruction's base_reg value, which isn't enough to
+            // reconstruct what object/field is actually being accessed at each of the derived rvas.
+            {
+                static std::unordered_set<uintptr_t> dumped_rvas{};
+                // Known family anchor + observed derivatives; also matches anything within a small window of
+                // the anchor rva since the crash chain has been seen to shift by a few bytes across game
+                // patches/ASLR-independent rebuilds while remaining the same underlying corrupted-object bug.
+                constexpr uintptr_t LGUI_KNOWN_UAF_ANCHOR_RVA = 0x23e1f889;
+                constexpr uintptr_t LGUI_KNOWN_UAF_WINDOW = 0x200;
+                static const std::unordered_set<uintptr_t> known_derivative_rvas{
+                    0x23e1f889, 0x23e1f90e, 0x23e1f91a, 0x23e2aa86,
+                };
+
+                const auto ex_mod_dump = utility::get_module_within((void*)exception_address);
+
+                if (ex_mod_dump.has_value()) {
+                    const auto mod_path_dump = utility::get_module_path(*ex_mod_dump).value_or("");
+
+                    if (mod_path_dump.find("-Win64-Shipping.exe") != std::string::npos) {
+                        const auto ex_rva_dump = exception_address - (uintptr_t)*ex_mod_dump;
+                        const bool is_known_derivative = known_derivative_rvas.contains(ex_rva_dump);
+                        const bool is_within_anchor_window =
+                            (ex_rva_dump >= LGUI_KNOWN_UAF_ANCHOR_RVA - LGUI_KNOWN_UAF_WINDOW) &&
+                            (ex_rva_dump <= LGUI_KNOWN_UAF_ANCHOR_RVA + LGUI_KNOWN_UAF_WINDOW);
+
+                        if ((is_known_derivative || is_within_anchor_window) && dumped_rvas.insert(ex_rva_dump).second) {
+                            const auto ctx_dump = exception->ContextRecord;
+
+                            SPDLOG_WARN("[Exception Handler] [LGUI_UAF_DUMP] ==== targeted dump for known UAF family rva={:x} "
+                                        "(is_known_derivative={} is_within_anchor_window={}) ====",
+                                ex_rva_dump, is_known_derivative, is_within_anchor_window);
+
+                            SPDLOG_WARN("[Exception Handler] [LGUI_UAF_DUMP] regs: rax={:x} rcx={:x} rdx={:x} rbx={:x} rsp={:x} rbp={:x} "
+                                        "rsi={:x} rdi={:x} r8={:x} r9={:x} r10={:x} r11={:x} r12={:x} r13={:x} r14={:x} r15={:x} rip={:x} eflags={:x}",
+                                ctx_dump->Rax, ctx_dump->Rcx, ctx_dump->Rdx, ctx_dump->Rbx, ctx_dump->Rsp, ctx_dump->Rbp,
+                                ctx_dump->Rsi, ctx_dump->Rdi, ctx_dump->R8, ctx_dump->R9, ctx_dump->R10, ctx_dump->R11,
+                                ctx_dump->R12, ctx_dump->R13, ctx_dump->R14, ctx_dump->R15, ctx_dump->Rip, ctx_dump->EFlags);
+
+                            // Cross-check every pointer-shaped GPR against the LGUI a3 lifecycle registry so we
+                            // can tell at a glance if any of them used to be one of our redirected render targets.
+                            SPDLOG_WARN("[Exception Handler] [LGUI_UAF_DUMP] a3 lookups: rax={} rcx={} rdx={} rbx={} rsi={} rdi={} r8={} r9={}",
+                                lgui_a3_history_lookup(ctx_dump->Rax), lgui_a3_history_lookup(ctx_dump->Rcx),
+                                lgui_a3_history_lookup(ctx_dump->Rdx), lgui_a3_history_lookup(ctx_dump->Rbx),
+                                lgui_a3_history_lookup(ctx_dump->Rsi), lgui_a3_history_lookup(ctx_dump->Rdi),
+                                lgui_a3_history_lookup(ctx_dump->R8), lgui_a3_history_lookup(ctx_dump->R9));
+
+                            // CLASS FINGERPRINTING: for every pointer-shaped GPR, treat it as a possible object
+                            // pointer and dump its vtable RVA + first few raw fields (see lgui_fingerprint_object
+                            // above). This is the missing piece for identifying WHAT TYPE of object is being
+                            // corrupted: even without RTTI, the vtable RVA is a stable per-class fingerprint that
+                            // only needs to be looked up once in a disassembler to attach a real class name.
+                            SPDLOG_WARN("[Exception Handler] [LGUI_UAF_DUMP] object fingerprints: rax=[{}] rcx=[{}] rdx=[{}] rbx=[{}]",
+                                lgui_fingerprint_object(ctx_dump->Rax), lgui_fingerprint_object(ctx_dump->Rcx),
+                                lgui_fingerprint_object(ctx_dump->Rdx), lgui_fingerprint_object(ctx_dump->Rbx));
+                            SPDLOG_WARN("[Exception Handler] [LGUI_UAF_DUMP] object fingerprints: rsi=[{}] rdi=[{}] r8=[{}] r9=[{}] rbp=[{}]",
+                                lgui_fingerprint_object(ctx_dump->Rsi), lgui_fingerprint_object(ctx_dump->Rdi),
+                                lgui_fingerprint_object(ctx_dump->R8), lgui_fingerprint_object(ctx_dump->R9),
+                                lgui_fingerprint_object(ctx_dump->Rbp));
+
+
+                            // fault and keep the last N instruction starts before the fault address - this is
+                            // the same "can't just seek backwards" problem noted elsewhere in this file for
+                            // exhaustive_decode, solved here with a simple forward re-sync scan).
+                            constexpr size_t LGUI_UAF_DUMP_BACK_SCAN = 64;
+                            constexpr int LGUI_UAF_DUMP_FORWARD_COUNT = 12;
+
+                            std::vector<uintptr_t> backward_starts{};
+                            auto scan_ip = exception_address - LGUI_UAF_DUMP_BACK_SCAN;
+
+                            while (scan_ip < exception_address) {
+                                const auto scan_decoded = utility::decode_one((uint8_t*)scan_ip);
+
+                                if (!scan_decoded || scan_decoded->Length == 0) {
+                                    ++scan_ip;
+                                    continue;
+                                }
+
+                                if (scan_ip + scan_decoded->Length <= exception_address) {
+                                    backward_starts.push_back(scan_ip);
+                                }
+
+                                scan_ip += scan_decoded->Length;
+                            }
+
+                            // Keep only the last few resynced instructions immediately preceding the fault.
+                            const size_t keep_back = std::min<size_t>(backward_starts.size(), 6);
+                            for (size_t i = backward_starts.size() - keep_back; i < backward_starts.size(); ++i) {
+                                const auto bp = backward_starts[i];
+                                const auto bdec = utility::decode_one((uint8_t*)bp);
+
+                                if (bdec) {
+                                    char txt[ND_MIN_BUF_SIZE]{};
+                                    NdToText(&*bdec, bp, sizeof(txt), txt);
+                                    SPDLOG_WARN("[Exception Handler] [LGUI_UAF_DUMP]   {:x}: {}", bp, txt);
+                                }
+                            }
+
+                            {
+                                char txt[ND_MIN_BUF_SIZE]{};
+                                const auto fault_decoded = utility::decode_one((uint8_t*)exception_address);
+
+                                if (fault_decoded) {
+                                    NdToText(&*fault_decoded, exception_address, sizeof(txt), txt);
+                                }
+
+                                SPDLOG_WARN("[Exception Handler] [LGUI_UAF_DUMP] > {:x}: {}  <-- FAULT", exception_address, txt);
+                            }
+
+                            // Disassemble a fixed number of instructions forward from (but not including) the
+                            // faulting instruction, to see what the surrounding code was trying to do with it.
+                            {
+                                auto fwd_ip = exception_address;
+                                const auto first_decoded = utility::decode_one((uint8_t*)fwd_ip);
+
+                                if (first_decoded) {
+                                    fwd_ip += first_decoded->Length;
+
+                                    for (int i = 0; i < LGUI_UAF_DUMP_FORWARD_COUNT; ++i) {
+                                        const auto fwd_decoded = utility::decode_one((uint8_t*)fwd_ip);
+
+                                        if (!fwd_decoded) {
+                                            break;
+                                        }
+
+                                        char txt[ND_MIN_BUF_SIZE]{};
+                                        NdToText(&*fwd_decoded, fwd_ip, sizeof(txt), txt);
+                                        SPDLOG_WARN("[Exception Handler] [LGUI_UAF_DUMP]   {:x}: {}", fwd_ip, txt);
+
+                                        fwd_ip += fwd_decoded->Length;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // TARGETED DIAGNOSTIC (VCRUNTIME140.dll variant): the same corrupted-object UAF family can also
+            // surface as an access violation *inside* VCRUNTIME140.dll itself, when the game hands a bulk-copy
+            // routine (memcpy/memmove, likely inlined into a CRT intrinsic) a bad source/dest pointer derived
+            // from the stale object. Our game-exe-only recovery above intentionally never patches instructions
+            // inside system/CRT DLLs (too risky to guess the correct semantics of an optimized copy loop
+            // mid-routine), so this crash currently always propagates to fatal. Since we can't safely recover
+            // it yet, at least make sure the FIRST occurrence is fully diagnosed: log every GPR (the bad
+            // pointer is typically rcx/rdx/r8/r9 per the Windows x64 calling convention, or a derived register
+            // like r9-0x10 as seen in the wild), the immediate caller return address (found by resolving the
+            // return address at [rsp] since VCRUNTIME140 entry stubs are thin wrappers with a normal call
+            // frame), and a short disassembly window so we can identify exactly which game-exe call site is
+            // handing VCRUNTIME140 the stale pointer - that call site, not VCRUNTIME140 itself, is the real
+            // fix target for a future targeted recovery.
+            {
+                static bool dumped_vcruntime_uaf = false;
+                const auto ex_mod_vcrt = utility::get_module_within((void*)exception_address);
+
+                if (ex_mod_vcrt.has_value() && !dumped_vcruntime_uaf) {
+                    const auto mod_path_vcrt = utility::get_module_path(*ex_mod_vcrt).value_or("");
+
+                    if (mod_path_vcrt.find("VCRUNTIME") != std::string::npos ||
+                        mod_path_vcrt.find("ucrtbase") != std::string::npos) {
+                        dumped_vcruntime_uaf = true;
+
+                        const auto ctx_vcrt = exception->ContextRecord;
+                        const auto ex_rva_vcrt = exception_address - (uintptr_t)*ex_mod_vcrt;
+
+                        SPDLOG_WARN("[Exception Handler] [LGUI_UAF_DUMP] ==== targeted dump: AV inside CRT module {} at rva={:x} "
+                                    "(likely same UAF family surfacing via a bulk-copy routine) ====",
+                            mod_path_vcrt, ex_rva_vcrt);
+
+                        SPDLOG_WARN("[Exception Handler] [LGUI_UAF_DUMP] regs: rax={:x} rcx={:x} rdx={:x} rbx={:x} rsp={:x} rbp={:x} "
+                                    "rsi={:x} rdi={:x} r8={:x} r9={:x} r10={:x} r11={:x} r12={:x} r13={:x} r14={:x} r15={:x} rip={:x} eflags={:x}",
+                            ctx_vcrt->Rax, ctx_vcrt->Rcx, ctx_vcrt->Rdx, ctx_vcrt->Rbx, ctx_vcrt->Rsp, ctx_vcrt->Rbp,
+                            ctx_vcrt->Rsi, ctx_vcrt->Rdi, ctx_vcrt->R8, ctx_vcrt->R9, ctx_vcrt->R10, ctx_vcrt->R11,
+                            ctx_vcrt->R12, ctx_vcrt->R13, ctx_vcrt->R14, ctx_vcrt->R15, ctx_vcrt->Rip, ctx_vcrt->EFlags);
+
+                        SPDLOG_WARN("[Exception Handler] [LGUI_UAF_DUMP] a3 lookups: rax={} rcx={} rdx={} rbx={} rsi={} rdi={} r8={} r9={}",
+                            lgui_a3_history_lookup(ctx_vcrt->Rax), lgui_a3_history_lookup(ctx_vcrt->Rcx),
+                            lgui_a3_history_lookup(ctx_vcrt->Rdx), lgui_a3_history_lookup(ctx_vcrt->Rbx),
+                            lgui_a3_history_lookup(ctx_vcrt->Rsi), lgui_a3_history_lookup(ctx_vcrt->Rdi),
+                            lgui_a3_history_lookup(ctx_vcrt->R8), lgui_a3_history_lookup(ctx_vcrt->R9));
+
+                        // Walk the return address chain a few frames up via [rsp], [ret_addr_frame+...] is not
+                        // reliable without frame pointers, but the immediate return address at [rsp] for a
+                        // freshly-entered leaf CRT routine (no prologue push yet, or right after one) usually
+                        // still points into the game exe call site that invoked the bad copy - report it and
+                        // let the module/rva be looked up in a disassembler.
+                        for (int slot = 0; slot < 4; ++slot) {
+                            const auto stack_ptr = ctx_vcrt->Rsp + (slot * sizeof(void*));
+
+                            if (IsBadReadPtr((void*)stack_ptr, sizeof(void*))) {
+                                break;
+                            }
+
+                            const auto candidate_ret = *(uintptr_t*)stack_ptr;
+                            const auto candidate_mod = utility::get_module_within((void*)candidate_ret);
+
+                            if (candidate_mod.has_value()) {
+                                const auto candidate_path = utility::get_module_path(*candidate_mod).value_or("<unknown>");
+
+                                if (candidate_path.find("-Win64-Shipping.exe") != std::string::npos) {
+                                    SPDLOG_WARN("[Exception Handler] [LGUI_UAF_DUMP] possible caller at [rsp+{:#x}]: module={} rva={:x}",
+                                        slot * (int)sizeof(void*), candidate_path, candidate_ret - (uintptr_t)*candidate_mod);
+                                }
+                            }
+                        }
+
+                        // Disassemble a short window at the fault site itself for completeness, even though
+                        // it's inside the CRT - the exact instruction shape (movdqu/rep movsb/etc.) tells us
+                        // the copy size class, which helps narrow down which game-exe call site this is.
+                        auto vcrt_ip = exception_address;
+                        for (int i = 0; i < 8; ++i) {
+                            const auto vcrt_decoded = utility::decode_one((uint8_t*)vcrt_ip);
+
+                            if (!vcrt_decoded) {
+                                break;
+                            }
+
+                            char txt[ND_MIN_BUF_SIZE]{};
+                            NdToText(&*vcrt_decoded, vcrt_ip, sizeof(txt), txt);
+                            SPDLOG_WARN("[Exception Handler] [LGUI_UAF_DUMP]   {}{:x}: {}", vcrt_ip == exception_address ? "> " : "  ", vcrt_ip, txt);
+
+                            vcrt_ip += vcrt_decoded->Length;
+                        }
+                    }
+                }
+            }
+
+            // NOTE: an earlier version of this recovery redirected the destination register to a static
+            // zeroed "dummy object" instead of a literal 0, on the theory that a follow-on pointer
+            // dereference into a real mapped page was safer than a null deref. In practice this made
+            // things WORSE: pointing at real, valid memory means the CPU no longer traps on the
+            // follow-on access, so the game's already-corrupted logic keeps running further down a
+            // broken call chain (vtable read -> indirect call -> ...) before eventually hitting a
+            // genuinely unrecoverable state, instead of failing fast and close to the origin. That
+            // required an ever-growing set of branch/taint guards just to catch up to new failure
+            // shapes it kept creating. Reverted to the simpler, previously-stable behavior: force the
+            // destination register straight to 0. A null deref right after this point still gets caught
+            // by this same handler, and it happens immediately instead of several instructions later.
+            //
             // GENERALIZED RECOVERY for a known family of use-after-free crashes inside the game's own
             // Client-Win64-Shipping.exe. We've observed multiple *different* faulting addresses/rvas
             // (0x23e1f889, 0x23e2aa86, ...) that all share the same signature: a base register used to
@@ -8077,6 +8786,19 @@ bool FFakeStereoRenderingHook::setup_view_extensions() try {
                                 if (warned_rvas.insert(ex_rva).second) {
                                     SPDLOG_WARN("[Exception Handler] Applying generalized UAF recovery in game exe at rva {:x} (base_reg={} value={:x}, load result forced to 0)",
                                         ex_rva, (int)base_reg, *gpr_table[base_reg]);
+                                    // CRASH-CORRELATION: check the exact stale/freed pointer value against the
+                                    // a3 address-lifecycle registry. If this comes back "KNOWN a3" (especially
+                                    // with reclaimed=true), the pointer this game-exe instruction just dereferenced
+                                    // used to be one of OUR redirected LGUI render targets - hard evidence the
+                                    // crash traces back to the redirect pipeline reusing/freeing an address that
+                                    // this other pass still references, rather than an unrelated engine bug.
+                                    SPDLOG_WARN("[Exception Handler] [LGUI_A3_LIFECYCLE] faulting pointer {:x} lookup: {}",
+                                        *gpr_table[base_reg], lgui_a3_history_lookup(*gpr_table[base_reg]));
+                                    // CLASS FINGERPRINTING: identify what type of object this read-recovery is
+                                    // touching (vtable RVA + raw fields), so repeated crashes at the same rva
+                                    // accumulate toward a nameable class via a one-time disassembler lookup.
+                                    SPDLOG_WARN("[Exception Handler] [LGUI_UAF_DUMP] object fingerprint at base_reg: [{}]",
+                                        lgui_fingerprint_object(*gpr_table[base_reg]));
                                 }
 
                                 const auto dst_reg = decoded_precheck->Operands[0].Info.Register.Reg;
@@ -8084,46 +8806,93 @@ bool FFakeStereoRenderingHook::setup_view_extensions() try {
                                 if (dst_reg < 16) {
                                     *gpr_table[dst_reg] = 0;
 
-                                    auto resume_addr = exception_address + decoded_precheck->Length;
+                                    ctx->Rip = exception_address + decoded_precheck->Length;
+                                    return EXCEPTION_CONTINUE_EXECUTION;
+                                }
+                            }
 
-                                    // Guard against a second, unrecoverable crash: if the very next
-                                    // instruction is an indirect CALL/JMP that uses the register we just
-                                    // zeroed out (as either its base/index memory operand or a bare
-                                    // register operand), executing it as-is would jump/call through a
-                                    // near-null address (e.g. "Bad read pointer at 74") - a crash we've
-                                    // observed happen right after this recovery path fires. Since we've
-                                    // already established the underlying object is stale/freed, the only
-                                    // safe option is to also skip that indirect branch (treat it as a
-                                    // no-op) rather than let it execute. This only ever affects the game
-                                    // exe's own UAF-crash instructions caught here - it does not touch any
-                                    // rendering/stereo/eye-pose code paths.
-                                    const auto next_decoded = utility::decode_one((uint8_t*)resume_addr);
 
-                                    if (next_decoded) {
-                                        const std::string_view next_mnemonic{next_decoded->Mnemonic};
+                        // Same UAF family, but for CMP/TEST-style reads: e.g. CMP eax, [rdi+0x34]. bddisasm
+                        // reports these with OperandsCount == 3 (the third being the implicit RFLAGS operand),
+                        // so the OperandsCount == 2 check above never matches them - this was a real gap: we
+                        // observed exactly this instruction shape (CMP reading a stale rdi-based field one
+                        // instruction after a successfully-recovered MOVSXD/MOV pair on the SAME corrupted
+                        // object) go completely unrecovered and crash the process. Unlike the MOV-load case,
+                        // there's no destination register to force to 0 here - CMP/TEST only set flags. To stay
+                        // consistent with the MOV-load recovery's convention of treating every field of the
+                        // freed/stale object as 0, we compute the flags CMP/TEST would have produced comparing
+                        // the live register operand against a memory value of 0, write those flags directly
+                        // into EFlags, and skip the faulting instruction so the following Jcc/CMOVcc/SETcc
+                        // sees a coherent, deterministic result instead of executing the read at all.
+                        if (decoded_precheck && decoded_precheck->OperandsCount >= 2 &&
+                            (decoded_precheck->Instruction == ND_INS_CMP || decoded_precheck->Instruction == ND_INS_TEST)) {
 
-                                        if (next_mnemonic.starts_with("CALL") || next_mnemonic.starts_with("JMP")) {
-                                            const auto& next_op0 = next_decoded->Operands[0];
-                                            const bool uses_zeroed_reg =
-                                                (next_op0.Type == ND_OP_REG && next_op0.Info.Register.Reg == dst_reg) ||
-                                                (next_op0.Type == ND_OP_MEM && next_op0.Info.Memory.HasBase && next_op0.Info.Memory.Base == dst_reg) ||
-                                                (next_op0.Type == ND_OP_MEM && next_op0.Info.Memory.HasIndex && next_op0.Info.Memory.Index == dst_reg);
+                            const ND_OPERAND* mem_op = nullptr;
+                            const ND_OPERAND* reg_op = nullptr;
 
-                                            if (uses_zeroed_reg) {
-                                                static std::unordered_set<uintptr_t> warned_branch_skip_rvas{};
-                                                const auto branch_rva = resume_addr - (uintptr_t)*ex_mod_precheck;
+                            if (decoded_precheck->Operands[0].Type == ND_OP_MEM && decoded_precheck->Operands[0].Info.Memory.HasBase &&
+                                decoded_precheck->Operands[1].Type == ND_OP_REG) {
+                                mem_op = &decoded_precheck->Operands[0];
+                                reg_op = &decoded_precheck->Operands[1];
+                            } else if (decoded_precheck->Operands[1].Type == ND_OP_MEM && decoded_precheck->Operands[1].Info.Memory.HasBase &&
+                                       decoded_precheck->Operands[0].Type == ND_OP_REG) {
+                                mem_op = &decoded_precheck->Operands[1];
+                                reg_op = &decoded_precheck->Operands[0];
+                            }
 
-                                                if (warned_branch_skip_rvas.insert(branch_rva).second) {
-                                                    SPDLOG_WARN("[Exception Handler] Skipping indirect {} at rva {:x} that would branch through zeroed register {}",
-                                                        next_decoded->Mnemonic, branch_rva, (int)dst_reg);
-                                                }
+                            if (mem_op != nullptr && reg_op != nullptr) {
+                                const auto ctx = exception->ContextRecord;
+                                DWORD64* const gpr_table[16] = {
+                                    &ctx->Rax, &ctx->Rcx, &ctx->Rdx, &ctx->Rbx,
+                                    &ctx->Rsp, &ctx->Rbp, &ctx->Rsi, &ctx->Rdi,
+                                    &ctx->R8,  &ctx->R9,  &ctx->R10, &ctx->R11,
+                                    &ctx->R12, &ctx->R13, &ctx->R14, &ctx->R15,
+                                };
 
-                                                resume_addr += next_decoded->Length;
-                                            }
-                                        }
+                                const auto mem_base_reg = mem_op->Info.Memory.Base;
+
+                                if (mem_base_reg < 16 && reg_op->Info.Register.Reg < 16) {
+                                    static std::unordered_set<uintptr_t> warned_cmp_rvas{};
+                                    const auto ex_rva = exception_address - (uintptr_t)*ex_mod_precheck;
+
+                                    if (g_hook != nullptr) {
+                                        g_hook->report_uaf_recovery(ex_rva);
                                     }
 
-                                    ctx->Rip = resume_addr;
+                                    // Register value, masked to the operand's actual width so the comparison
+                                    // against the assumed-0 memory operand is computed at the right size.
+                                    const auto op_size_bits = reg_op->Size * 8;
+                                    const uint64_t width_mask = (op_size_bits >= 64) ? ~0ULL : ((1ULL << op_size_bits) - 1);
+                                    const uint64_t reg_val = *gpr_table[reg_op->Info.Register.Reg] & width_mask;
+
+                                    if (warned_cmp_rvas.insert(ex_rva).second) {
+                                        SPDLOG_WARN("[Exception Handler] Applying generalized UAF compare recovery in game exe at rva {:x} "
+                                                    "(mem_base_reg={} value={:x}, treating stale field as 0, reg_val={:x})",
+                                            ex_rva, (int)mem_base_reg, *gpr_table[mem_base_reg], reg_val);
+                                        SPDLOG_WARN("[Exception Handler] [LGUI_A3_LIFECYCLE] faulting pointer {:x} lookup: {}",
+                                            *gpr_table[mem_base_reg], lgui_a3_history_lookup(*gpr_table[mem_base_reg]));
+                                    }
+
+                                    // Compute flags as-if the memory operand's value were 0. For TEST this is
+                                    // "reg_val AND 0", for CMP this is "reg_val - 0" - both simplify to the same
+                                    // result value (reg_val itself), so a single flag computation covers both.
+                                    const uint64_t result = reg_val;
+                                    const bool zf = (result == 0);
+                                    const bool sf = op_size_bits > 0 && ((result >> (op_size_bits - 1)) & 1) != 0;
+
+                                    constexpr DWORD FLAG_CF = 0x0001;
+                                    constexpr DWORD FLAG_PF = 0x0004;
+                                    constexpr DWORD FLAG_AF = 0x0010;
+                                    constexpr DWORD FLAG_ZF = 0x0040;
+                                    constexpr DWORD FLAG_SF = 0x0080;
+                                    constexpr DWORD FLAG_OF = 0x0800;
+
+                                    ctx->EFlags &= ~(FLAG_CF | FLAG_PF | FLAG_AF | FLAG_ZF | FLAG_SF | FLAG_OF);
+                                    if (zf) ctx->EFlags |= FLAG_ZF;
+                                    if (sf) ctx->EFlags |= FLAG_SF;
+                                    // CF/OF are always 0 for both "x - 0" (CMP) and "x AND 0" (TEST).
+
+                                    ctx->Rip = exception_address + decoded_precheck->Length;
                                     return EXCEPTION_CONTINUE_EXECUTION;
                                 }
                             }
@@ -8132,11 +8901,19 @@ bool FFakeStereoRenderingHook::setup_view_extensions() try {
                         // Same UAF family, but for STORES instead of loads: e.g. MOV [reg+disp], reg2/imm,
                         // where the destination memory operand (Operands[0]) holds a stale/freed pointer.
                         // This is a WRITE access violation (as opposed to the read case above), and it cannot
-                        // be recovered by forcing a register to 0 - there's nothing to write TO. Since the CPU
-                        // has already proven the destination address is invalid, the only safe recovery is to
-                        // skip the write entirely (treat it as a no-op) and continue at the next instruction.
-                        // Scoped identically to the read case: game exe only, one-time warning per rva.
-                        if (decoded_precheck && decoded_precheck->OperandsCount >= 1 &&
+                        // be recovered by forcing a register to 0 - there's nothing to write TO. The only
+                        // possible recovery is to skip the write entirely (treat it as a no-op) and continue.
+                        //
+                        // TOGGLEABLE (see VR::is_lgui_uaf_store_recovery_disabled()): this "skip the write"
+                        // recovery was stable across most sessions and is the default (toggle OFF = recovery
+                        // ACTIVE), but was observed once to let the game limp forward with a partially
+                        // corrupted object instead of crashing immediately, which later produced a permanent
+                        // hang ("present stalled" every ~5s forever, beginning ~5s after the last store
+                        // recovery) rather than terminating. An infinite hang is harder to diagnose/recover
+                        // from than an immediate crash, so this can be disabled at runtime (DIAG menu) to let
+                        // these faults propagate as a real, fast, dumpable crash instead if a hang recurs.
+                        if (!VR::get()->is_lgui_uaf_store_recovery_disabled() &&
+                            decoded_precheck && decoded_precheck->OperandsCount >= 1 &&
                             decoded_precheck->Operands[0].Type == ND_OP_MEM && decoded_precheck->Operands[0].Info.Memory.HasBase) {
 
                             const auto ctx = exception->ContextRecord;
@@ -8160,9 +8937,90 @@ bool FFakeStereoRenderingHook::setup_view_extensions() try {
                                 if (warned_store_rvas.insert(ex_rva).second) {
                                     SPDLOG_WARN("[Exception Handler] Applying generalized UAF store recovery in game exe at rva {:x} (base_reg={} value={:x}, write skipped)",
                                         ex_rva, (int)base_reg, *gpr_table[base_reg]);
+                                    SPDLOG_WARN("[Exception Handler] [LGUI_A3_LIFECYCLE] faulting pointer {:x} lookup: {}",
+                                        *gpr_table[base_reg], lgui_a3_history_lookup(*gpr_table[base_reg]));
+                                    // CLASS FINGERPRINTING: identify what type of object this store-recovery is
+                                    // touching. This is the path most directly implicated in the "B button does
+                                    // nothing" regression (rva 2094f9d0 in the observed repro), so knowing the
+                                    // object's vtable RVA here is the most valuable fingerprint to capture.
+                                    SPDLOG_WARN("[Exception Handler] [LGUI_UAF_DUMP] object fingerprint at base_reg: [{}]",
+                                        lgui_fingerprint_object(*gpr_table[base_reg]));
                                 }
 
-                                ctx->Rip = exception_address + decoded_precheck->Length;
+                                auto resume_addr = exception_address + decoded_precheck->Length;
+
+                                // GUARD (added after observing a fatal VCRUNTIME140.dll AV following this exact
+                                // store recovery): skipping the store above only prevents ITS OWN write from
+                                // crashing, but the corrupted object's other stale fields can still be read a
+                                // few instructions later and handed as arguments (e.g. src/dst/size) to a CALL
+                                // into a CRT bulk-copy routine (memcpy/memmove), which then dereferences a
+                                // non-canonical garbage pointer and crashes inside VCRUNTIME140.dll/ucrtbase.dll
+                                // instead - a module our recovery correctly refuses to patch directly. Since we
+                                // already know the feeding object is stale/corrupted at this point, scan a short
+                                // forward window for exactly that pattern (a direct CALL whose resolved target
+                                // lands in a CRT module) and skip the CALL entirely (treat as a no-op) rather
+                                // than let it execute with garbage arguments. Bounded to a small window/instr
+                                // count so we don't accidentally skip an unrelated, legitimate call further down.
+                                {
+                                    constexpr int LGUI_STORE_GUARD_MAX_INSTRS = 8;
+                                    auto guard_ip = resume_addr;
+
+                                    for (int i = 0; i < LGUI_STORE_GUARD_MAX_INSTRS; ++i) {
+                                        const auto guard_decoded = utility::decode_one((uint8_t*)guard_ip);
+
+                                        if (!guard_decoded) {
+                                            break;
+                                        }
+
+                                        const std::string_view guard_mnemonic{guard_decoded->Mnemonic};
+
+                                        if (guard_mnemonic.starts_with("CALL")) {
+                                            uintptr_t call_target = 0;
+
+                                            if (guard_decoded->BranchInfo.IsBranch && !guard_decoded->BranchInfo.IsIndirect) {
+                                                call_target = guard_ip + guard_decoded->Length + (int32_t)guard_decoded->RelativeOffset;
+                                            }
+
+                                            bool skip_call = false;
+
+                                            if (call_target != 0) {
+                                                const auto call_target_mod = utility::get_module_within((void*)call_target);
+
+                                                if (call_target_mod.has_value()) {
+                                                    const auto call_target_path = utility::get_module_path(*call_target_mod).value_or("");
+
+                                                    if (call_target_path.find("VCRUNTIME") != std::string::npos ||
+                                                        call_target_path.find("ucrtbase") != std::string::npos ||
+                                                        call_target_path.find("msvcrt") != std::string::npos ||
+                                                        call_target_path.find("MSVCP") != std::string::npos) {
+                                                        skip_call = true;
+                                                    }
+                                                }
+                                            }
+
+                                            if (skip_call) {
+                                                static std::unordered_set<uintptr_t> warned_call_skip_rvas{};
+                                                const auto call_rva = guard_ip - (uintptr_t)*ex_mod_precheck;
+
+                                                if (warned_call_skip_rvas.insert(call_rva).second) {
+                                                    SPDLOG_WARN("[Exception Handler] Skipping CALL at rva {:x} into CRT module (target={:x}) shortly "
+                                                                "after a store-recovery on the same corrupted object - avoiding a downstream CRT AV",
+                                                        call_rva, call_target);
+                                                }
+
+                                                resume_addr = guard_ip + guard_decoded->Length;
+                                            }
+
+                                            // Whether skipped or not, a CALL is a natural stopping point for this
+                                            // short forward scan - don't walk into the callee's own instructions.
+                                            break;
+                                        }
+
+                                        guard_ip += guard_decoded->Length;
+                                    }
+                                }
+
+                                ctx->Rip = resume_addr;
                                 return EXCEPTION_CONTINUE_EXECUTION;
                             }
                         }
@@ -8209,7 +9067,42 @@ bool FFakeStereoRenderingHook::setup_view_extensions() try {
                 SPDLOG_INFO("[Exception Handler]   rva={:x} base_reg={} disp={:#x} rax={:x} rcx={:x} rdx={:x} rbx={:x} rsi={:x} rdi={:x} r8={:x} r9={:x} r12={:x} r13={:x} r14={:x} r15={:x}",
                     ex_mod.has_value() ? exception_address - (uintptr_t)*ex_mod : exception_address, (int)base_reg, disp,
                     ctx->Rax, ctx->Rcx, ctx->Rdx, ctx->Rbx, ctx->Rsi, ctx->Rdi, ctx->R8, ctx->R9, ctx->R12, ctx->R13, ctx->R14, ctx->R15);
+
+                // CRASH-CORRELATION: resolve the actual faulting memory operand's base register value (the
+                // stale/bad pointer, before adding disp) and check it, PLUS every other GPR that looks
+                // pointer-shaped, against the a3 address-lifecycle registry. This directly answers "is the
+                // exact address this crash touched one of our redirected LGUI render targets" instead of only
+                // the indirect timing evidence in LGUI_CRASH_CONTEXT below - e.g. for the VCRUNTIME140.dll
+                // memcpy crash, the bad SOURCE pointer is typically in rcx/rdx/r8 (Windows x64 calling
+                // convention), not necessarily the RIP-relative base_reg of the faulting MOV itself.
+                if (base_reg < 16) {
+                    DWORD64* const gpr_table[16] = {
+                        &ctx->Rax, &ctx->Rcx, &ctx->Rdx, &ctx->Rbx,
+                        &ctx->Rsp, &ctx->Rbp, &ctx->Rsi, &ctx->Rdi,
+                        &ctx->R8,  &ctx->R9,  &ctx->R10, &ctx->R11,
+                        &ctx->R12, &ctx->R13, &ctx->R14, &ctx->R15,
+                    };
+                    SPDLOG_WARN("[Exception Handler] [LGUI_A3_LIFECYCLE] faulting base_reg value {:x} lookup: {}",
+                        *gpr_table[base_reg], lgui_a3_history_lookup(*gpr_table[base_reg]));
+                }
+                SPDLOG_WARN("[Exception Handler] [LGUI_A3_LIFECYCLE] rcx lookup: {} | rdx lookup: {} | r8 lookup: {}",
+                    lgui_a3_history_lookup(ctx->Rcx), lgui_a3_history_lookup(ctx->Rdx), lgui_a3_history_lookup(ctx->R8));
             }
+
+            // TARGETED DIAGNOSTIC: any crash that reaches this point was NOT recognized as the known game-exe
+            // UAF pattern above, i.e. it is either genuinely unrelated to that family, OR it's the *same*
+            // underlying corruption surfacing through a different module/instruction shape (e.g. the
+            // VCRUNTIME140.dll memcpy AV seen after the LGUI redirect changes - a bad source pointer handed to
+            // a bulk copy by the game, which our game-exe-only recovery correctly refuses to patch). Log the
+            // LGUI redirect pipeline's lock-free diagnostic snapshot here unconditionally so every such crash
+            // is self-diagnosing: if lgui_ms_since_last_redirect() is small (redirect just happened) and/or the
+            // shadow-copy pool size or per-frame redirect count looks abnormal, that's strong evidence this
+            // crash traces back to the UI redirect pipeline rather than being an unrelated engine/game bug.
+            SPDLOG_ERROR("[Exception Handler] [LGUI_CRASH_CONTEXT] ms_since_last_redirect={} last_redirect_a3={:x} redirect_count_this_frame={} shadow_pool_size={} total_redirect_calls={}",
+                lgui_ms_since_last_redirect(), g_lgui_last_redirect_a3.load(std::memory_order_relaxed),
+                g_lgui_redirect_count_this_frame_diag.load(std::memory_order_relaxed),
+                g_lgui_shadow_pool_size_diag.load(std::memory_order_relaxed),
+                g_lgui_total_redirect_calls.load(std::memory_order_relaxed));
 
             // Get the start of the previous instruction
             const auto previous_instruction = utility::resolve_instruction(exception_address - 1);
@@ -8294,6 +9187,7 @@ bool FFakeStereoRenderingHook::setup_view_extensions() try {
 
             SPDLOG_INFO("Finished creating patches, continuing execution.");
             return EXCEPTION_CONTINUE_EXECUTION;
+        }
         }
 
         return EXCEPTION_CONTINUE_SEARCH;
@@ -9204,18 +10098,58 @@ __forceinline void FFakeStereoRenderingHook::calculate_stereo_view_offset(
 
     vr->set_world_to_meters(world_to_meters);
 
-    if (view_index == 2) {
-        index_starts_from_one = true;
-        index_was_ever_two = true;
-    } else if (view_index == 0 && !index_was_ever_two) {
-        index_starts_from_one = false;
+    // BUG: calculate_stereo_view_offset_() (the manual-call wrapper used by the Scene View
+    // Extension / SplitScreen compatibility path in sceneview_constructor) sets
+    // m_inside_manual_view_offset=true and calls in here with view_index = true_index + 1 -
+    // i.e. it ALREADY knows the correct eye. But this function fed that view_index through the
+    // SAME shared, static index_starts_from_one/index_was_ever_two heuristic used to classify
+    // the engine's own raw per-eye calls. Since both call sites mutate the same static state,
+    // whichever one runs first each session/frame can flip index_starts_from_one for the OTHER
+    // one too, silently inverting which eye a manual call's view_index maps to - explaining the
+    // "left eye locks to raw HMD forward, unrelated to camera" symptom (the manual call for the
+    // left eye's pose write was landing on true_index=1's branch, or vice versa, depending on
+    // heuristic state left over from the real per-eye calls). Manual calls carry unambiguous
+    // eye identity already, so bypass the heuristic entirely for them and use it (and mutate its
+    // state) only for real engine-issued calls.
+    const bool is_manual_call = g_hook->m_inside_manual_view_offset;
+
+    if (!is_manual_call) {
+        if (view_index == 2) {
+            index_starts_from_one = true;
+            index_was_ever_two = true;
+        } else if (view_index == 0 && !index_was_ever_two) {
+            index_starts_from_one = false;
+        }
     }
 
-    const auto is_full_pass = view_index == 0 && !index_was_ever_two && !index_was_ever_negative;
+    const auto is_full_pass = !is_manual_call && view_index == 0 && !index_was_ever_two && !index_was_ever_negative;
 
-    auto true_index = index_starts_from_one ? ((view_index + 1) % 2) : (view_index % 2);
+    // Manual calls (Scene View Extension / SplitScreen compatibility path) already pass an
+    // unambiguous view_index = true_index + 1 - decode it directly instead of running it through
+    // the heuristic meant only for classifying the engine's own raw per-eye calls (see is_manual_call
+    // above for why sharing that heuristic silently inverted eye identity for manual calls).
+    auto true_index = is_manual_call ? (uint32_t)(view_index - 1) :
+        (index_starts_from_one ? ((view_index + 1) % 2) : (view_index % 2));
     const auto has_double_precision = g_hook->m_has_double_precision;
     const auto rot_d = (Rotator<double>*)view_rotation;
+
+    if (is_manual_call) {
+        // NOTE: previously used a single shared SPDLOG_INFO_EVERY_N_SEC throttle for this log line,
+        // which meant whichever eye's manual call happened to land first inside each 2-second window
+        // suppressed the OTHER eye's log for that entire window - making it look like only one eye
+        // (true_index=1) was ever receiving a manual call, when this was actually just a throttling
+        // artifact. Throttle independently per true_index (0/1) so both eyes are actually observable.
+        static std::chrono::steady_clock::time_point s_last_logged[2]{};
+        const auto now = std::chrono::steady_clock::now();
+        const auto idx_for_throttle = true_index < 2 ? true_index : 0;
+
+        if (now - s_last_logged[idx_for_throttle] >= std::chrono::seconds(2)) {
+            s_last_logged[idx_for_throttle] = now;
+            SPDLOG_INFO("[VR][SVC-MANUAL-CALL] manual calculate_stereo_view_offset: view_index={} decoded true_index={} (heuristic index_starts_from_one={} index_was_ever_two={} would have given {})",
+                view_index, true_index, index_starts_from_one, index_was_ever_two,
+                index_starts_from_one ? ((view_index + 1) % 2) : (view_index % 2));
+        }
+    }
 
     // DIAG: world_to_meters is supplied per-call (effectively per-eye) but immediately clobbers a single
     // shared vr->m_world_to_meters value that is then read back later (as world_scale) for whichever eye
@@ -9391,7 +10325,15 @@ __forceinline void FFakeStereoRenderingHook::calculate_stereo_view_offset(
     const bool diag_exclude_from_sync_cache = vr->is_diag_exclude_view_index_from_sync_cache_enabled() &&
         view_index == vr->get_diag_exclude_view_index_from_sync_cache();
 
-    if (!diag_exclude_from_sync_cache && vr->is_native_stereo_fix_enabled() && !vr->is_using_afr() && vr->is_native_stereo_fix_sync_pose_enabled() && !is_full_pass) {
+    // FIX: manual calls (Scene View Extension / SplitScreen compatibility, is_manual_call above)
+    // already carry a fresh, independently-resolved, correct pose for their specific eye - they do
+    // NOT go through NSF's real two-pass-per-frame render, so they lack the synchronous back-to-
+    // back Pass1/Pass2 timing this cache/blend mechanism relies on (see the have_left consumption
+    // below). Letting them feed into/be blended by this cache when both NSF sync-pose AND Scene
+    // View compatibility are enabled together caused the manual path's already-correct per-eye pose
+    // to be blended toward a stale/mistimed cached pose, reading as blur/lag - the opposite of what
+    // sync-pose is meant to fix. Skip this entire block for manual calls; they never needed it.
+    if (!is_manual_call && !diag_exclude_from_sync_cache && vr->is_native_stereo_fix_enabled() && !vr->is_using_afr() && vr->is_native_stereo_fix_sync_pose_enabled() && !is_full_pass) {
         auto& hook_data = *g_hook;
         const auto local_view_d = (Vector3d*)view_location;
 
@@ -9713,7 +10655,7 @@ __forceinline void FFakeStereoRenderingHook::calculate_stereo_view_offset(
     // have_left, does not write m_nsf_sync_pose_*) to the excluded index, so its frustum/pose stays
     // coherent with the actual HMD pose without re-introducing the cache race. Gated so it can be
     // disabled independently if it turns out to break/flicker culling instead of fixing it.
-    if (diag_exclude_from_sync_cache && vr->is_diag_apply_synced_pose_to_excluded_view_index_enabled() &&
+    if (!is_manual_call && diag_exclude_from_sync_cache && vr->is_diag_apply_synced_pose_to_excluded_view_index_enabled() &&
         vr->is_native_stereo_fix_enabled() && !vr->is_using_afr() && vr->is_native_stereo_fix_sync_pose_enabled() && !is_full_pass) {
         auto& hook_data = *g_hook;
 
@@ -9908,6 +10850,35 @@ __forceinline void FFakeStereoRenderingHook::calculate_stereo_view_offset(
     // it is only for debugging purposes
     if (!vr->is_stereo_emulation_enabled()) {
         const auto is_2d_screen = vr->is_using_2d_screen();
+
+        // DIAG: NSF-POSE-REFRESH-RACE. Snapshots the pose-refresh call counter (bumped once per
+        // update_hmd_state() call - see VR::update_hmd_state) at the exact moment this eye reads the
+        // shared HMD pose. If the counter differs between the true_index=0 and true_index=1 calls of
+        // the SAME rendered frame (g_frame_count), a pose refresh landed in between the two eyes' reads
+        // and they are consuming genuinely different snapshots - independent of NSF vs Scene View
+        // compatibility, since both just call get_rotation(0)/get_position(0) here.
+        if (vr->is_diag_log_pose_refresh_timing_enabled()) {
+            static std::unordered_map<uint64_t, uint64_t> s_frame_first_eye_counter{};
+            const auto counter_now = vr->get_diag_pose_refresh_call_count();
+            const auto it = s_frame_first_eye_counter.find(g_frame_count);
+
+            if (it == s_frame_first_eye_counter.end()) {
+                s_frame_first_eye_counter[g_frame_count] = counter_now;
+                SPDLOG_INFO("[VR][NSF-POSE-REFRESH-RACE] frame={} true_index={} is_manual_call={} pose_refresh_counter={} (first eye this frame)",
+                    g_frame_count, true_index, is_manual_call, counter_now);
+            } else if (it->second != counter_now) {
+                SPDLOG_WARN("[VR][NSF-POSE-REFRESH-RACE] frame={} true_index={} is_manual_call={} pose_refresh_counter={} DIFFERS from first eye's counter={} - pose refreshed mid-frame!",
+                    g_frame_count, true_index, is_manual_call, counter_now, it->second);
+            } else {
+                SPDLOG_INFO("[VR][NSF-POSE-REFRESH-RACE] frame={} true_index={} is_manual_call={} pose_refresh_counter={} (matches first eye, no race)",
+                    g_frame_count, true_index, is_manual_call, counter_now);
+            }
+
+            // Bound the map so it can't grow unbounded over a long session.
+            if (s_frame_first_eye_counter.size() > 256) {
+                s_frame_first_eye_counter.clear();
+            }
+        }
 
         const auto rotation_offset = vr->get_rotation_offset();
         const auto current_hmd_rotation = glm::normalize(rotation_offset * glm::quat{vr->get_rotation(0)});
