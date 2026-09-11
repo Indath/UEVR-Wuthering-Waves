@@ -32,6 +32,7 @@ struct IStereoLayers;
 namespace sdk {
 struct FSceneViewStateInterface;
 class FViewport;
+class FRenderTarget;
 class FCanvas;
 class UGameViewportClient;
 class AActor;
@@ -76,6 +77,15 @@ public:
     FRHITexture2D* get_render_target() {
         return render_target; 
     }
+
+    // NARROW EXPERIMENT (see lgui_frt_get_render_target_texture_hook): a second, independently-sized
+    // persistent texture created alongside ui_target (only via the "common version" texture-create
+    // branch of pre_texture_hook_callback, since that is the only branch observed to fire for this
+    // game build). Lets the LGUI FRenderTarget redirect hand back a texture matching the ORIGINAL
+    // call site's requested size instead of ui_target's (intentionally wider) NSF-fit size.
+    FRHITexture2D*& get_lgui_shadow_ui_target() { return lgui_shadow_ui_texture; }
+    uint32_t lgui_shadow_ui_width{0};
+    uint32_t lgui_shadow_ui_height{0};
 
     FRHITexture2D* get_scene_capture_render_target();
     void set_render_target(FRHITexture2D* rt) { render_target = rt; }
@@ -169,6 +179,7 @@ protected:
 
     VerifiedFTexture2D ui_target{};
     VerifiedFTexture2D render_target{};
+    VerifiedFTexture2D lgui_shadow_ui_texture{};
     static void pre_texture_hook_callback(safetyhook::Context& ctx, bool from_second = false); // only used if pixel format cvar is missing
     static void texture_hook_callback(safetyhook::Context& ctx, bool from_second = false);
 
@@ -645,6 +656,17 @@ public:
     static void begin_render_viewfamily(ISceneViewExtension* extension, sdk::FSceneViewFamily& view_family);
     static void pre_render_viewfamily_renderthread(ISceneViewExtension* extension, sdk::FRHICommandListBase* cmd_list, sdk::FSceneViewFamily& view_family);
 
+    // FRenderTarget - EXPERIMENT: higher-level alternative to the a3 shadow-copy pool (see
+    // VR::is_lgui_frt_redirect_disabled()). Hooks the shared FRenderTarget::GetRenderTargetTexture()
+    // vtable slot directly instead of duplicating the per-frame transient a3 RDG texture object.
+    // Public (rather than alongside the other FViewport hooks below) because it is installed from
+    // VRRenderTargetManager_Base::create_scene_capture's hook_frt lambda, a different class.
+    static FRHITexture2D** lgui_frt_get_render_target_texture_hook(sdk::FRenderTarget* frt);
+    // Raw original vtable function pointer for FRenderTarget::GetRenderTargetTexture, captured once at hook
+    // install time (before we overwrite the slot). Not a PointerHook because the slot lives inside the
+    // per-instance/class vtable array already managed by hook_frt's original_frender_target_vtable copy.
+    void* m_lgui_frt_original_get_render_target_texture{nullptr};
+
 private:
     bool hook();
     bool standard_fake_stereo_hook(uintptr_t vtable);
@@ -763,6 +785,15 @@ private:
         bool has_view_family_tex{false};
         int32_t selected_retaddr{0};
     } m_viewport_rt_hook_data{};
+
+    // EXPERIMENT: retaddr classification state for lgui_frt_get_render_target_texture_hook, mirroring
+    // m_viewport_rt_hook_data's pattern but scoped to the FRenderTarget-level redirect.
+    struct {
+        std::unordered_set<uintptr_t> seen_retaddrs{};
+        std::unordered_set<uintptr_t> call_original_retaddrs{};
+        std::unordered_set<uintptr_t> redirected_retaddrs{};
+        std::recursive_mutex retaddr_mutex{};
+    } m_lgui_frt_rt_hook_data{};
 
     VRRenderTargetManager m_rtm{};
     VRRenderTargetManager_418 m_rtm_418{};

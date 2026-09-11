@@ -1187,6 +1187,111 @@ public:
         return m_disable_lgui_uaf_store_recovery->value();
     }
 
+    // DIAG: gate for the forward-store-skip guard added to the generalized MOV/MOVZX load-recovery
+    // path in FFakeStereoRenderingHook.cpp. That guard scans a short window past a recovered read and
+    // skips a downstream store that uses a register tainted by the zeroed load result, to prevent a
+    // follow-on write access violation. It's being A/B tested against a report of a black/no-visual
+    // left eye + menu crash: default OFF (guard ACTIVE) is the new behavior; turn this ON to fully
+    // disable the guard (falling back to only zeroing the load and letting any follow-on store crash
+    // normally) to determine whether this guard is responsible for the left-eye regression.
+    bool is_lgui_uaf_load_store_guard_disabled() const {
+        return m_disable_lgui_uaf_load_store_guard->value();
+    }
+
+    // DIAG: gate for the plausible-float guard in the generalized MOV/MOVZX load-recovery path. That
+    // recovery assumes a faulting base register holds a stale/freed pointer and forces the load result
+    // to 0, but was observed (rva=23e1f889) faulting on a base register holding the raw bit pattern
+    // 0xbf800000 - which is exactly -1.0f as a float, not garbage - suggesting this particular fault is
+    // NOT a stale pointer at all, but a legitimate small float (e.g. a per-eye scale/sign constant) that
+    // just happens to also be an invalid address when treated as one. Zeroing the load result in that
+    // case could corrupt real eye/view scale state and cause a black/no-visual eye, rather than actually
+    // recovering a UAF. Default OFF (guard ACTIVE): when the base register's raw bits reinterpret as a
+    // plausible small float, skip the zero-forcing recovery entirely and let the fault propagate normally
+    // instead. Turn this ON to fully disable the guard (revert to the old unconditional zero-and-recover
+    // behavior for every faulting load in this family) to A/B test whether this guard is what's needed to
+    // fix the black-eye regression, or whether it's unrelated.
+    bool is_lgui_uaf_float_guard_disabled() const {
+        return m_disable_lgui_uaf_float_guard->value();
+    }
+
+    // DIAG/EXPERIMENT: gates a higher-level alternative to the a3 RDG-texture shadow-copy/quarantine redirect
+    // (see LGUI_PATCH_A3_REFS in FFakeStereoRenderingHook.cpp). Instead of duplicating the per-frame transient
+    // FRDGTexture object, this hooks the shared, class-level FRenderTarget::GetRenderTargetTexture() vtable slot
+    // directly (the same slot resolved by sdk::FRenderTarget::update_offsets/get_render_target_texture_index).
+    // CRASH HISTORY: two independent DXGI_ERROR_DEVICE_REMOVED crashes have been traced to actually redirecting
+    // this call to ui_target. Rev 1 returned &rtm->get_ui_target() directly - the address of the live, mutable
+    // ui_target member - which RDG can capture and dereference later (deferred Execute, possibly off thread); a
+    // logged "Tall-UI mode changed... forcing UI target reallocation" reassigning ui_target in that window was
+    // followed by device removal. Rev 2 snapshotted the pointer value into a thread_local slot to fix that, but
+    // a second crash log showed the redirect firing and, in the same frame, the device being removed while
+    // D3D12Component.cpp set up the right-eye stereo blit - i.e. the underlying *resource*, not just the raw
+    // pointer, had already been freed/recreated by the time deferred GPU work referencing it actually ran.
+    // As a result, lgui_frt_get_render_target_texture_hook() no longer redirects anything regardless of this
+    // toggle's value - it only classifies/logs the retaddr and always calls through to the original function.
+    // This toggle is kept only to enable/disable that diagnostic logging; a real fix needs the same per-call
+    // lifetime/quarantine tracking the a3 shadow-copy pool already implements.
+    bool is_lgui_frt_redirect_disabled() const {
+        return m_disable_lgui_frt_redirect->value();
+    }
+
+    // EXPERIMENT: see the [LGUI_SHADOW_TEX] logging in pre_texture_hook_callback and
+    // lgui_frt_get_render_target_texture_hook. When enabled, an additional persistent texture is created
+    // (only via the "common version" texture-create branch, the only one observed to fire for this game
+    // build) sized to match what the LGUI FRenderTarget redirect call site actually wants, instead of
+    // handing it the intentionally-wider ui_target. Default OFF until validated in-headset.
+    bool is_lgui_shadow_ui_texture_enabled() const {
+        return m_enable_lgui_shadow_ui_texture->value();
+    }
+
+    // EXPERIMENT: when a brand-new a3 key is added to the LGUI shadow-copy pool (lgui_copy_pool) -
+    // i.e. the pool grows this frame, which reliably correlates with a new UI element/menu/submenu
+    // appearing - force-clear the ENTIRE pool (and its quarantine) instead of just adding the new
+    // entry. This throws away every existing shadow-copy slot so all currently-visible LGUI content
+    // is forced to re-acquire a fresh shadow copy on its very next redirect call, on the theory that
+    // stale/mismatched slots left over from a previous UI state are what causes new UI (e.g. opening
+    // a menu) to intermittently fail to redirect correctly. Default OFF; this is a blunt, easy-to-try
+    // A/B test, not a targeted fix - clearing the whole pool is wasteful if only one entry was
+    // actually stale, and could itself cause a brief visual hiccup for content whose copy was still
+    // legitimately in use.
+    bool is_lgui_clear_pool_on_new_a3_enabled() const {
+        return m_enable_lgui_clear_pool_on_new_a3->value();
+    }
+
+    // EXPERIMENT: the a2 ref scan in FFakeStereoRenderingHook.cpp currently walks EVERY 8-byte slot from
+    // offset 0x0 to 0x3d0 (~122 slots) and patches any slot whose raw value happens to equal the a3 pointer.
+    // Ground-truth layout comments in that file identify only THREE offsets (0x270/0x348/0x3a0) as what
+    // LGUI's Execute pass actually dereferences to find its render target - the rest of the range is scanned
+    // "just in case" a match shows up there too. During a submenu/nested-popup churn burst, addresses get
+    // freed and reused fast enough that an unrelated a2 field can transiently hold the same bit pattern as a
+    // stale/reused a3 value, causing the blind scan to patch a field that was never actually a render-target
+    // reference. When enabled, restrict the scan/patch to exactly the three known-good offsets instead of the
+    // whole 0x0-0x3d0 range, eliminating accidental value collisions with unrelated fields entirely (as
+    // opposed to trying to validate matches after the fact, which proved unreliable). Default OFF so it can
+    // be A/B tested against the existing full-range scan.
+    bool is_lgui_restrict_ref_scan_to_known_offsets_enabled() const {
+        return m_enable_lgui_restrict_ref_scan_to_known_offsets->value();
+    }
+
+    // DIAG/EXPERIMENT: alternative keying strategy for the a3 shadow-copy pool in FFakeStereoRenderingHook.cpp.
+    // The existing pool is keyed by the a3 pointer itself - a transient per-frame FRDGTexture WRAPPER object that
+    // Unreal's RDG allocator recreates at a new address every single frame (confirmed by [LGUI_A3_CHURN]: hundreds
+    // of distinct a3 addresses per session). Every one of those must be individually allocated, tracked, aged out
+    // (LGUI_COPY_STALE_FRAMES), and quarantined (LGUI_COPY_QUARANTINE_FRAMES) - and the well-known submenu/nested-
+    // popup crashes have all been variations of that bookkeeping racing against the real RDG execute timing, or
+    // racing against the engine reusing a freed a3 ADDRESS for a new, unrelated object before our quarantine window
+    // closes (see repeated "[LGUI_A3_LIFECYCLE] address REUSE" warnings).
+    // [LGUI_RHI_STABILITY] already proves the underlying GPU-backed RHI resource each a3 wraps (a3+RDG_RESOURCE_RHI_OFF)
+    // is drawn from a small, STABLE set (typically 2-8 distinct resources, matching eyes/menu layers, with high
+    // reuse counts) - i.e. the wrapper churns constantly but the real resource does not. Keying the shadow-copy
+    // pool by that stable RHI pointer instead of the transient a3 wrapper pointer means a slot is only created once
+    // per real GPU resource (not once per frame), never aged out by a frame-count guess, and never subject to a3-
+    // address-reuse confusion, because we never look at the a3 address for identity - only for redirecting THIS
+    // call's reference into the resource-keyed slot. Default OFF (old a3-keyed pool active); turn ON to A/B test
+    // this against the existing pool for the submenu-crash reproduction case.
+    bool is_lgui_rhi_keyed_copy_pool_enabled() const {
+        return m_enable_lgui_rhi_keyed_copy_pool->value();
+    }
+
     // DIAG: A/B test to determine whether the runtime's own depth-based compositor reprojection
     // (submitted via XR_KHR_composition_layer_depth, see OpenXR::end_frame) is responsible for a
     // transient double-image/ghosting artifact seen only in-headset (not in screenshots) during
@@ -1687,6 +1792,28 @@ private:
     // DIAG: see is_lgui_uaf_store_recovery_disabled(). Default ON (recovery active) to match the
     // legacy behavior that was stable in most sessions before the "let it crash" alternative existed.
     const ModToggle::Ptr m_disable_lgui_uaf_store_recovery{ ModToggle::create(generate_name("DisableLGUIUafStoreRecovery"), false) };
+    // DIAG: see is_lgui_uaf_load_store_guard_disabled(). Default OFF (guard active); toggle ON to A/B
+    // test whether this guard is the cause of a reported black/no-visual left eye + menu crash.
+    const ModToggle::Ptr m_disable_lgui_uaf_load_store_guard{ ModToggle::create(generate_name("DisableLGUIUafLoadStoreGuard"), false) };
+    // DIAG: see is_lgui_uaf_float_guard_disabled(). Default OFF (guard active); toggle ON to A/B test
+    // whether recovering faults on plausible-float base registers unconditionally (old behavior) is
+    // actually needed, or whether skipping the recovery for those fixes a black-eye regression.
+    const ModToggle::Ptr m_disable_lgui_uaf_float_guard{ ModToggle::create(generate_name("DisableLGUIUafFloatGuard"), false) };
+    // DIAG/EXPERIMENT: see is_lgui_frt_redirect_disabled(). Default ON (redirect DISABLED). The redirect now
+    // returns the render-target-manager's persistent ui_target member (not a pointer tied to a3's transient
+    // lifetime, which caused the earlier DXGI_ERROR_DEVICE_REMOVED crashes), gated the same way as the
+    // proven-safe AHUD-compatibility viewport hook. Toggle OFF to enable this redirect (skips the a3
+    // shadow-copy pool for this call path while active).
+    const ModToggle::Ptr m_disable_lgui_frt_redirect{ ModToggle::create(generate_name("DisableLGUIFrtRedirect"), true) };
+    // EXPERIMENT: see is_lgui_shadow_ui_texture_enabled(). Default OFF.
+    const ModToggle::Ptr m_enable_lgui_shadow_ui_texture{ ModToggle::create(generate_name("EnableLGUIShadowUiTexture"), false) };
+    // EXPERIMENT: see is_lgui_clear_pool_on_new_a3_enabled(). Default OFF.
+    const ModToggle::Ptr m_enable_lgui_clear_pool_on_new_a3{ ModToggle::create(generate_name("EnableLGUIClearPoolOnNewA3"), false) };
+    // EXPERIMENT: see is_lgui_restrict_ref_scan_to_known_offsets_enabled(). Default OFF.
+    const ModToggle::Ptr m_enable_lgui_restrict_ref_scan_to_known_offsets{ ModToggle::create(generate_name("EnableLGUIRestrictRefScanToKnownOffsets"), false) };
+    // DIAG/EXPERIMENT: see is_lgui_rhi_keyed_copy_pool_enabled(). Default OFF (old a3-pointer-keyed shadow-copy
+    // pool active); toggle ON to switch to keying shadow-copy slots by the stable underlying RHI resource instead.
+    const ModToggle::Ptr m_enable_lgui_rhi_keyed_copy_pool{ ModToggle::create(generate_name("EnableLGUIRhiKeyedCopyPool"), false) };
     // DIAG: see is_depth_submission_disabled().
     const ModToggle::Ptr m_disable_depth_submission{ ModToggle::create(generate_name("DisableDepthSubmission"), false) };
     const ModToggle::Ptr m_native_stereo_fix{ ModToggle::create(generate_name("NativeStereoFix"), false) };

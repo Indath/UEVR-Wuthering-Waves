@@ -779,6 +779,55 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
 
     const auto frame_count = vr->m_render_frame_count;
 
+    // EXPERIMENT: when the LGUI shadow UI texture redirect is enabled, LGUI now paints into a
+    // separate, size-matched persistent texture (shadow_target) instead of ui_target, because
+    // ui_target's larger NSF-fit size is incompatible with the FRenderTarget redirect (see
+    // lgui_frt_get_render_target_texture_hook / LGUI_FRT_DIAG size-mismatch logs). The world-space
+    // quad compositor (slate_draw_window_render_thread) still only reads ui_target, so blit
+    // shadow_target back into the top-left of ui_target here, every frame, before anything else
+    // in this function reads/composites ui_target. This mirrors the existing top-left crop-copy
+    // pattern used elsewhere in this file (see the ui_draw_extent-based D3D12_BOX crop below).
+    if (VR::get()->is_lgui_shadow_ui_texture_enabled() && ui_target != nullptr) {
+        auto& rtm = *ffsr->get_render_target_manager();
+        auto shadow_target = rtm.get_lgui_shadow_ui_target();
+
+        if (shadow_target != nullptr && !IsBadReadPtr(shadow_target, 0x60)) {
+            const auto native_ui = (ID3D12Resource*)ui_target->get_native_resource();
+            const auto native_shadow = (ID3D12Resource*)shadow_target->get_native_resource();
+
+            if (native_ui != nullptr && native_shadow != nullptr) {
+                const auto ui_desc = native_ui->GetDesc();
+                const auto shadow_w = rtm.lgui_shadow_ui_width;
+                const auto shadow_h = rtm.lgui_shadow_ui_height;
+
+                if (shadow_w > 0 && shadow_h > 0 &&
+                    (UINT)shadow_w <= ui_desc.Width && (UINT)shadow_h <= ui_desc.Height)
+                {
+                    D3D12_BOX shadow_box{};
+                    shadow_box.left = 0;
+                    shadow_box.top = 0;
+                    shadow_box.front = 0;
+                    shadow_box.right = (UINT)shadow_w;
+                    shadow_box.bottom = (UINT)shadow_h;
+                    shadow_box.back = 1;
+
+                    auto& command_ctx = m_generic_commands[frame_count % m_generic_commands.size()];
+                    command_ctx.wait(INFINITE);
+                    command_ctx.copy_region(native_shadow, native_ui, &shadow_box,
+                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+                    command_ctx.execute();
+
+                    SPDLOG_INFO_EVERY_N_SEC(2, "[LGUI_SHADOW_BLIT] copied shadow_target={:x} ({}x{}) into ui_target={:x} top-left",
+                        (uintptr_t)shadow_target, shadow_w, shadow_h, (uintptr_t)ui_target);
+                } else {
+                    SPDLOG_INFO_EVERY_N_SEC(2, "[LGUI_SHADOW_BLIT] skipping blit: shadow size {}x{} incompatible with ui_target {}x{}",
+                        shadow_w, shadow_h, ui_desc.Width, ui_desc.Height);
+                }
+            }
+        }
+    }
+
     if (m_game_tex.texture.Get() == nullptr && backbuffer.Get() == real_backbuffer.Get()) {
         spdlog::info("[VR] Setting up game texture as copy of backbuffer");
         

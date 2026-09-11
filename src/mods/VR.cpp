@@ -2807,9 +2807,33 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
             if (ImGui::IsItemHovered()) {
                 ImGui::SetTooltip("Skips spawning the scene-capture actor entirely. The right eye is\njust a flat mirror of the left/game view (no stereoscopic depth).\nUse this as a stable fallback if the scene capture is causing\nstuck loading screens during level transitions, or if an eye ever\nbreaks/goes black due to future code changes. See the Debug tab's\n'NS Double Vision Diagnostics' section for the auto-mirror triggers\n(cutscene/UI-blank/motion) and other double-vision investigation toggles.");
             }
-            m_native_stereo_fix_tall_ui->draw("Fit UI To Full Canvas (Fix Bottom Cutoff)");
-            if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip("With Native Stereo Fix on, LGUI lays its UI canvas out at the per-eye view\nrect height, which is taller than the scene render target, so the bottom of\nthe UI is clipped. This grows the UI render target to the full canvas height\nso the whole UI is captured, then presents it cropped/stretched back to 16:9.\nOnly applies while Native Stereo Fix is active - in AFR / NSF Off the canvas\nis not tall, so growing the target would distort the UI. Requires a texture\nrecreation (toggle NSF off/on or reload) to take effect.");
+            ImGui::SetNextItemOpen(true, ImGuiCond_::ImGuiCond_Once);
+            if (ImGui::TreeNode("UI Fixes for Shadow LGUI")) {
+                m_native_stereo_fix_tall_ui->draw("Fit UI To Full Canvas (Fix Bottom Cutoff)");
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("With Native Stereo Fix on, LGUI lays its UI canvas out at the per-eye view\nrect height, which is taller than the scene render target, so the bottom of\nthe UI is clipped. This grows the UI render target to the full canvas height\nso the whole UI is captured, then presents it cropped/stretched back to 16:9.\nOnly applies while Native Stereo Fix is active - in AFR / NSF Off the canvas\nis not tall, so growing the target would distort the UI. Requires a texture\nrecreation (toggle NSF off/on or reload) to take effect.");
+                }
+
+                m_disable_lgui_ui_redirect->draw("Disable LGUI UI Redirect (Shadow-Copy Pool Off)");
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("Skips submitting the redirected LGUI UI texture to the compositor every frame\n"
+                                       "(wait/acquire/copy/clear/draw on the UI swapchain), without changing how the\n"
+                                       "game itself renders its UI. Use this to A/B test whether the UI redirect submission\n"
+                                       "is contributing to a visual/perf issue, at the cost of falling back to the\n"
+                                       "original HMD-attached UI behavior.");
+                }
+
+                m_enable_lgui_restrict_ref_scan_to_known_offsets->draw("Restrict LGUI Ref Patch To Known-Good Offsets (Submenu Crash Fix)");
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("The a2 ref scan normally checks EVERY 8-byte slot from 0x0 to 0x3d0 and patches any\n"
+                                       "slot whose raw value equals the a3 pointer, even though only offsets 0x270/0x348/0x3a0\n"
+                                       "are actually dereferenced by LGUI's Execute pass. During submenu/nested-popup churn, a\n"
+                                       "freed and reused address can make an unrelated a2 field collide with a stale/reused a3\n"
+                                       "value, causing the blind scan to patch a field that was never a real render-target\n"
+                                       "reference - a confirmed cause of submenu crashes. When enabled, only the three\n"
+                                       "known-good offsets are checked/patched, removing that collision risk entirely.");
+                }
+                ImGui::TreePop();
             }
             m_native_stereo_fix_allow_with_afr->draw("Allow While Using AFR/Synchronized Sequential");
             if (ImGui::IsItemHovered()) {
@@ -3043,15 +3067,6 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
             m_fake_stereo_hook->on_draw_ui();
         }
 
-        m_disable_lgui_ui_redirect->draw("DIAG: Disable LGUI UI Redirect (perf A/B test)");
-        if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("Skips submitting the redirected LGUI UI texture to the compositor every frame\n"
-                               "(wait/acquire/copy/clear/draw on the UI swapchain), without changing how the\n"
-                               "game itself renders its UI. Use this to A/B test whether the UI redirect submission\n"
-                               "is responsible for a GPU utilization / FPS drop, without needing an external Lua script.\n"
-                               "The in-VR UI quad will go blank/stale while this is enabled.");
-        }
-
         m_disable_lgui_uaf_store_recovery->draw("DIAG: Disable LGUI UAF Store Recovery (crash-fast vs. hang-avoidance)");
         if (ImGui::IsItemHovered()) {
             ImGui::SetTooltip("Controls how the generalized game-exe UAF exception handler reacts to a WRITE\n"
@@ -3063,6 +3078,93 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
                                "specific repro than risk the skipped write later causing a permanent hang\n"
                                "(observed in one session: the write turned out to be load-bearing for\n"
                                "game-thread progress, and skipping it stalled forever instead of crashing).");
+        }
+
+        m_disable_lgui_uaf_load_store_guard->draw("DIAG: Disable LGUI UAF Load-Store Guard (A/B test for black eye)");
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Controls the forward-store-skip guard added to the generalized game-exe MOV/MOVZX\n"
+                               "load-recovery path. After forcing a stale/freed load result to 0, that guard scans\n"
+                               "a short window forward and skips a downstream store that uses a register tainted\n"
+                               "by the zeroed value, to prevent a follow-on write access violation. OFF (default)\n"
+                               "keeps the guard active. Turn this ON to fully disable it (only the load is zeroed;\n"
+                               "any follow-on store through the derived value is allowed to fault normally) - use\n"
+                               "this to A/B test whether the guard itself is responsible for a black/no-visual\n"
+                               "left eye or a related crash, since skipping the wrong store could leave engine\n"
+                               "state (e.g. a view/eye index or render target selector) incorrectly zeroed.");
+        }
+
+        m_disable_lgui_uaf_float_guard->draw("DIAG: Disable LGUI UAF Float Guard (A/B test for black eye)");
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Controls a guard in the generalized game-exe MOV/MOVZX load-recovery path that\n"
+                               "checks whether the faulting base register's raw bits reinterpret as a plausible\n"
+                               "small float (e.g. observed: 0xbf800000 == -1.0f, a typical per-eye scale/sign\n"
+                               "constant) rather than garbage/pointer-like bits. OFF (default) keeps the guard\n"
+                               "active: when the base register looks like a plausible float, the zero-forcing\n"
+                               "recovery is skipped and the fault is allowed to propagate instead, since forcing\n"
+                               "a real scale constant to 0 could corrupt eye/view state without ever being a\n"
+                               "true use-after-free. Turn this ON to fully disable the guard and always force the\n"
+                               "load result to 0 regardless of what the base register's bits look like (the old,\n"
+                               "unconditional behavior) - use this to A/B test whether this guard is what's\n"
+                               "needed to fix a black/no-visual left eye, or whether it's unrelated.");
+        }
+
+        m_disable_lgui_frt_redirect->draw("EXPERIMENT: Disable LGUI FRenderTarget Redirect (uncheck to enable UI redirect via ui_target)");
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("This hooks the shared FRenderTarget::GetRenderTargetTexture() vtable\n"
+                               "slot to redirect LGUI's render target to ui_target as an alternative to the a3\n"
+                               "shadow-copy/quarantine pool. Two earlier attempts caused DXGI_ERROR_DEVICE_REMOVED\n"
+                               "crashes because they returned pointers tied to a3's transient per-frame RDG\n"
+                               "lifetime. This version instead returns the address of the render-target-manager's\n"
+                               "own persistent ui_target member (mirroring the already-working AHUD compatibility\n"
+                               "viewport hook), guarded against dangling/freed pointers, so there is no per-frame\n"
+                               "lifetime race. Default: DISABLED (checked) - uncheck this box to enable the\n"
+                               "redirect. When enabled, the a3 shadow-copy pool below is skipped entirely for\n"
+                               "this call path (see is_lgui_frt_redirect_disabled() gating).");
+        }
+
+        m_enable_lgui_shadow_ui_texture->draw("EXPERIMENT: LGUI Shadow UI Texture (size-matched, for use with FRT Redirect)");
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("[LGUI_FRT_DIAG] proved ui_target is intentionally wider than what the FRT\n"
+                               "redirect call site actually wants (e.g. ui_target 3840x3193 vs wanted 2699x3193),\n"
+                               "which caused DXGI_ERROR_DEVICE_REMOVED when redirecting straight to ui_target.\n"
+                               "Enabling this creates a SECOND persistent texture at the exact size the redirect\n"
+                               "wants, alongside ui_target (not replacing it), and the redirect will only use it\n"
+                               "once its cached size matches - otherwise it safely falls back to the original\n"
+                               "unredirected result. Requires the FRT redirect above to be enabled (unchecked).\n"
+                               "Default: OFF - test with the FRT redirect enabled to validate this fixes the\n"
+                               "device-removed crash instead of abandoning the redirect approach.");
+        }
+
+        m_enable_lgui_clear_pool_on_new_a3->draw("EXPERIMENT: Clear LGUI Shadow-Copy Pool When New UI Element Appears");
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("QUICK FIX ATTEMPT for stale/racing shadow-copy slots when a menu/submenu opens.\n"
+                               "The a3 shadow-copy pool (lgui_copy_pool) normally only ADDS a new slot when a\n"
+                               "brand-new a3 pointer appears, leaving all existing slots untouched. When this is\n"
+                               "enabled, that same 'pool grew this frame' event instead force-clears the ENTIRE\n"
+                               "pool (and its quarantine list) first, so every currently-visible piece of LGUI\n"
+                               "content is forced to re-acquire a fresh shadow copy on its very next redirect\n"
+                               "call. This is a blunt A/B test, not a targeted fix: it may cause a brief visual\n"
+                               "hiccup for content whose existing copy was still legitimately in use. Default: OFF.");
+        }
+
+        m_enable_lgui_rhi_keyed_copy_pool->draw("EXPERIMENT: LGUI Shadow-Copy Pool Keyed By Stable RHI Resource");
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("The a3 shadow-copy pool normally keys its slots by the a3 pointer itself - a\n"
+                               "transient per-frame FRDGTexture WRAPPER that Unreal's RDG allocator recreates at a\n"
+                               "new address every frame ([LGUI_A3_CHURN] logs hundreds of distinct a3 addresses per\n"
+                               "session). Every submenu/nested-popup crash traced so far has been a variation of\n"
+                               "that per-wrapper bookkeeping (aging out slots, quarantining them, or the engine\n"
+                               "reusing a freed a3 address for something else - see \"[LGUI_A3_LIFECYCLE] address\n"
+                               "REUSE\") racing against real RDG execute timing.\n"
+                               "[LGUI_RHI_STABILITY] already shows the underlying GPU resource each a3 wraps is\n"
+                               "drawn from a small, STABLE set (usually 2-8 resources, matching eyes/menu layers,\n"
+                               "with high reuse) - only the wrapper churns, not the real resource. This experiment\n"
+                               "keys the shadow-copy pool by that stable RHI resource pointer instead: a slot is\n"
+                               "only created once per real GPU resource, is never aged out by a frame-count guess,\n"
+                               "and is immune to a3-address-reuse confusion since a3's address is never used for\n"
+                               "identity, only to redirect the current call into the resource-keyed slot.\n"
+                               "Default OFF (old a3-keyed pool active). Turn ON to A/B test this against the\n"
+                               "existing pool, especially for reproducing the submenu crash.");
         }
 
         m_disable_depth_submission->draw("DIAG: Disable Depth Submission (compositor reprojection A/B test)");

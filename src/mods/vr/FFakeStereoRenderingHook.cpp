@@ -5,6 +5,8 @@
 #include <unordered_set>
 #include <array>
 #include <cmath>
+#include <d3d12.h>
+#include <wrl/client.h>
 
 #include <asmjit/asmjit.h>
 #include <future>
@@ -2423,6 +2425,156 @@ FRHITexture2D** FFakeStereoRenderingHook::viewport_get_render_target_texture_hoo
     return og(viewport);
 }
 
+// EXPERIMENT: higher-level alternative to the a3 RDG-texture shadow-copy/quarantine redirect (see
+// LGUI_PATCH_A3_REFS and lgui_copy_pool further below). Rather than duplicating the per-frame transient a3
+// object (which requires the whole shadow-copy pool/quarantine machinery to track its lifetime), this hooks
+// the shared, class-level FRenderTarget::GetRenderTargetTexture() vtable slot directly - the same slot
+// resolved by sdk::FRenderTarget::update_offsets()/get_render_target_texture_index() - and redirects it to
+// ui_target purely based on the caller's return address, mirroring the retaddr-classification approach
+// already proven out by viewport_get_render_target_texture_hook above. Because the vtable slot is shared by
+// every FRenderTarget instance rather than being a per-frame allocation, there is no object lifetime to
+// track here: we either hand back ui_target or call straight through to the real function.
+// Gated by VR::is_lgui_frt_redirect_disabled() so it can be A/B tested against the a3 shadow-copy pool.
+//
+// SIZE-KEYED SHADOW TEXTURE (narrow experiment): ui_target is proven (via [LGUI_FRT_DIAG]) to be
+// intentionally wider than what this call site actually wants (e.g. ui_target 3840x3193 vs original
+// 2699x3193), because ui_target is sized to fit the NSF tall-UI canvas, not this call site's per-eye
+// size. Redirecting to ui_target therefore hands RDG a texture of the wrong shape, which has been
+// observed to cause DXGI_ERROR_DEVICE_REMOVED shortly after. Instead of mutating/resizing the shared
+// ui_target (which other call sites depend on), pre_texture_hook_callback additionally creates a
+// second, independently-sized persistent texture (rtm->get_lgui_shadow_ui_target()) using the exact
+// original-result size recorded here. This hook records that size on every call (from the real,
+// unredirected result) and only redirects to the shadow texture once its cached size matches.
+static std::atomic<uint32_t> g_lgui_frt_wanted_width{0};
+static std::atomic<uint32_t> g_lgui_frt_wanted_height{0};
+
+FRHITexture2D** FFakeStereoRenderingHook::lgui_frt_get_render_target_texture_hook(sdk::FRenderTarget* frt) {
+    const auto retaddr = (uintptr_t)_ReturnAddress();
+
+    SPDLOG_INFO_ONCE("[EXPERIMENT] FRenderTarget::GetRenderTargetTexture called!");
+
+    using OriginalFn = FRHITexture2D** (*)(const sdk::FRenderTarget*);
+    const auto og = (OriginalFn)g_hook->m_lgui_frt_original_get_render_target_texture;
+
+    if (og == nullptr) {
+        SPDLOG_WARN_ONCE("[EXPERIMENT] lgui_frt_get_render_target_texture_hook: original function pointer is null!");
+        return nullptr;
+    }
+
+    const auto& vr = VR::get();
+
+    if (vr->is_lgui_frt_redirect_disabled() || !vr->is_hmd_active() || frt == nullptr) {
+        return og(frt);
+    }
+
+    auto& data = g_hook->m_lgui_frt_rt_hook_data;
+
+    {
+        std::scoped_lock _{data.retaddr_mutex};
+        utility::ScopeGuard guard{[&](){ data.seen_retaddrs.insert(retaddr); }};
+
+        if (data.call_original_retaddrs.contains(retaddr)) {
+            return og(frt);
+        }
+
+        // ALWAYS check the retaddr for ViewFamilyTexture first and never skip it, same rationale as
+        // viewport_get_render_target_texture_hook above: this is the actual scene render target and must
+        // never be redirected, or the whole scene composite (not just LGUI) would render into ui_target.
+        if (!data.seen_retaddrs.contains(retaddr)) {
+            SPDLOG_INFO("[EXPERIMENT] FRenderTarget::GetRenderTargetTexture called from {:x}", retaddr);
+
+            auto func_start = utility::find_function_start(retaddr);
+
+            if (!func_start) {
+                func_start = retaddr;
+            }
+
+            if (utility::find_string_reference_in_path(*func_start, L"ViewFamilyTexture", false) || utility::find_string_reference_in_path(*func_start, L"ViewFamilyTarget", false)) {
+                SPDLOG_INFO("[EXPERIMENT] Found view family texture reference @ {:x}", retaddr);
+                data.call_original_retaddrs.insert(retaddr);
+                return og(frt);
+            }
+
+            SPDLOG_INFO("[EXPERIMENT] Redirecting FRenderTarget::GetRenderTargetTexture call to UI render target @ {:x}", retaddr);
+            data.redirected_retaddrs.insert(retaddr);
+        } else if (!data.redirected_retaddrs.contains(retaddr)) {
+            // Seen before but never classified as either the view-family texture or a redirect target
+            // (e.g. the string-reference scan failed to resolve a function start) - be conservative and
+            // fall back to the original rather than guessing.
+            return og(frt);
+        }
+    }
+
+    // RE-ENABLED: the two prior DXGI_ERROR_DEVICE_REMOVED crashes were both caused by handing RDG a pointer
+    // tied to a *transient* a3/RDG-texture object (the raw persistent-swap experiment and the thread_local
+    // snapshot experiment both still raced a3's lifetime). This call site is different: it mirrors the
+    // proven-safe viewport_get_render_target_texture_hook() pattern above (same retaddr classification,
+    // same guard), returning the address of the render-target-manager's own persistent ui_target member
+    // (rtm->get_ui_target()) rather than anything tied to a3's lifetime. ui_target is a long-lived UEVR-owned
+    // texture, not a per-frame RDG allocation, so there is no deferred-Execute race here as long as we only
+    // ever return it for retaddrs already classified above as redirect targets (never the ViewFamilyTexture
+    // call site, which must keep rendering the real scene).
+    const auto rtm = g_hook->get_render_target_manager();
+
+    if (rtm == nullptr) {
+        SPDLOG_WARN("[LGUI_FRT] render_target_manager is nullptr, falling back to original call for retaddr={:x}", retaddr);
+        return og(frt);
+    }
+
+    // SAFETY: this game is a UE 4.xx build with backported UE5 features (not a real UE5 engine), and
+    // ui_target is proven size-incompatible with this call site on this build (see [LGUI_FRT_DIAG]).
+    // Redirecting to ui_target directly caused an instant DXGI_ERROR_DEVICE_REMOVED crash. The redirect
+    // must NEVER fall back to ui_target here - only to the size-matched shadow texture below, or to the
+    // real/original result. If the shadow-texture experiment is disabled, bail out immediately so this
+    // never accidentally redirects anywhere: same behavior as the redirect being fully disabled.
+    if (!VR::get()->is_lgui_shadow_ui_texture_enabled()) {
+        return og(frt);
+    }
+
+    auto& shadow_target = rtm->get_lgui_shadow_ui_target();
+
+    // Always resolve the real, unredirected result first: it both tells us what size this call site
+    // actually wants (recorded below so pre_texture_hook_callback can create a matching shadow texture)
+    // and is our safe fallback whenever the shadow texture isn't ready yet.
+    const auto orig_result = og(frt);
+    const auto orig_tex = (orig_result != nullptr) ? *orig_result : nullptr;
+
+    uint32_t orig_width = 0;
+    uint32_t orig_height = 0;
+
+    if (orig_tex != nullptr && !IsBadReadPtr(orig_tex, 0x60)) {
+        const auto native = (ID3D12Resource*)orig_tex->get_native_resource();
+
+        if (native != nullptr) {
+            const auto desc = native->GetDesc();
+            orig_width = (uint32_t)desc.Width;
+            orig_height = (uint32_t)desc.Height;
+
+            g_lgui_frt_wanted_width.store(orig_width, std::memory_order_relaxed);
+            g_lgui_frt_wanted_height.store(orig_height, std::memory_order_relaxed);
+        }
+    }
+
+    // Prefer the size-keyed shadow texture (created by pre_texture_hook_callback specifically at
+    // orig_width x orig_height) over ui_target, since ui_target is intentionally wider (NSF-fit) and
+    // was proven via [LGUI_FRT_DIAG] to mismatch this call site, causing DXGI_ERROR_DEVICE_REMOVED.
+    if (shadow_target != nullptr && !IsBadReadPtr(shadow_target, 0x60) &&
+        orig_width != 0 && orig_height != 0 &&
+        rtm->lgui_shadow_ui_width == orig_width && rtm->lgui_shadow_ui_height == orig_height)
+    {
+        SPDLOG_INFO_EVERY_N_SEC(2, "[LGUI_FRT] redirecting retaddr={:x} to shadow_target={:x} ({}x{})",
+            retaddr, (uintptr_t)shadow_target, orig_width, orig_height);
+        return &shadow_target;
+    }
+
+    SPDLOG_INFO_EVERY_N_SEC(2, "[LGUI_FRT] shadow_target not ready/size-mismatched (shadow={:x} shadow_size={}x{} "
+                                "wanted={}x{}) for retaddr={:x}, falling back to original",
+        (uintptr_t)shadow_target, rtm->lgui_shadow_ui_width, rtm->lgui_shadow_ui_height,
+        orig_width, orig_height, retaddr);
+
+    return orig_result;
+}
+
 // OPTION B (UI canvas fit): LGUI lays its UI canvas out in pixel space at the game-thread FViewport::GetSizeXY size
 // (per-eye hmd_w x hmd_h with NSF, e.g. 2699x3193) and paints it top-left into the fixed 3840x2160 ui_target. When the
 // per-eye height (3193) exceeds the target height (2160), the bottom of the UI is clipped - this is the NSF-ON bottom
@@ -3954,6 +4106,48 @@ static std::atomic<uint32_t> g_lgui_redirect_count_this_frame_diag{0};
 static std::atomic<uint32_t> g_lgui_shadow_pool_size_diag{0};
 static std::atomic<uint64_t> g_lgui_total_redirect_calls{0};
 
+// SHADOW-COPY QUARANTINE DIAGNOSTICS: counters that let us tell, from the log alone, whether the
+// identity-validation + delayed-free fix for the a3 shadow-copy pool is (a) actually engaging, and
+// (b) preventing a real UAF that would otherwise have happened. See lgui_copy_pool/lgui_copy_quarantine
+// near LGUI_PATCH_A3_REFS below.
+static std::atomic<uint64_t> g_lgui_identity_mismatch_count{0}; // times a pool slot was found to hold a different object than expected
+static std::atomic<uint64_t> g_lgui_quarantine_size_diag{0}; // current quarantine list size, updated every sweep
+static std::atomic<uint64_t> g_lgui_quarantine_freed_count{0}; // total quarantine entries actually freed (grace period elapsed)
+static std::atomic<uint64_t> g_lgui_quarantine_high_water{0}; // largest quarantine size ever observed
+// SAVE: records every currently-quarantined buffer's [begin, end) range + retirement frame/time so the
+// exception handler can check "did this fault land inside a buffer we already decided was stale?" - if
+// so, that is direct proof the quarantine window is too short (or the old immediate-free was the actual
+// crash cause and this confirms it), rather than a guess from timing alone.
+struct LguiQuarantineRangeDiag {
+    uintptr_t begin{0};
+    uintptr_t end{0};
+    uint64_t retire_frame{0};
+    uint64_t retire_time_us{0};
+};
+static std::mutex g_lgui_quarantine_ranges_mutex{};
+static std::vector<LguiQuarantineRangeDiag> g_lgui_quarantine_ranges{};
+
+// Called from the vectored exception handler with any faulting address. Returns a human-readable
+// description if the address falls inside a buffer we quarantined (already considered "done with" but
+// not yet freed), along with how long ago it was retired - this is the single most direct piece of
+// evidence available for "was this crash our shadow-copy buffer's lifetime, and if so was the grace
+// period long enough".
+static std::string lgui_quarantine_lookup(uintptr_t fault_addr, uint64_t current_frame) {
+    std::lock_guard<std::mutex> lock(g_lgui_quarantine_ranges_mutex);
+
+    for (const auto& r : g_lgui_quarantine_ranges) {
+        if (fault_addr >= r.begin && fault_addr < r.end) {
+            const auto now_us = (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+            return fmt::format("HIT inside quarantined LGUI shadow-copy buffer [{:x}-{:x}), retired {} frames / {}us ago",
+                r.begin, r.end, current_frame >= r.retire_frame ? current_frame - r.retire_frame : 0,
+                now_us >= r.retire_time_us ? now_us - r.retire_time_us : 0);
+        }
+    }
+
+    return "not inside any tracked quarantined LGUI shadow-copy buffer";
+}
+
 // ==== a3 ADDRESS-LIFECYCLE REGISTRY (crash-correlation diagnostic) ================================
 // Goal: turn "we think the crash is a stale/reused a3 pointer" from a guess into a fact. Every a3
 // pointer we ever redirect gets a permanent history entry (first-seen frame/time, last-seen frame/time,
@@ -4123,7 +4317,7 @@ static void lgui_note_new_a3_for_rate_tracking() {
     }
 }
 
-// ==== RHI RESOURCE STABILITY TRACKING (render-target instability diagnostic) ======================
+// ==== RHI RESOURCE STABILITY TRACKING
 // The a3 pointer (FRDGTexture wrapper) churning at hundreds of distinct addresses per session does NOT
 // by itself prove anything is wrong: Unreal's RDG system creates a fresh lightweight FRDGTexture wrapper
 // object EVERY FRAME even when it wraps the exact same underlying GPU resource (a pooled RHI texture) -
@@ -5111,6 +5305,10 @@ static void* lgui_slot24_hook(void* self, void* a2, void* a3, void* a4, void* a5
     }
 
     if (LGUI_PATCH_A3_REFS && !VR::get()->is_lgui_ui_redirect_disabled() &&
+        VR::get()->is_lgui_frt_redirect_disabled() && // EXPERIMENT: skip the a3 shadow-copy pool entirely when the
+                                                       // FRenderTarget-vtable redirect (see lgui_frt_redirect_hook)
+                                                       // is active; only fall back to this path when that
+                                                       // experimental redirect has been explicitly disabled.
         g_hook != nullptr && g_hook->get_render_target_manager() != nullptr &&
         a2 != nullptr && !IsBadReadPtr(a2, 0x1000) && a3 != nullptr && !IsBadReadPtr(a3, 0x200))
     {
@@ -5142,16 +5340,112 @@ static void* lgui_slot24_hook(void* self, void* a2, void* a3, void* a4, void* a5
                 struct LguiCopySlot {
                     std::unique_ptr<uint8_t[]> data;
                     uint64_t last_used_frame{0};
+                    uintptr_t identity_vtable{0}; // vtable ptr of the a3 object this slot was last filled from
+                };
+                // QUARANTINE: a slot pulled out of lgui_copy_pool because it looked stale/mismatched is not freed
+                // immediately - it is parked here for LGUI_COPY_QUARANTINE_FRAMES more frames before the
+                // unique_ptr is actually destroyed. This guards against a deferred RDG pass that is still going
+                // to read/write the buffer even after our idle/identity heuristics decided it was done with -
+                // freeing it immediately in that case is a real, self-inflicted UAF on our own heap allocation
+                // (matches crashes with no game-module rva and no crash popup, since the fault can land inside
+                // CRT/heap internals that our exception filter never even attributes to LGUI).
+                struct LguiCopyQuarantineEntry {
+                    std::unique_ptr<uint8_t[]> data;
+                    uint64_t retire_frame{0};
                 };
                 constexpr size_t COPY_SIZE = 0x200;
                 constexpr size_t COPY_STRIDE = 0x800;
                 constexpr uint64_t LGUI_COPY_STALE_FRAMES = 180; // ~3s at 60fps; generous vs. RDG's same/next-frame execute
+                constexpr uint64_t LGUI_COPY_QUARANTINE_FRAMES = 180; // additional grace period before actually freeing
                 static std::unordered_map<uintptr_t, LguiCopySlot> lgui_copy_pool{};
+                static std::vector<LguiCopyQuarantineEntry> lgui_copy_quarantine{};
                 static uint64_t lgui_copy_pool_last_sweep_frame = 0;
                 static size_t lgui_copy_pool_high_water = 0;
 
                 const auto a3_key = (uintptr_t)a3;
-                auto& slot_entry = lgui_copy_pool[a3_key]; // default-constructs (data == nullptr) on first use for this a3
+                const auto a3_vtable_now = *(uintptr_t*)a3;
+
+                // EXPERIMENT (see VR::is_lgui_rhi_keyed_copy_pool_enabled()): key the pool by the stable
+                // underlying RHI resource (a3+RDG_RESOURCE_RHI_OFF) instead of the transient a3 wrapper pointer
+                // when enabled. [LGUI_RHI_STABILITY] shows that underlying resource set is small and stable
+                // (2-8 entries, high reuse) versus the a3 wrapper churning at hundreds of distinct addresses per
+                // session - every submenu/nested-popup crash traced so far has been a variation of the a3-keyed
+                // pool's bookkeeping (aging/quarantine/address-reuse) racing real RDG execute timing. Keying by
+                // the stable resource means a slot is created once per real GPU resource and reused indefinitely
+                // for as long as that resource stays alive, with no frame-count eviction guess needed for it.
+                const bool rhi_keyed = VR::get()->is_lgui_rhi_keyed_copy_pool_enabled();
+                const auto rhi_ptr_now = *(uintptr_t*)((uintptr_t)a3 + RDG_RESOURCE_RHI_OFF);
+                const auto pool_key = (rhi_keyed && rhi_ptr_now != 0) ? rhi_ptr_now : a3_key;
+                auto pool_it = lgui_copy_pool.find(pool_key);
+
+                // IDENTITY VALIDATION: address-reuse (see [LGUI_A3_LIFECYCLE] REUSE warnings) means a pool hit on
+                // a3_key does not guarantee it is still the same logical object we last redirected at this
+                // address - the engine may have freed the old one and allocated something entirely different at
+                // the same address in the meantime. Compare the object's current vtable pointer against what we
+                // cached when we last filled this slot; a mismatch means "different object, same address", so
+                // treat it like a brand-new a3 (fresh slot) instead of reusing possibly-incompatible state. The
+                // old slot's buffer (if any) is quarantined rather than freed immediately in case something is
+                // still mid-flight against it.
+                // NOTE: this identity check is specific to the a3-wrapper-keyed mode - it detects a3's ADDRESS
+                // being reused for an unrelated object. When rhi_keyed, the key is the underlying GPU resource
+                // pointer itself (not a3), and a3's vtable naturally varies call to call (every a3 wrapper for
+                // the same resource is still a distinct RDG object) - it is not a useful identity signal there,
+                // so skip this check entirely in that mode; the RHI pointer itself is a strong enough identity
+                // (recreation of the actual GPU resource, not just a new wrapper, is exactly what should start a
+                // fresh slot, and that shows up as a new value of rhi_ptr_now / a new pool_key, not a vtable
+                // mismatch on an existing one).
+                if (!rhi_keyed && pool_it != lgui_copy_pool.end() && pool_it->second.data != nullptr &&
+                    pool_it->second.identity_vtable != 0 && pool_it->second.identity_vtable != a3_vtable_now) {
+                    const auto mismatch_total = g_lgui_identity_mismatch_count.fetch_add(1, std::memory_order_relaxed) + 1;
+                    SPDLOG_WARN("[LGUI_REDIRECT_STATS] [DIAG] a3={:x} identity mismatch #{} (vtable {:x} -> {:x}) - address reused by a "
+                                "different object, quarantining old shadow copy and starting a fresh slot",
+                        a3_key, mismatch_total, pool_it->second.identity_vtable, a3_vtable_now);
+                    // DIAG: track this buffer's [begin,end) range + retirement time so the exception handler can
+                    // report whether a later crash faulted inside it (see lgui_quarantine_lookup above).
+                    {
+                        const auto now_us = (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
+                            std::chrono::steady_clock::now().time_since_epoch()).count();
+                        const auto raw_ptr = (uintptr_t)pool_it->second.data.get();
+                        std::lock_guard<std::mutex> lock(g_lgui_quarantine_ranges_mutex);
+                        g_lgui_quarantine_ranges.push_back(LguiQuarantineRangeDiag{raw_ptr, raw_ptr + COPY_STRIDE, lgui_current_frame, now_us});
+                    }
+                    lgui_copy_quarantine.push_back(LguiCopyQuarantineEntry{std::move(pool_it->second.data), lgui_current_frame});
+                    lgui_copy_pool.erase(pool_it);
+                    pool_it = lgui_copy_pool.end();
+                }
+
+                // EXPERIMENT (see VR::is_lgui_clear_pool_on_new_a3_enabled()): a brand-new key about to be added to
+                // the pool (pool_it == end()) reliably correlates with new UI content appearing (menu/submenu open,
+                // new popup, etc.). Quick-fix attempt: instead of just adding the new slot alongside every existing
+                // one, force-clear the ENTIRE pool (moving all existing buffers into quarantine, never freeing them
+                // immediately - same safety rule as the periodic sweep below) so all currently-visible LGUI content
+                // is forced to re-acquire a fresh shadow copy on its very next redirect call. This is a blunt A/B
+                // test for whether stale/mismatched slots left over from a previous UI state are why newly-opened
+                // menus intermittently fail to redirect correctly - it is NOT a targeted fix, and clearing perfectly
+                // valid in-use slots can itself cause a brief visual hiccup.
+                if (pool_it == lgui_copy_pool.end() && !lgui_copy_pool.empty() && VR::get()->is_lgui_clear_pool_on_new_a3_enabled()) {
+                    SPDLOG_INFO("[LGUI_REDIRECT_STATS] [CLEAR_ON_NEW_A3] new key={:x} triggered full pool clear ({} entries -> quarantine, rhi_keyed={})",
+                        pool_key, lgui_copy_pool.size(), rhi_keyed);
+
+                    const auto now_us = (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch()).count();
+
+                    for (auto& [old_key, old_slot] : lgui_copy_pool) {
+                        if (old_slot.data != nullptr) {
+                            const auto raw_ptr = (uintptr_t)old_slot.data.get();
+                            {
+                                std::lock_guard<std::mutex> lock(g_lgui_quarantine_ranges_mutex);
+                                g_lgui_quarantine_ranges.push_back(LguiQuarantineRangeDiag{raw_ptr, raw_ptr + COPY_STRIDE, lgui_current_frame, now_us});
+                            }
+                            lgui_note_a3_reclaimed(old_key);
+                            lgui_copy_quarantine.push_back(LguiCopyQuarantineEntry{std::move(old_slot.data), lgui_current_frame});
+                        }
+                    }
+
+                    lgui_copy_pool.clear();
+                }
+
+                auto& slot_entry = lgui_copy_pool[pool_key]; // default-constructs (data == nullptr) on first use for this key
 
                 if (slot_entry.data == nullptr) {
                     slot_entry.data = std::make_unique<uint8_t[]>(COPY_STRIDE);
@@ -5170,11 +5464,12 @@ static void* lgui_slot24_hook(void* self, void* a2, void* a3, void* a4, void* a5
                         // still "in flight"). If this climbs unboundedly instead of settling, that itself is a
                         // signal something is failing to ever be recognized as stale (leak), which is exactly
                         // the kind of root cause we want visible before it manifests as an OOM/crash.
-                        SPDLOG_INFO("[LGUI_REDIRECT_STATS] shadow-copy pool grew to {} live entries (a3={:x})", lgui_copy_pool.size(), a3_key);
+                        SPDLOG_INFO("[LGUI_REDIRECT_STATS] shadow-copy pool grew to {} live entries (key={:x}, rhi_keyed={})", lgui_copy_pool.size(), pool_key, rhi_keyed);
                     }
                 }
 
                 slot_entry.last_used_frame = lgui_current_frame;
+                slot_entry.identity_vtable = a3_vtable_now;
 
                 // Periodic sweep (not every call) to reclaim entries that have gone stale, i.e. their a3 pointer
                 // has not been redirected again in a long time. This is intentionally conservative: RDG passes
@@ -5182,18 +5477,87 @@ static void* lgui_slot24_hook(void* self, void* a2, void* a3, void* a4, void* a5
                 // LGUI_COPY_STALE_FRAMES frames is certainly done, and we log every reclaim so a future
                 // regression that needs an even longer window is immediately visible in the log instead of
                 // silently causing a new UAF.
+                //
+                // Reclaimed buffers are moved into quarantine (see above) instead of being destroyed here, and
+                // the quarantine itself is swept on the same cadence, actually freeing entries only once they
+                // have sat unused for LGUI_COPY_QUARANTINE_FRAMES more frames on top of the stale window they
+                // already served.
+                // NOTE: the "RHI-keyed pool stays small/stable (2-8 entries)" assumption above only held for the
+                // main menu. Submenu/nested-panel content (per-item icons, nested list panels, etc.) allocates
+                // genuinely distinct underlying RHI resources just as fast as a3 wrappers churn - confirmed live
+                // via [LGUI_REDIRECT_STATS] showing unbounded growth (100+ live entries and climbing) while
+                // rhi_keyed=true during submenu navigation. Extending the stale window 20x in that state let the
+                // pool grow essentially without bound instead of reclaiming dead slots, which is the most likely
+                // cause of the submenu access violation. Use the same aggressive eviction window regardless of
+                // keying mode until pool growth is independently verified to be bounded again.
+                const auto stale_frames_threshold = LGUI_COPY_STALE_FRAMES;
                 if (lgui_current_frame != lgui_copy_pool_last_sweep_frame) {
                     lgui_copy_pool_last_sweep_frame = lgui_current_frame;
 
                     for (auto it = lgui_copy_pool.begin(); it != lgui_copy_pool.end();) {
-                        if (lgui_current_frame - it->second.last_used_frame > LGUI_COPY_STALE_FRAMES) {
-                            SPDLOG_INFO("[LGUI_REDIRECT_STATS] reclaiming stale shadow copy for a3={:x} (idle {} frames, pool size {} -> {})",
-                                it->first, lgui_current_frame - it->second.last_used_frame, lgui_copy_pool.size(), lgui_copy_pool.size() - 1);
+                        if (lgui_current_frame - it->second.last_used_frame > stale_frames_threshold) {
+                            SPDLOG_INFO("[LGUI_REDIRECT_STATS] reclaiming stale shadow copy for key={:x} (idle {} frames, pool size {} -> {}, "
+                                        "quarantined for {} more frames, rhi_keyed={})",
+                                it->first, lgui_current_frame - it->second.last_used_frame, lgui_copy_pool.size(), lgui_copy_pool.size() - 1,
+                                LGUI_COPY_QUARANTINE_FRAMES, rhi_keyed);
                             lgui_note_a3_reclaimed(it->first);
+                            // DIAG: track range so a fault landing here later is directly attributable.
+                            {
+                                const auto now_us = (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
+                                    std::chrono::steady_clock::now().time_since_epoch()).count();
+                                const auto raw_ptr = (uintptr_t)it->second.data.get();
+                                std::lock_guard<std::mutex> lock(g_lgui_quarantine_ranges_mutex);
+                                g_lgui_quarantine_ranges.push_back(LguiQuarantineRangeDiag{raw_ptr, raw_ptr + COPY_STRIDE, lgui_current_frame, now_us});
+                            }
+                            lgui_copy_quarantine.push_back(LguiCopyQuarantineEntry{std::move(it->second.data), lgui_current_frame});
                             it = lgui_copy_pool.erase(it);
                         } else {
                             ++it;
                         }
+
+                    }
+
+                    // Sweep the quarantine list itself: only truly free (drop the unique_ptr) once an entry has
+                    // waited out its full grace period since being retired.
+                    for (auto qit = lgui_copy_quarantine.begin(); qit != lgui_copy_quarantine.end();) {
+                        if (lgui_current_frame - qit->retire_frame > LGUI_COPY_QUARANTINE_FRAMES) {
+                            // DIAG: the buffer is about to actually be freed - drop its tracked range at the same
+                            // time so lgui_quarantine_lookup doesn't report stale hits against freed-and-reused
+                            // memory, and bump the freed counter so [LGUI_REDIRECT_STATS] periodic summaries (see
+                            // below) can show "N quarantine entries freed so far" without needing per-event logs.
+                            {
+                                const auto raw_ptr = (uintptr_t)qit->data.get();
+                                std::lock_guard<std::mutex> lock(g_lgui_quarantine_ranges_mutex);
+                                g_lgui_quarantine_ranges.erase(
+                                    std::remove_if(g_lgui_quarantine_ranges.begin(), g_lgui_quarantine_ranges.end(),
+                                        [raw_ptr](const LguiQuarantineRangeDiag& r) { return r.begin == raw_ptr; }),
+                                    g_lgui_quarantine_ranges.end());
+                            }
+                            g_lgui_quarantine_freed_count.fetch_add(1, std::memory_order_relaxed);
+                            qit = lgui_copy_quarantine.erase(qit);
+                        } else {
+                            ++qit;
+                        }
+                    }
+
+                    // DIAG: periodic summary of quarantine health, throttled to once per ~5s (300 frames @60fps)
+                    // so this is visible in every log without spamming per-frame. If quarantine size grows
+                    // unboundedly, entries aren't being freed (leak / logic bug); if it stays near 0, either the
+                    // fix rarely engages (identity mismatches / reclaims are rare) or it's working as intended -
+                    // cross-reference against g_lgui_identity_mismatch_count and reclaim log lines to tell which.
+                    static uint64_t s_lgui_quarantine_diag_last_frame = 0;
+                    if (lgui_current_frame - s_lgui_quarantine_diag_last_frame >= 300) {
+                        s_lgui_quarantine_diag_last_frame = lgui_current_frame;
+                        const auto qsize = lgui_copy_quarantine.size();
+                        g_lgui_quarantine_size_diag.store(qsize, std::memory_order_relaxed);
+                        if (qsize > g_lgui_quarantine_high_water.load(std::memory_order_relaxed)) {
+                            g_lgui_quarantine_high_water.store(qsize, std::memory_order_relaxed);
+                        }
+                        SPDLOG_INFO("[LGUI_REDIRECT_STATS] [DIAG] quarantine health: size={} high_water={} freed_total={} "
+                                    "identity_mismatches_total={} pool_size={}",
+                            qsize, g_lgui_quarantine_high_water.load(std::memory_order_relaxed),
+                            g_lgui_quarantine_freed_count.load(std::memory_order_relaxed),
+                            g_lgui_identity_mismatch_count.load(std::memory_order_relaxed), lgui_copy_pool.size());
                     }
                 }
 
@@ -5344,17 +5708,41 @@ static void* lgui_slot24_hook(void* self, void* a2, void* a3, void* a4, void* a5
                 // every 8-byte slot (thousands of costly checks per UI draw) - a confirmed steady-state lag source on
                 // the render thread. The functional redirect group lives entirely below 0x3d0.
                 const uint32_t ref_scan_end = std::min<uint32_t>(a2_len, LGUI_REF_MAX_OFF);
-                for (uint32_t off = LGUI_REF_MIN_OFF; off + 8 <= ref_scan_end; off += 8) {
-                    auto p = (uintptr_t*)((uintptr_t)a2 + off);
-                    // The a2_len page-readability scan above only validates readability once, before this loop
-                    // runs. During a live resolution change the engine can resize/free parts of this buffer
-                    // between that check and here (observed crash: EXCEPTION_ACCESS_VIOLATION reading a stale
-                    // pointer at this line). Re-validate each 8-byte slot immediately before dereferencing it.
-                    if (IsBadReadPtr(p, sizeof(uintptr_t))) break;
-                    if (*p != (uintptr_t)a3) continue;
-                    refs.push_back(p);
-                    where += fmt::format("a2+{:x} ", off);
+
+                // EXPERIMENT (see VR::is_lgui_restrict_ref_scan_to_known_offsets_enabled()): the loop below still
+                // scans every 8-byte slot in [LGUI_REF_MIN_OFF, LGUI_REF_MAX_OFF) and patches ANY slot whose raw
+                // value equals a3, even though the ground-truth layout notes above only identify 0x270/0x348/0x3a0
+                // as offsets LGUI's Execute pass actually dereferences. During submenu/nested-popup churn, a freed
+                // and reused address can transiently make an unrelated a2 field collide with a stale/reused a3
+                // value, causing this blind scan to patch a field that was never really a render-target reference.
+                // When enabled, only those three known-good offsets are checked/patched, closing off that collision
+                // risk entirely instead of trying to validate matches after the fact.
+                static constexpr uint32_t LGUI_KNOWN_GOOD_REF_OFFS[] = {0x270, 0x348, 0x3a0};
+                const bool lgui_restrict_scan = VR::get()->is_lgui_restrict_ref_scan_to_known_offsets_enabled();
+
+                if (lgui_restrict_scan) {
+                    for (auto off : LGUI_KNOWN_GOOD_REF_OFFS) {
+                        if (off + 8 > a2_len) continue;
+                        auto p = (uintptr_t*)((uintptr_t)a2 + off);
+                        if (IsBadReadPtr(p, sizeof(uintptr_t))) continue;
+                        if (*p != (uintptr_t)a3) continue;
+                        refs.push_back(p);
+                        where += fmt::format("a2+{:x} ", off);
+                    }
+                } else {
+                    for (uint32_t off = LGUI_REF_MIN_OFF; off + 8 <= ref_scan_end; off += 8) {
+                        auto p = (uintptr_t*)((uintptr_t)a2 + off);
+                        // The a2_len page-readability scan above only validates readability once, before this loop
+                        // runs. During a live resolution change the engine can resize/free parts of this buffer
+                        // between that check and here (observed crash: EXCEPTION_ACCESS_VIOLATION reading a stale
+                        // pointer at this line). Re-validate each 8-byte slot immediately before dereferencing it.
+                        if (IsBadReadPtr(p, sizeof(uintptr_t))) break;
+                        if (*p != (uintptr_t)a3) continue;
+                        refs.push_back(p);
+                        where += fmt::format("a2+{:x} ", off);
+                    }
                 }
+
 
                 // Stretch persists with every int (hw,hh) pair patched -> the ortho projection is built from a size we do not see as
                 // ints (float aspect / 1/w / matrix) or from game-thread canvas data. Two-pronged:
@@ -8542,6 +8930,26 @@ bool FFakeStereoRenderingHook::setup_view_extensions() try {
                                 lgui_a3_history_lookup(ctx_dump->Rsi), lgui_a3_history_lookup(ctx_dump->Rdi),
                                 lgui_a3_history_lookup(ctx_dump->R8), lgui_a3_history_lookup(ctx_dump->R9));
 
+                            // DIAG: cross-check every pointer-shaped GPR against the shadow-copy quarantine list.
+                            // A "HIT" here is the single most direct evidence available: it means this register
+                            // holds the address of a buffer WE allocated, WE decided was stale/mismatched, and
+                            // then WE zeroed/moved into quarantine - if the fault happened before the grace
+                            // period elapsed, this is a live UAF on our own quarantined memory (grace period too
+                            // short or something is holding the pointer far longer than expected); if it happened
+                            // after, this proves the ranges were reused for something else already and any
+                            // apparent "hit" is coincidental. Combined with g_lgui_identity_mismatch_count and the
+                            // periodic quarantine-health log lines, this tells us definitively whether the
+                            // identity-validation + delayed-free fix is the reason a crash did or didn't happen.
+                            {
+                                const auto diag_frame = (uint64_t)VR::get()->get_frame_count();
+                                SPDLOG_WARN("[Exception Handler] [LGUI_UAF_DUMP] [DIAG] quarantine lookups: rax={} rcx={} rdx={} rbx={}",
+                                    lgui_quarantine_lookup(ctx_dump->Rax, diag_frame), lgui_quarantine_lookup(ctx_dump->Rcx, diag_frame),
+                                    lgui_quarantine_lookup(ctx_dump->Rdx, diag_frame), lgui_quarantine_lookup(ctx_dump->Rbx, diag_frame));
+                                SPDLOG_WARN("[Exception Handler] [LGUI_UAF_DUMP] [DIAG] quarantine lookups: rsi={} rdi={} r8={} r9={}",
+                                    lgui_quarantine_lookup(ctx_dump->Rsi, diag_frame), lgui_quarantine_lookup(ctx_dump->Rdi, diag_frame),
+                                    lgui_quarantine_lookup(ctx_dump->R8, diag_frame), lgui_quarantine_lookup(ctx_dump->R9, diag_frame));
+                            }
+
                             // CLASS FINGERPRINTING: for every pointer-shaped GPR, treat it as a possible object
                             // pointer and dump its vtable RVA + first few raw fields (see lgui_fingerprint_object
                             // above). This is the missing piece for identifying WHAT TYPE of object is being
@@ -8776,6 +9184,79 @@ bool FFakeStereoRenderingHook::setup_view_extensions() try {
                             const auto base_reg = decoded_precheck->Operands[1].Info.Memory.Base;
 
                             if (base_reg < 16) {
+                                // PLAUSIBLE-FLOAT GUARD: this recovery assumes base_reg holds a stale/freed
+                                // pointer, but was observed faulting (rva=23e1f889) with base_reg == 0xbf800000,
+                                // which is exactly -1.0f when reinterpreted as an IEEE-754 float - a typical
+                                // per-eye scale/sign constant, not garbage. Treat any base register whose raw
+                                // bits reinterpret as a plausible small, non-zero, finite float (roughly
+                                // [-16.0, 16.0], excluding subnormals/denormals which are themselves a strong
+                                // "real pointer, not a float" signal since legitimate scale/sign constants don't
+                                // land there) as NOT a stale pointer, and skip the zero-forcing recovery so the
+                                // fault propagates normally instead of silently corrupting what might be real
+                                // eye/view state.
+                                //
+                                // TOGGLEABLE (see VR::is_lgui_uaf_float_guard_disabled()): default OFF (guard
+                                // active) to A/B test whether this is the cause of a reported black/no-visual
+                                // left eye; turn ON to fully disable and always recover unconditionally like
+                                // before.
+                                //
+                                // REGRESSION (confirmed via [DIAG] telemetry): this guard fired at the KNOWN,
+                                // always-safely-recovered UAF family anchor rva 23e1f889 (base_reg=8
+                                // value=bf800000) and skipped the zero-recovery, letting the fault propagate for
+                                // real. The fallback CMP/TEST-based recovery further down did not match this
+                                // instruction shape either ("Previous instruction does not use the same register
+                                // as the dereference"), so the exception went fully unhandled -> instant silent
+                                // crash with no crash popup and no game-side log, exactly matching reports of
+                                // "crashes instantly on opening submenu, no crash log anywhere". We have
+                                // extensive prior telemetry (many recoveries logged at this exact rva with no
+                                // ill effects) proving base_reg here is NOT actually a real -1.0f scale constant
+                                // despite reinterpreting as one - it is coincidental bit pattern overlap with a
+                                // stale pointer. Exempt the known anchor rva (and its tight window) from the
+                                // float-plausibility check entirely so it always gets the zero-recovery it has
+                                // always safely gotten, regardless of what the raw bits look like as a float.
+                                constexpr uintptr_t LGUI_FLOAT_GUARD_EXEMPT_ANCHOR_RVA = 0x23e1f889;
+                                constexpr uintptr_t LGUI_FLOAT_GUARD_EXEMPT_WINDOW = 0x20;
+                                const auto float_guard_ex_rva = exception_address - (uintptr_t)*ex_mod_precheck;
+                                const bool float_guard_exempt =
+                                    (float_guard_ex_rva >= LGUI_FLOAT_GUARD_EXEMPT_ANCHOR_RVA - LGUI_FLOAT_GUARD_EXEMPT_WINDOW) &&
+                                    (float_guard_ex_rva <= LGUI_FLOAT_GUARD_EXEMPT_ANCHOR_RVA + LGUI_FLOAT_GUARD_EXEMPT_WINDOW);
+
+                                bool skip_due_to_plausible_float = false;
+
+                                if (float_guard_exempt) {
+                                    static std::unordered_set<uintptr_t> diag_warned_exempt_rvas{};
+                                    if (diag_warned_exempt_rvas.insert(float_guard_ex_rva).second) {
+                                        SPDLOG_INFO("[Exception Handler] [DIAG] [LGUI_UAF_FLOAT_GUARD] rva {:x} is within the known-anchor exempt "
+                                                    "window - float-plausibility check skipped, always applying unconditional zero-recovery here",
+                                            float_guard_ex_rva);
+                                    }
+                                }
+
+                                if (!VR::get()->is_lgui_uaf_float_guard_disabled() && !float_guard_exempt) {
+                                    const uint64_t base_val = *gpr_table[base_reg];
+                                    const uint32_t base_val32 = (uint32_t)(base_val & 0xFFFFFFFFu);
+                                    float as_float{};
+                                    std::memcpy(&as_float, &base_val32, sizeof(as_float));
+
+                                    const bool looks_like_plausible_float = base_val32 != 0 && std::isfinite(as_float) &&
+                                        std::fabs(as_float) >= (1.0f / 1024.0f) && std::fabs(as_float) <= 16.0f;
+
+                                    if (looks_like_plausible_float) {
+                                        static std::unordered_set<uintptr_t> warned_float_guard_rvas{};
+                                        const auto float_guard_rva = exception_address - (uintptr_t)*ex_mod_precheck;
+
+                                        if (warned_float_guard_rvas.insert(float_guard_rva).second) {
+                                            SPDLOG_WARN("[Exception Handler] [LGUI_UAF_FLOAT_GUARD] Skipping generalized UAF recovery at rva {:x} - "
+                                                        "base_reg={} value={:x} reinterprets as a plausible float ({:.4f}), likely a real scale/sign "
+                                                        "constant rather than a stale pointer; letting the fault propagate instead of zeroing it",
+                                                float_guard_rva, (int)base_reg, base_val32, as_float);
+                                        }
+
+                                        skip_due_to_plausible_float = true;
+                                    }
+                                }
+
+                                if (!skip_due_to_plausible_float) {
                                 static std::unordered_set<uintptr_t> warned_rvas{};
                                 const auto ex_rva = exception_address - (uintptr_t)*ex_mod_precheck;
 
@@ -8794,6 +9275,10 @@ bool FFakeStereoRenderingHook::setup_view_extensions() try {
                                     // this other pass still references, rather than an unrelated engine bug.
                                     SPDLOG_WARN("[Exception Handler] [LGUI_A3_LIFECYCLE] faulting pointer {:x} lookup: {}",
                                         *gpr_table[base_reg], lgui_a3_history_lookup(*gpr_table[base_reg]));
+                                    // DIAG: check the exact faulting pointer against the shadow-copy quarantine
+                                    // list too - see the identical check/rationale in the targeted UAF dump above.
+                                    SPDLOG_WARN("[Exception Handler] [DIAG] faulting pointer {:x} quarantine lookup: {}",
+                                        *gpr_table[base_reg], lgui_quarantine_lookup(*gpr_table[base_reg], (uint64_t)VR::get()->get_frame_count()));
                                     // CLASS FINGERPRINTING: identify what type of object this read-recovery is
                                     // touching (vtable RVA + raw fields), so repeated crashes at the same rva
                                     // accumulate toward a nameable class via a one-time disassembler lookup.
@@ -8806,9 +9291,111 @@ bool FFakeStereoRenderingHook::setup_view_extensions() try {
                                 if (dst_reg < 16) {
                                     *gpr_table[dst_reg] = 0;
 
-                                    ctx->Rip = exception_address + decoded_precheck->Length;
+                                    auto resume_addr = exception_address + decoded_precheck->Length;
+
+                                    // FORWARD-STORE GUARD: forcing the load result to 0 stops the read itself
+                                    // from crashing, but the game can (and does, per observed rva 23e2aad7/
+                                    // 23e2aa86) go on to use that same now-zeroed value - or a copy/extension of
+                                    // it moved into ANOTHER register a few instructions later (e.g. `movzx ecx,
+                                    // al` / `mov edx, eax` / `lea rax, [rcx+rdx*4]`) - as a base/index for a
+                                    // WRITE (e.g. `mov [rax+something*stride+0xD0], ...`), which then faults on
+                                    // its own because the "recovered" value doesn't point at a valid object
+                                    // either - a null/near-null write access violation one level downstream of
+                                    // the read we already handled. A same-register-only check isn't enough here:
+                                    // the observed crash moved the zeroed byte through a MOVZX into a different
+                                    // register before using it as an array index, so we track a small "tainted
+                                    // register" set seeded with dst_reg and propagated through simple single-
+                                    // source copy/extend instructions (MOV/MOVZX/MOVSX/MOVSXD/LEA whose only
+                                    // memory operand, if any, is itself tainted), and skip the first store whose
+                                    // memory operand's base or index is any tainted register - the same way the
+                                    // store-recovery path below skips writes through a stale base pointer.
+                                    // Bounded to a small instruction count so we don't walk past an unrelated
+                                    // branch/call and skip something legitimate.
+                                    //
+                                    // TOGGLEABLE (see VR::is_lgui_uaf_load_store_guard_disabled()): added to A/B
+                                    // test against a reported black/no-visual left eye + menu crash. If this guard
+                                    // ends up skipping a store that was actually setting a legitimate eye/view
+                                    // index or render target selector (rather than one truly derived from the
+                                    // stale object), it could itself cause a rendering regression like that one.
+                                    // Default OFF (guard active); the DIAG toggle disables it entirely so only the
+                                    // original load-zeroing behavior remains and any downstream store faults for
+                                    // real, to determine whether this guard is the culprit.
+                                    if (!VR::get()->is_lgui_uaf_load_store_guard_disabled()) {
+                                        constexpr int LGUI_LOAD_GUARD_MAX_INSTRS = 12;
+                                        auto guard_ip = resume_addr;
+                                        uint32_t tainted_regs = (1u << dst_reg);
+
+                                        for (int i = 0; i < LGUI_LOAD_GUARD_MAX_INSTRS; ++i) {
+                                            const auto guard_decoded = utility::decode_one((uint8_t*)guard_ip);
+
+                                            if (!guard_decoded) {
+                                                break;
+                                            }
+
+                                            const std::string_view guard_mnemonic{guard_decoded->Mnemonic};
+
+                                            // Stop at the first branch/call - don't walk into unrelated control flow.
+                                            if (guard_decoded->BranchInfo.IsBranch || guard_mnemonic.starts_with("CALL")) {
+                                                break;
+                                            }
+
+                                            // Does this instruction WRITE to memory through a tainted base/index?
+                                            if (guard_decoded->OperandsCount >= 1 &&
+                                                guard_decoded->Operands[0].Type == ND_OP_MEM && guard_decoded->Operands[0].Info.Memory.HasBase &&
+                                                ((guard_decoded->Operands[0].Info.Memory.Base < 16 && (tainted_regs & (1u << guard_decoded->Operands[0].Info.Memory.Base))) ||
+                                                 (guard_decoded->Operands[0].Info.Memory.HasIndex && guard_decoded->Operands[0].Info.Memory.Index < 16 &&
+                                                  (tainted_regs & (1u << guard_decoded->Operands[0].Info.Memory.Index))))) {
+                                                static std::unordered_set<uintptr_t> warned_load_store_skip_rvas{};
+                                                const auto store_rva = guard_ip - (uintptr_t)*ex_mod_precheck;
+
+                                                if (warned_load_store_skip_rvas.insert(store_rva).second) {
+                                                    SPDLOG_WARN("[Exception Handler] Skipping downstream store at rva {:x} that uses a register tainted "
+                                                                "by the just-recovered load (tainted_regs={:#x}) as a memory base/index - avoiding a "
+                                                                "follow-on write AV through the zeroed/derived load result",
+                                                        store_rva, tainted_regs);
+                                                }
+
+                                                resume_addr = guard_ip + guard_decoded->Length;
+                                                break;
+                                            }
+
+                                            // Propagate taint through simple single-source copy/extend instructions:
+                                            // MOV/MOVZX/MOVSX/MOVSXD reg, reg_or_mem ; LEA reg, [mem].
+                                            if (guard_decoded->OperandsCount >= 2 && guard_decoded->Operands[0].Type == ND_OP_REG &&
+                                                guard_decoded->Operands[0].Info.Register.Reg < 16 &&
+                                                (guard_mnemonic == "MOV" || guard_mnemonic.starts_with("MOVZX") || guard_mnemonic.starts_with("MOVSX") ||
+                                                 guard_mnemonic == "LEA")) {
+
+                                                const auto& src_op = guard_decoded->Operands[1];
+                                                bool src_tainted = false;
+
+                                                if (src_op.Type == ND_OP_REG && src_op.Info.Register.Reg < 16) {
+                                                    src_tainted = (tainted_regs & (1u << src_op.Info.Register.Reg)) != 0;
+                                                } else if (src_op.Type == ND_OP_MEM && src_op.Info.Memory.HasBase) {
+                                                    src_tainted = (src_op.Info.Memory.Base < 16 && (tainted_regs & (1u << src_op.Info.Memory.Base))) ||
+                                                        (src_op.Info.Memory.HasIndex && src_op.Info.Memory.Index < 16 &&
+                                                         (tainted_regs & (1u << src_op.Info.Memory.Index)));
+                                                }
+
+                                                const auto dst_taint_reg = guard_decoded->Operands[0].Info.Register.Reg;
+
+                                                if (src_tainted) {
+                                                    tainted_regs |= (1u << dst_taint_reg);
+                                                } else {
+                                                    // Overwritten with something unrelated to the recovered value -
+                                                    // it's no longer tainted, stop tracking it as such.
+                                                    tainted_regs &= ~(1u << dst_taint_reg);
+                                                }
+                                            }
+
+                                            guard_ip += guard_decoded->Length;
+                                        }
+                                    }
+
+                                    ctx->Rip = resume_addr;
                                     return EXCEPTION_CONTINUE_EXECUTION;
                                 }
+                                } // if (!skip_due_to_plausible_float)
                             }
 
 
@@ -13033,6 +13620,37 @@ void VRRenderTargetManager_Base::pre_texture_hook_callback(safetyhook::Context& 
                 SPDLOG_INFO("Had to set texture hook ref in pre texture hook!");
                 rtm->texture_hook_ref = (FTexture2DRHIRef*)ctx.rdx;
             }
+
+            // NARROW EXPERIMENT: also create a second, independently-sized persistent texture matching
+            // whatever size the LGUI FRenderTarget redirect actually wants (see
+            // lgui_frt_get_render_target_texture_hook / g_lgui_frt_wanted_width/height). Only done here
+            // because logs confirm this "common version" branch is the only one that ever fires for this
+            // game build; other branches intentionally do not get this treatment (see VR::is_lgui_shadow_ui_texture_enabled()).
+            if (VR::get()->is_lgui_shadow_ui_texture_enabled()) {
+                const auto wanted_w = g_lgui_frt_wanted_width.load(std::memory_order_relaxed);
+                const auto wanted_h = g_lgui_frt_wanted_height.load(std::memory_order_relaxed);
+
+                if (wanted_w != 0 && wanted_h != 0 &&
+                    (rtm->lgui_shadow_ui_width != wanted_w || rtm->lgui_shadow_ui_height != wanted_h))
+                {
+                    static FTexture2DRHIRef shadow_out{};
+                    shadow_out.texture = nullptr;
+
+                    func(ctx.rcx, &shadow_out, ctx.r8, wanted_w, wanted_h, 2,
+                        stack_args[2], stack_args[3], stack_args[4],
+                        stack_args[5], stack_args[6], stack_args[7]);
+
+                    if (shadow_out.texture != nullptr) {
+                        rtm->lgui_shadow_ui_texture = shadow_out.texture;
+                        rtm->lgui_shadow_ui_width = wanted_w;
+                        rtm->lgui_shadow_ui_height = wanted_h;
+                        SPDLOG_INFO("[LGUI_SHADOW_TEX] created shadow UI texture {:x} at {}x{}",
+                            (uintptr_t)shadow_out.texture, wanted_w, wanted_h);
+                    } else {
+                        SPDLOG_ERROR("[LGUI_SHADOW_TEX] failed to create shadow UI texture at {}x{}", wanted_w, wanted_h);
+                    }
+                }
+            }
         }
 
         rtm->ui_target = out.texture;
@@ -13712,12 +14330,31 @@ bool VRRenderTargetManager_Base::create_scene_capture() try {
         auto& vtable = *(void**)frt;
         memcpy(original_frender_target_vtable.data(), vtable, original_frender_target_vtable.size() * sizeof(uintptr_t));
 
+        bool patched_any = false;
+
         if (auto display_gamma_index = sdk::FRenderTarget::get_display_gamma_index(); display_gamma_index != 0) {
             original_frender_target_vtable[*display_gamma_index] = (uintptr_t)gamma_increase_fn;
-            vtable = original_frender_target_vtable.data();
+            patched_any = true;
             SPDLOG_INFO("[FRenderTarget] Hooked FRenderTarget!");
         } else {
             SPDLOG_WARN("[FRenderTarget] Gamma index not found, can't hook!");
+        }
+
+        // EXPERIMENT: higher-level alternative to the a3 shadow-copy pool redirect (see
+        // VR::is_lgui_frt_redirect_disabled()). Hook the shared FRenderTarget::GetRenderTargetTexture()
+        // vtable slot directly instead of shadow-copying the per-frame transient a3 RDG texture object.
+        // This slot is stable per-class (unlike a3), so no per-object lifetime tracking is needed here.
+        if (auto rt_tex_index = sdk::FRenderTarget::get_render_target_texture_index(); rt_tex_index) {
+            g_hook->m_lgui_frt_original_get_render_target_texture = (void*)original_frender_target_vtable[*rt_tex_index];
+            original_frender_target_vtable[*rt_tex_index] = (uintptr_t)&FFakeStereoRenderingHook::lgui_frt_get_render_target_texture_hook;
+            patched_any = true;
+            SPDLOG_INFO("[FRenderTarget] Hooked FRenderTarget::GetRenderTargetTexture (EXPERIMENT lgui_frt_redirect)!");
+        } else {
+            SPDLOG_WARN("[FRenderTarget] GetRenderTargetTexture index not found, EXPERIMENT lgui_frt_redirect unavailable!");
+        }
+
+        if (patched_any) {
+            vtable = original_frender_target_vtable.data();
         }
     };
 
