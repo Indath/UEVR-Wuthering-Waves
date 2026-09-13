@@ -710,6 +710,11 @@ public:
         return m_native_stereo_fix_null_pass2_view_state->value();
     }
 
+    // See m_native_stereo_fix_dual_write_projection for rationale. Fallback-only, defaults OFF.
+    bool is_native_stereo_fix_dual_write_projection_enabled() const {
+        return m_native_stereo_fix_dual_write_projection->value();
+    }
+
     bool is_native_stereo_fix_sync_pose_enabled() const {
         return m_native_stereo_fix_sync_pose->value() || m_diag_double_vision_fix_master->value();
     }
@@ -1013,6 +1018,10 @@ public:
         return m_diag_suppress_extra_view->value();
     }
 
+    bool is_diag_treat_view_index_1_as_monoscopic_enabled() const {
+        return m_diag_treat_view_index_1_as_monoscopic->value();
+    }
+
     int32_t get_diag_suppress_view_index() const {
         return m_diag_suppress_view_index->value();
     }
@@ -1027,6 +1036,29 @@ public:
 
     bool is_diag_log_raw_view_index_enabled() const {
         return m_diag_log_raw_view_index->value();
+    }
+
+    // DIAG: enables a raw-address inline hook at utility::get_executable() + m_diag_dual_view_gate_rva,
+    // a statically-confirmed "dual view gate" function that reads StereoPass off two FSceneView-shaped
+    // pointers (rcx/rdx at entry) and gates a shared-state/cache path on them matching. Logs both
+    // pointers, both StereoPass bytes, g_frame_count, and the original return value, then calls through
+    // unchanged (pure observer, no behavior change) so we can determine from logs alone whether the two
+    // pointers are the same eye across frames (benign per-view cache) or a left/right pair (the actual
+    // double-vision shared-state gate).
+    bool is_diag_hook_dual_view_gate_enabled() const {
+        return m_diag_hook_dual_view_gate->value();
+    }
+
+    uint32_t get_diag_dual_view_gate_rva() const {
+        return (uint32_t)m_diag_dual_view_gate_rva->value();
+    }
+
+    bool is_diag_hook_dual_view_gate_caller_enabled() const {
+        return m_diag_hook_dual_view_gate_caller->value();
+    }
+
+    uint32_t get_diag_dual_view_gate_caller_rva() const {
+        return (uint32_t)m_diag_dual_view_gate_caller_rva->value();
     }
 
     // See the comment at its usage site in calculate_stereo_view_offset for full rationale: excludes
@@ -1687,6 +1719,12 @@ private:
     // using this, do not assume a fixed value like 3 is always correct.
     const ModToggle::Ptr m_diag_suppress_extra_view{ ModToggle::create(generate_name("DiagSuppressExtraView"), false) };
     const ModInt32::Ptr m_diag_suppress_view_index{ ModSliderInt32::create(generate_name("DiagSuppressViewIndex"), -1, 8, 3) };
+    // DIAG: experimental test of the hypothesis that raw view_index 1 is an extra/monoscopic view slot
+    // inserted ahead of the real eyes on titles where the real eyes land at raw indices 2/3 instead of
+    // stock 1/2 (confirmed via runtime logs for this game). Off by default - enable to test whether
+    // ignoring view_index 1 (once index_was_ever_two is true) resolves double vision without needing
+    // to first confirm the exact engine-side cause via binary reverse engineering.
+    const ModToggle::Ptr m_diag_treat_view_index_1_as_monoscopic{ ModToggle::create(generate_name("DiagTreatViewIndex1AsMonoscopic"), false) };
     // DIAG: true_index (which decides "left" vs "right" and is what the sync-pose cache/eye-offset
     // math key off of) is derived purely from view_index's PARITY: true_index = (view_index + 1) % 2
     // or view_index % 2 depending on index_starts_from_one. That means two DIFFERENT view_index values
@@ -1710,6 +1748,26 @@ private:
     // authoritative table of which raw indices actually occur (observed 0-4 previously) instead of
     // inferring it indirectly from aliasing/pose diagnostics alone.
     const ModToggle::Ptr m_diag_log_raw_view_index{ ModToggle::create(generate_name("DiagLogRawViewIndex"), false) };
+    // DIAG: see is_diag_hook_dual_view_gate_enabled() for full rationale. NOTE: static analysis of the
+    // full decompiled body of this function (FUN_180471440 in client-win64-shippingbase.dll) proved it
+    // is HTTP/2 connection-pooling/multiplexing logic (strings like "Found bundle for host", "Server
+    // doesn't support multiplex"), NOT anything related to FSceneView/StereoPass. The 0x10C offset
+    // match was coincidental. Kept disabled/for reference only - do not re-enable without a new lead.
+    const ModToggle::Ptr m_diag_hook_dual_view_gate{ ModToggle::create(generate_name("DiagHookDualViewGate"), false) };
+    // Plain text input (not a slider) so the exact decimal RVA can be typed precisely instead of
+    // dragged across a multi-billion range.
+    const ModInt32::Ptr m_diag_dual_view_gate_rva{ ModInt32::create(generate_name("DiagDualViewGateRva"), 0x471440) };
+    // DIAG: alternative to hooking the dual-view gate function directly (which crashed via a bad
+    // trampoline relocation deep in hot AVX/vectorized code). This instead hooks the gate's CALLER's
+    // `call` instruction site directly - hooking an ordinary `call` instruction is far more reliably
+    // relocatable than hooking deep into a hot function body. Mutually exclusive in practice with
+    // m_diag_hook_dual_view_gate; toggle one at a time to compare stability/results. IMPORTANT: the
+    // default RVA below is a placeholder (0) - you must find the real caller `call` instruction's RVA
+    // yourself in a debugger (set a breakpoint on the dual-view-gate entry RVA, check the call stack /
+    // return address, subtract the module base to get the RVA of the call site) before enabling this,
+    // otherwise it will fail to hook or hook the wrong address entirely.
+    const ModToggle::Ptr m_diag_hook_dual_view_gate_caller{ ModToggle::create(generate_name("DiagHookDualViewGateCaller"), false) };
+    const ModInt32::Ptr m_diag_dual_view_gate_caller_rva{ ModInt32::create(generate_name("DiagDualViewGateCallerRva"), 0x4737D2) };
     // Off by default until confirmed stable across more sessions; user directly tested that excluding
     // view_index=1 from rendering entirely (a full early-return, stronger than this) caused no visible
     // regression (no stuck/frozen/blank eye). This toggle is the narrower, safer version of that test:
@@ -1835,6 +1893,15 @@ private:
     // DIAG: render NSF Pass2 with a null FSceneViewState (no occlusion/TAA history) to test whether
     // shared per-view-state history is what freezes distant foliage in the second-rendered eye.
     const ModToggle::Ptr m_native_stereo_fix_null_pass2_view_state{ ModToggle::create(generate_name("NativeStereoFixNullPass2ViewState"), false) };
+    // FALLBACK: this game's CalculateStereoProjectionMatrix is only ever called ONCE per frame
+    // (confirmed via runtime STEREO-SETUP logs: proj_calls=0 for the left eye on every frame in the
+    // reported double-vision window), the signature of Instanced Stereo Rendering (ISR). The primary
+    // mitigation is forcing vr.InstancedStereo=0 at hook time so the engine falls back to two real
+    // stereo passes. If that does NOT resolve the double vision in-headset, enable this to directly
+    // patch the OTHER (un-called) eye's FSceneView::ViewProjectionMatrix via the same offset used by
+    // init_canvas(), immediately after the single real call writes the called eye's matrix. Default
+    // OFF - only enable if the ISR cvar mitigation is confirmed insufficient.
+    const ModToggle::Ptr m_native_stereo_fix_dual_write_projection{ ModToggle::create(generate_name("NativeStereoFixDualWriteProjection"), false) };
     // NSF renders both eyes within the same engine frame via two calculate_stereo_view_offset() calls
     // (Pass1=left, Pass2=right). Unlike AFR (which already caches/reuses eye 0's rotation across the
     // frame - see m_last_afr_rotation), NSF has no equivalent: each eye independently reads whatever the
@@ -2050,10 +2117,15 @@ public:
             *m_disable_skin_cache_nsf,
             *m_diag_log_final_eye_pose,
             *m_diag_suppress_extra_view,
+            *m_diag_treat_view_index_1_as_monoscopic,
             *m_diag_suppress_view_index,
             *m_diag_log_true_index_alias,
             *m_diag_log_world_to_meters,
             *m_diag_log_raw_view_index,
+            *m_diag_hook_dual_view_gate,
+            *m_diag_dual_view_gate_rva,
+            *m_diag_hook_dual_view_gate_caller,
+            *m_diag_dual_view_gate_caller_rva,
             *m_diag_exclude_view_index_from_sync_cache,
             *m_diag_exclude_view_index_from_sync_cache_index,
             *m_diag_apply_synced_pose_to_excluded_view_index,

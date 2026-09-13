@@ -5,6 +5,7 @@
 #include <atomic>
 #include <algorithm>
 #include <cmath>
+#include <mutex>
 
 #include <SafetyHook.hpp>
 
@@ -374,7 +375,62 @@ public:
     void attempt_hook_slate_thread(uintptr_t return_address = 0, bool alternate = false);
     void attempt_hook_update_viewport_rhi(uintptr_t return_address);
     void attempt_hook_fsceneview_constructor();
-    
+    void attempt_hook_dual_view_gate();
+    static bool dual_view_gate_hook(void* view_a, void* view_b);
+    void attempt_hook_dual_view_gate_caller();
+    static void dual_view_gate_caller_hook(safetyhook::Context& ctx);
+
+    // DIAG: dumps every stereo-rendering-related address this hook has resolved so far (both the
+    // raw/ASLR'd VA and the module-relative RVA) into the log in one shot, so they can be gathered
+    // and cross-referenced in a static disassembler without having to grep the log for a dozen
+    // separately-emitted "Found X at 0x..." lines from different points in the session.
+    void dump_stereo_addresses();
+
+    // DIAG: runtime-only (no static analysis) per-frame reconstruction of "how the stereo pass is set
+    // up". Every call site that participates in the per-eye pipeline (AdjustViewRect,
+    // CalculateStereoViewOffset, CalculateStereoProjectionMatrix, GetDesiredNumberOfViews,
+    // sceneview_constructor) reports its own view of the current frame's eye classification into a
+    // shared per-frame record via report_stereo_setup_sample(...). Once BOTH true_index=0 and
+    // true_index=1 have reported for calculate_stereo_view_offset in the same frame, a single
+    // consolidated [VR][STEREO-SETUP] line is emitted summarizing raw view_index, true_index,
+    // x-offset, w/h, and projection-matrix touch state for both eyes side by side - answering "is the
+    // engine actually calling both eyes this frame, with what indices, and where did each eye's data
+    // end up" from one line instead of correlating a dozen separate throttled logs by hand.
+    struct StereoSetupEyeSample {
+        bool seen{false};
+        int32_t raw_view_index{-1};
+        uint32_t true_index{0xFFFFFFFF};
+        int32_t x{0};
+        int32_t y{0};
+        uint32_t w{0};
+        uint32_t h{0};
+        bool got_projection_matrix{false};
+        bool got_view_offset{false};
+        bool is_afr{false};
+        // DIAG: how many times AdjustViewRect / CalculateStereoProjectionMatrix / CalculateStereoViewOffset
+        // were each called for THIS true_index within the frame. If a per-eye pipeline stage should run
+        // exactly once per eye per frame but one eye's count stays 0 while the other's is >=1 (or one
+        // eye's count is 2+ while the other's is 0), that pinpoints the exact stage where the engine (or
+        // one of our hooks) is only ever driving a single eye through that stage instead of both.
+        uint32_t adjust_view_rect_calls{0};
+        uint32_t projection_matrix_calls{0};
+        uint32_t view_offset_calls{0};
+    };
+
+    void report_stereo_setup_view_offset(uint32_t true_index, int32_t raw_view_index, bool is_afr);
+    void report_stereo_setup_view_rect(uint32_t true_index, int32_t x, int32_t y, uint32_t w, uint32_t h);
+    void report_stereo_setup_projection_matrix(uint32_t true_index);
+
+private:
+    void maybe_log_stereo_setup_summary();
+    void ensure_stereo_setup_frame_locked();
+
+    std::array<StereoSetupEyeSample, 2> m_stereo_setup_eyes{};
+    uint32_t m_stereo_setup_frame{0xFFFFFFFF};
+    std::mutex m_stereo_setup_mutex{};
+
+public:
+
 
     bool has_double_precision() const {
         return m_has_double_precision;
@@ -745,10 +801,21 @@ private:
         std::unordered_map<sdk::FSceneViewStateInterface*, sdk::FSceneViewInitOptionsUE4> view_init_options_ue4{};
         std::unordered_map<sdk::FSceneViewStateInterface*, sdk::FSceneViewInitOptionsUE5> view_init_options_ue5{};
         std::unordered_set<uintptr_t> seen_retaddrs{};
+
+        // FALLBACK: caches the constructed FSceneView* for each eye (true_index 0/1), keyed to the
+        // frame they were built on. Used by calculate_stereo_projection_matrix's dual-write fallback
+        // (see is_native_stereo_fix_dual_write_projection_enabled()) to locate the OTHER eye's
+        // FSceneView when this title only calls CalculateStereoProjectionMatrix once per frame.
+        uint32_t cached_view_frame_count[2]{};
+        sdk::FSceneView* cached_view_for_eye[2]{};
     } m_sceneview_data;
 
     safetyhook::InlineHook m_localplayer_get_viewpoint_hook{};
     safetyhook::InlineHook m_tick_hook{};
+    safetyhook::InlineHook m_dual_view_gate_hook{};
+    safetyhook::MidHook m_dual_view_gate_caller_hook{};
+    bool m_attempted_hook_dual_view_gate_caller{false};
+    bool m_attempted_hook_dual_view_gate{false};
     safetyhook::InlineHook m_adjust_view_rect_hook{};
     safetyhook::InlineHook m_calculate_stereo_view_offset_hook_inline{};
     std::unique_ptr<PointerHook> m_calculate_stereo_view_offset_hook_ptr{}; // some games have a short jmp which isnt supported by safetyhook right now so we use pointerhook

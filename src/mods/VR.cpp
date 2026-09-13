@@ -3219,6 +3219,15 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
                                   "If distant trees stop freezing in the right eye with this on, shared per-view-state occlusion history is the cause. "
                                   "Expect aliasing/flicker in the right eye while enabled.");
             }
+            m_native_stereo_fix_dual_write_projection->draw("DIAG: Dual-Write Missing Eye Projection Matrix (double vision fallback)");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("This title only calls CalculateStereoProjectionMatrix ONCE per frame (Instanced Stereo\\n"
+                                  "Rendering). Forcing vr.InstancedStereo=0 did not change this. When enabled, directly\\n"
+                                  "patches the OTHER (never-called) eye's cached FSceneView::ViewProjectionMatrix right\\n"
+                                  "after the real call writes the called eye's matrix, using the same offset init_canvas()\\n"
+                                  "resolves. Experimental - may crash or produce garbage if the cached view pointer for\\n"
+                                  "the other eye is stale or the offset does not apply to it.");
+            }
             m_native_stereo_fix_sync_pose_force_full->draw("DIAG: Force Full Sync Every Frame (bypass hard-cut gate)");
             if (ImGui::IsItemHovered()) {
                 ImGui::SetTooltip("Normally the full 1.0 blend_alpha snap above only applies on a detected hard-cut-grade\n"
@@ -3312,6 +3321,16 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
                                   "the HMD, proving this value must be re-verified every session (see\n"
                                   "m_diag_log_final_eye_pose / DIAG: Log True-Index Alias below) rather than assumed.");
             }
+            m_diag_treat_view_index_1_as_monoscopic->draw("DIAG: Treat View Index 1 As Monoscopic (experimental)");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("EXPERIMENT: on titles where the two real eyes are observed at raw view_index 2/3\n"
+                                  "(instead of the stock 1/2), this treats view_index 1 as an extra/monoscopic view\n"
+                                  "(mirroring index 0's existing eSSP_FULL skip once index_was_ever_two is true) and\n"
+                                  "ignores it in calculate_stereo_view_offset, so it can't pollute the NSF sync-pose\n"
+                                  "cache or eye-offset math. Only takes effect after view_index 2 has been observed\n"
+                                  "at least once this session. Test with double vision reproduction steps and check\n"
+                                  "the [VR][DIAG-INDEX1-MONO] log line to confirm it's firing.");
+            }
             m_diag_log_true_index_alias->draw("DIAG: Log True-Index Alias");
             if (ImGui::IsItemHovered()) {
                 ImGui::SetTooltip("true_index (which decides left vs right eye, and is what the sync-pose cache and\n"
@@ -3343,6 +3362,46 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
                                   "authoritative table of exactly which raw indices occur and how often,\n"
                                   "instead of piecing it together from aliasing/pose diagnostics alone.\n"
                                   "Very verbose - enable only during a short repro window.");
+            }
+            m_diag_hook_dual_view_gate->draw("DIAG: Hook Dual-View Gate Function (statically-confirmed RVA)");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Installs an inline hook directly on the dual-view gate function itself, at\n"
+                                  "client-win64-shippingbase.dll + the RVA below. WARNING: this crashed in\n"
+                                  "testing (access violation inside the relocated trampoline, likely due to\n"
+                                  "hooking deep into hot AVX/vectorized code). Prefer the caller-hook toggle\n"
+                                  "below instead unless specifically comparing the two approaches. Logs both\n"
+                                  "pointers, both StereoPass bytes, g_frame_count, and the original return\n"
+                                  "value, then calls through unchanged (pure observer). Requires a restart to\n"
+                                  "take effect. Toggle only ONE of the two Dual-View Gate hooks at a time.");
+            }
+            m_diag_dual_view_gate_rva->draw("DIAG: Dual-View Gate RVA");
+            m_diag_hook_dual_view_gate_caller->draw("DIAG: Hook Dual-View Gate CALLER Function (safer alternative)");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Alternative to the direct dual-view-gate hook above. Hooks the CALL\n"
+                                  "instruction site that calls into the gate function instead, which is\n"
+                                  "far more reliably relocatable than hooking deep into a hot vectorized\n"
+                                  "function body. IMPORTANT: the RVA below defaults to 0 (disabled/invalid)\n"
+                                  "- you must find the real caller call-site RVA yourself in a debugger\n"
+                                  "first (break on the gate function entry, check the return address on\n"
+                                  "the call stack, subtract the module base). Requires a restart to take\n"
+                                  "effect. Toggle only ONE of the two Dual-View Gate hooks at a time.");
+            }
+            m_diag_dual_view_gate_caller_rva->draw("DIAG: Dual-View Gate CALLER RVA");
+            if (ImGui::Button("DIAG: Dump All Stereo Addresses to Log")) {
+                if (auto& hook = get_fake_stereo_hook(); hook != nullptr) {
+                    hook->dump_stereo_addresses();
+                }
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Logs every stereo-rendering-related address this hook has resolved so far\n"
+                                  "(FSceneView constructor, AdjustViewRect, CalculateStereoViewOffset,\n"
+                                  "CalculateStereoProjectionMatrix, GetViewPassForIndex, BeginRenderViewFamily,\n"
+                                  "UGameEngine::Tick, and more) as one contiguous [VR][ADDR-DUMP] block, with\n"
+                                  "both the raw (ASLR'd) VA and a module-relative RVA for each. Click this AFTER\n"
+                                  "the game has fully loaded so as many of these hooks as possible have had the\n"
+                                  "chance to resolve, then grep the log for ADDR-DUMP to gather every address in\n"
+                                  "one place for static cross-referencing instead of hunting through the whole\n"
+                                  "session log for each one's individual first-resolved log line.");
             }
             m_diag_exclude_view_index_from_sync_cache->draw("DIAG: Exclude View Index From Sync-Pose Cache");
             if (ImGui::IsItemHovered()) {

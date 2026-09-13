@@ -271,6 +271,8 @@ void FFakeStereoRenderingHook::on_frame() {
     attempt_hook_game_engine_tick();
     attempt_hook_slate_thread();
     attempt_hook_fsceneview_constructor();
+    attempt_hook_dual_view_gate();
+    attempt_hook_dual_view_gate_caller();
 
     // Ideally we want to do all hooking
     // from game engine tick. if it fails
@@ -748,6 +750,157 @@ bool pre_find_fsceneview_constructor() {
 }
 }
 
+// DIAG: one-shot dump of every stereo-rendering-related address this hook currently has resolved,
+// logged together as both the raw (ASLR'd) VA and a module-relative RVA. Previously these addresses
+// were only ever logged individually, scattered across the boot log at whatever point each one was
+// first resolved (e.g. "[FSceneView] Constructor module-relative RVA" fires once during
+// attempt_hook_fsceneview_constructor(), long before other hooks are even installed). Call this
+// on-demand (via the Debug UI button) once the game is fully loaded and all hooks that are going to
+// resolve have had the chance to, so every address needed for static cross-referencing is available
+// in one contiguous block of the log instead of having to hunt through the whole session.
+void FFakeStereoRenderingHook::dump_stereo_addresses() {
+    const auto exe = utility::get_executable();
+
+    const auto log_addr = [&](const char* name, uintptr_t addr) {
+        if (addr == 0) {
+            SPDLOG_INFO("[VR][ADDR-DUMP] {:<45} NOT RESOLVED", name);
+            return;
+        }
+
+        if (const auto module_within = utility::get_module_within(addr)) {
+            const auto rva = addr - (uintptr_t)*module_within;
+            SPDLOG_INFO("[VR][ADDR-DUMP] {:<45} VA=0x{:x} module_base=0x{:x} RVA=0x{:x}", name, addr, (uintptr_t)*module_within, rva);
+        } else {
+            SPDLOG_INFO("[VR][ADDR-DUMP] {:<45} VA=0x{:x} (module unknown)", name, addr);
+        }
+    };
+
+    SPDLOG_INFO("[VR][ADDR-DUMP] ================= BEGIN STEREO ADDRESS DUMP =================");
+    SPDLOG_INFO("[VR][ADDR-DUMP] exe base=0x{:x}", (uintptr_t)exe);
+
+    log_addr("FSceneView::FSceneView (constructor)", m_sceneview_data.constructor_hook ? m_sceneview_data.constructor_hook.target_address() : 0);
+    log_addr("IStereoRendering::AdjustViewRect", m_adjust_view_rect_hook ? m_adjust_view_rect_hook.target_address() : 0);
+    log_addr("IStereoRendering::CalculateStereoViewOffset (inline)", m_calculate_stereo_view_offset_hook_inline ? m_calculate_stereo_view_offset_hook_inline.target_address() : 0);
+    log_addr("IStereoRendering::CalculateStereoViewOffset (ptr)", m_calculate_stereo_view_offset_hook_ptr != nullptr ? m_calculate_stereo_view_offset_hook_ptr->get_original<uintptr_t>() : 0);
+    log_addr("IStereoRendering::CalculateStereoProjectionMatrix", m_calculate_stereo_projection_matrix_hook ? m_calculate_stereo_projection_matrix_hook.target_address() : 0);
+    log_addr("IStereoRendering::CalculateStereoProjectionMatrix (post mid-hook)", m_calculate_stereo_projection_matrix_post_hook ? m_calculate_stereo_projection_matrix_post_hook.target_address() : 0);
+    log_addr("IStereoRenderTargetManager::GetViewPassForIndex", m_get_view_pass_for_index_hook != nullptr ? m_get_view_pass_for_index_hook->get_original<uintptr_t>() : 0);
+    log_addr("FRenderTexture_RenderThread", m_render_texture_render_thread_hook ? m_render_texture_render_thread_hook.target_address() : 0);
+    log_addr("FSlateRHIRenderer::DrawWindow_RenderThread", m_slate_thread_hook ? m_slate_thread_hook.target_address() : 0);
+    log_addr("UGameViewportClient::Draw", m_gameviewportclient_draw_hook ? m_gameviewportclient_draw_hook.target_address() : 0);
+    log_addr("FViewport::Draw (AFR)", m_viewport_draw_hook ? m_viewport_draw_hook.target_address() : 0);
+    log_addr("Render module BeginRenderViewFamily", m_render_module_begin_render_viewfamily_hook ? m_render_module_begin_render_viewfamily_hook.target_address() : 0);
+    log_addr("UGameEngine::Tick", m_tick_hook ? m_tick_hook.target_address() : 0);
+    log_addr("ULocalPlayer::GetViewPoint", m_localplayer_get_viewpoint_hook ? m_localplayer_get_viewpoint_hook.target_address() : 0);
+    log_addr("Dual-View Gate (direct, disproved - networking, not stereo)", m_dual_view_gate_hook ? m_dual_view_gate_hook.target_address() : 0);
+    log_addr("Dual-View Gate CALLER (disproved - networking, not stereo)", m_dual_view_gate_caller_hook ? m_dual_view_gate_caller_hook.target_address() : 0);
+    log_addr("IStereoRendering::IsStereoEnabled", m_is_stereo_enabled_hook != nullptr ? m_is_stereo_enabled_hook->get_original<uintptr_t>() : 0);
+    log_addr("IStereoRendering::GetRenderTargetManager", m_get_render_target_manager_hook != nullptr ? m_get_render_target_manager_hook->get_original<uintptr_t>() : 0);
+    log_addr("IStereoRendering::GetStereoLayers", m_get_stereo_layers_hook != nullptr ? m_get_stereo_layers_hook->get_original<uintptr_t>() : 0);
+    log_addr("FViewport::InitCanvas", m_init_canvas_hook != nullptr ? m_init_canvas_hook->get_original<uintptr_t>() : 0);
+    log_addr("IStereoRenderTargetManager::GetDesiredNumberOfViews", m_get_desired_number_of_views_hook != nullptr ? m_get_desired_number_of_views_hook->get_original<uintptr_t>() : 0);
+    log_addr("FSceneViewport::UpdateViewportRHI", m_update_viewport_rhi_hook != nullptr ? m_update_viewport_rhi_hook->get_original<uintptr_t>() : 0);
+    log_addr("FViewport::GetRenderTargetTexture", m_viewport_get_render_target_texture_hook != nullptr ? m_viewport_get_render_target_texture_hook->get_original<uintptr_t>() : 0);
+    log_addr("FViewport::~FViewport (destructor)", m_viewport_destructor_hook != nullptr ? m_viewport_destructor_hook->get_original<uintptr_t>() : 0);
+
+    if (const auto constructor = sdk::FSceneView::get_constructor_address()) {
+        log_addr("FSceneView::FSceneView (SDK-resolved, may differ from hooked)", *constructor);
+    }
+
+    SPDLOG_INFO("[VR][ADDR-DUMP] ================== END STEREO ADDRESS DUMP ==================");
+}
+
+// DIAG: runtime-only reconstruction of "how the stereo pass is set up", built entirely from live call
+// data (no static analysis). Each participating hook reports its own per-eye observation for the
+// CURRENT frame (g_frame_count) into m_stereo_setup_eyes[true_index]; once both slots have a
+// calculate_stereo_view_offset sample for the same frame, a single consolidated line is emitted and
+// the record is reset for the next frame. This directly answers: is the engine calling both eyes this
+// frame, what raw view_index maps to which true_index, is AFR active, what viewport rect did
+// AdjustViewRect assign to each eye, and did CalculateStereoProjectionMatrix actually run for both.
+// NOTE: must be called with m_stereo_setup_mutex already held; does not lock itself.
+void FFakeStereoRenderingHook::maybe_log_stereo_setup_summary() {
+    auto& left = m_stereo_setup_eyes[0];
+    auto& right = m_stereo_setup_eyes[1];
+
+    if (!left.got_view_offset || !right.got_view_offset) {
+        return;
+    }
+
+    SPDLOG_WARN("[VR][STEREO-SETUP] frame={} is_afr={}/{} | L: raw_idx={} true_idx={} x={} y={} w={} h={} avr_calls={} svo_calls={} proj_calls={} | R: raw_idx={} true_idx={} x={} y={} w={} h={} avr_calls={} svo_calls={} proj_calls={}",
+        m_stereo_setup_frame,
+        left.is_afr, right.is_afr,
+        left.raw_view_index, left.true_index, left.x, left.y, left.w, left.h, left.adjust_view_rect_calls, left.view_offset_calls, left.projection_matrix_calls,
+        right.raw_view_index, right.true_index, right.x, right.y, right.w, right.h, right.adjust_view_rect_calls, right.view_offset_calls, right.projection_matrix_calls);
+
+    left = {};
+    right = {};
+    m_stereo_setup_frame = 0xFFFFFFFF;
+}
+
+// DIAG: shared helper - any of the three report_stereo_setup_* callers can be the FIRST one to touch
+// a given frame (call order between AdjustViewRect / CalculateStereoViewOffset /
+// CalculateStereoProjectionMatrix is not guaranteed and is itself part of what we're diagnosing), so
+// the frame record must be (re)initialized by whichever one sees a new g_frame_count first. Must be
+// called with m_stereo_setup_mutex already held.
+void FFakeStereoRenderingHook::ensure_stereo_setup_frame_locked() {
+    if (m_stereo_setup_frame != g_frame_count) {
+        m_stereo_setup_eyes[0] = {};
+        m_stereo_setup_eyes[1] = {};
+        m_stereo_setup_frame = g_frame_count;
+    }
+}
+
+void FFakeStereoRenderingHook::report_stereo_setup_view_offset(uint32_t true_index, int32_t raw_view_index, bool is_afr) {
+    if (true_index > 1) {
+        return;
+    }
+
+    std::scoped_lock _{m_stereo_setup_mutex};
+
+    ensure_stereo_setup_frame_locked();
+
+    auto& eye = m_stereo_setup_eyes[true_index];
+    eye.seen = true;
+    eye.true_index = true_index;
+    eye.raw_view_index = raw_view_index;
+    eye.is_afr = is_afr;
+    eye.got_view_offset = true;
+    ++eye.view_offset_calls;
+
+    maybe_log_stereo_setup_summary();
+}
+
+void FFakeStereoRenderingHook::report_stereo_setup_view_rect(uint32_t true_index, int32_t x, int32_t y, uint32_t w, uint32_t h) {
+    if (true_index > 1) {
+        return;
+    }
+
+    std::scoped_lock _{m_stereo_setup_mutex};
+
+    ensure_stereo_setup_frame_locked();
+
+    auto& eye = m_stereo_setup_eyes[true_index];
+    eye.x = x;
+    eye.y = y;
+    eye.w = w;
+    eye.h = h;
+    ++eye.adjust_view_rect_calls;
+}
+
+void FFakeStereoRenderingHook::report_stereo_setup_projection_matrix(uint32_t true_index) {
+    if (true_index > 1) {
+        return;
+    }
+
+    std::scoped_lock _{m_stereo_setup_mutex};
+
+    ensure_stereo_setup_frame_locked();
+
+    auto& eye = m_stereo_setup_eyes[true_index];
+    eye.got_projection_matrix = true;
+    ++eye.projection_matrix_calls;
+}
+
 void FFakeStereoRenderingHook::attempt_hook_fsceneview_constructor() {
     if (m_attempted_hook_fsceneview_constructor) {
         return;
@@ -785,6 +938,14 @@ void FFakeStereoRenderingHook::attempt_hook_fsceneview_constructor() {
 
     g_hook->m_sceneview_data.constructor_hook = safetyhook::create_inline(*constructor, (uintptr_t)&sceneview_constructor, safetyhook::InlineHook::StartDisabled);
 
+    // DIAG: log the module-relative RVA too, not just the raw (ASLR'd) VA, so it can be cross-referenced
+    // against static analysis tools (Ghidra/IDA) across different sessions/launches without needing to
+    // account for ASLR each time.
+    if (const auto module_within = utility::get_module_within(*constructor)) {
+        const auto rva = *constructor - (uintptr_t)*module_within;
+        SPDLOG_INFO("[FSceneView] Constructor module-relative RVA: 0x{:x} (module base 0x{:x})", rva, (uintptr_t)*module_within);
+    }
+
     if (!g_hook->m_sceneview_data.constructor_hook) {
         SPDLOG_ERROR("Failed to hook FSceneView::FSceneView constructor!");
         return;
@@ -798,6 +959,177 @@ void FFakeStereoRenderingHook::attempt_hook_fsceneview_constructor() {
     SPDLOG_INFO("Hooked FSceneView::FSceneView constructor!");
 }
 
+// DIAG: see VR::is_diag_hook_dual_view_gate_enabled() for full rationale. This hooks a statically-
+// confirmed function (found via static disassembly, not decompilation - offset 0x10C on both incoming
+// pointers matches the same StereoPass offset confirmed via [VR][SVC-RAW-STEREO-PASS]) that gates a
+// shared-state/cache path on whether two view-shaped pointers' StereoPass values match. Pure observer:
+// logs both pointers/StereoPass bytes/g_frame_count/return value and calls through unchanged, so it's
+// safe to leave enabled while reproducing the double-vision artifact.
+bool FFakeStereoRenderingHook::dual_view_gate_hook(void* view_a, void* view_b) {
+    constexpr uintptr_t stereo_pass_offset = 0x10C;
+
+    uint8_t pass_a = 0xFF;
+    uint8_t pass_b = 0xFF;
+
+    if (view_a != nullptr && !IsBadReadPtr((void*)((uintptr_t)view_a + stereo_pass_offset), sizeof(uint8_t))) {
+        pass_a = *(uint8_t*)((uintptr_t)view_a + stereo_pass_offset);
+    }
+
+    if (view_b != nullptr && !IsBadReadPtr((void*)((uintptr_t)view_b + stereo_pass_offset), sizeof(uint8_t))) {
+        pass_b = *(uint8_t*)((uintptr_t)view_b + stereo_pass_offset);
+    }
+
+    const auto result = g_hook->m_dual_view_gate_hook.call<bool>(view_a, view_b);
+
+    SPDLOG_INFO_EVERY_N_SEC(1, "[VR][DUAL-VIEW-GATE] frame={} view_a={:x} view_b={:x} same_ptr={} pass_a={} pass_b={} passes_match={} result={}",
+        g_frame_count, (uintptr_t)view_a, (uintptr_t)view_b, view_a == view_b, pass_a, pass_b, pass_a == pass_b, result);
+
+    return result;
+}
+
+void FFakeStereoRenderingHook::attempt_hook_dual_view_gate() {
+    if (m_attempted_hook_dual_view_gate) {
+        return;
+    }
+
+    auto& vr = VR::get();
+
+    if (!vr->is_diag_hook_dual_view_gate_enabled()) {
+        return;
+    }
+
+    m_attempted_hook_dual_view_gate = true;
+
+    // DIAG: static analysis (via debugger module view) confirmed this function actually lives inside
+    // client-win64-shippingbase.dll, NOT the main executable, so the RVA must be applied to that
+    // module's base address instead of utility::get_executable(). Falls back to the exe base if the
+    // DLL isn't loaded (e.g. different build), though the hook will likely fail in that case.
+    auto* module_base = GetModuleHandleA("client-win64-shippingbase.dll");
+
+    if (module_base == nullptr) {
+        SPDLOG_ERROR("[VR][DUAL-VIEW-GATE] client-win64-shippingbase.dll not found, falling back to exe base (this will likely be wrong)");
+        module_base = (HMODULE)utility::get_executable();
+    }
+
+    const auto rva = vr->get_diag_dual_view_gate_rva();
+    const auto target = (uintptr_t)module_base + rva;
+
+    SPDLOG_INFO("[VR][DUAL-VIEW-GATE] Attempting to hook dual-view gate function at {:x} (module_base={:x} + {:x})", target, (uintptr_t)module_base, rva);
+
+    if (!IsBadReadPtr((void*)target, 16)) {
+        const auto* bytes = (const uint8_t*)target;
+        SPDLOG_INFO("[VR][DUAL-VIEW-GATE] Bytes at target: {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}",
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+            bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]);
+    } else {
+        SPDLOG_ERROR("[VR][DUAL-VIEW-GATE] Target address is not readable!");
+    }
+
+    auto hook_result = safetyhook::InlineHook::create((void*)target, (void*)&FFakeStereoRenderingHook::dual_view_gate_hook, safetyhook::InlineHook::StartDisabled);
+
+    if (!hook_result) {
+        const auto& err = hook_result.error();
+        SPDLOG_ERROR("[VR][DUAL-VIEW-GATE] Failed to hook dual-view gate function! error_type={} ip={:x}",
+            (int)err.type, (uintptr_t)err.ip);
+        return;
+    }
+
+    m_dual_view_gate_hook = std::move(*hook_result);
+
+    if (auto enable_result = m_dual_view_gate_hook.enable(); !enable_result.has_value()) {
+        SPDLOG_ERROR("[VR][DUAL-VIEW-GATE] Failed to enable dual-view gate hook! {}", (int)enable_result.error().type);
+        return;
+    }
+
+    SPDLOG_INFO("[VR][DUAL-VIEW-GATE] Hooked dual-view gate function!");
+}
+
+// DIAG: safer alternative to attempt_hook_dual_view_gate() above. Instead of inline-hooking the gate
+// function itself (which crashed via a bad trampoline relocation inside hot AVX/vectorized code), this
+// hooks the CALL instruction site at its caller. A MidHook over an ordinary `call` opcode only needs to
+// relocate that one instruction, which is far safer than relocating the first N instructions of a
+// vectorized function body. At the call site, rcx/rdx still hold the two view-shaped pointer arguments
+// per the Windows x64 calling convention, before they're passed to the gate function.
+void FFakeStereoRenderingHook::dual_view_gate_caller_hook(safetyhook::Context& ctx) {
+    constexpr uintptr_t stereo_pass_offset = 0x10C;
+
+    auto* view_a = (void*)ctx.rcx;
+    auto* view_b = (void*)ctx.rdx;
+
+    uint8_t pass_a = 0xFF;
+    uint8_t pass_b = 0xFF;
+
+    if (view_a != nullptr && !IsBadReadPtr((void*)((uintptr_t)view_a + stereo_pass_offset), sizeof(uint8_t))) {
+        pass_a = *(uint8_t*)((uintptr_t)view_a + stereo_pass_offset);
+    }
+
+    if (view_b != nullptr && !IsBadReadPtr((void*)((uintptr_t)view_b + stereo_pass_offset), sizeof(uint8_t))) {
+        pass_b = *(uint8_t*)((uintptr_t)view_b + stereo_pass_offset);
+    }
+
+    SPDLOG_INFO_EVERY_N_SEC(1, "[VR][DUAL-VIEW-GATE-CALLER] frame={} view_a={:x} view_b={:x} same_ptr={} pass_a={} pass_b={} passes_match={}",
+        g_frame_count, (uintptr_t)view_a, (uintptr_t)view_b, view_a == view_b, pass_a, pass_b, pass_a == pass_b);
+}
+
+void FFakeStereoRenderingHook::attempt_hook_dual_view_gate_caller() {
+    if (m_attempted_hook_dual_view_gate_caller) {
+        return;
+    }
+
+    auto& vr = VR::get();
+
+    if (!vr->is_diag_hook_dual_view_gate_caller_enabled()) {
+        return;
+    }
+
+    m_attempted_hook_dual_view_gate_caller = true;
+
+    const auto rva = vr->get_diag_dual_view_gate_caller_rva();
+
+    if (rva == 0) {
+        SPDLOG_ERROR("[VR][DUAL-VIEW-GATE-CALLER] RVA is 0 (unset placeholder) - refusing to hook. Find the real caller call-site RVA in a debugger first.");
+        return;
+    }
+
+    auto* module_base = GetModuleHandleA("client-win64-shippingbase.dll");
+
+    if (module_base == nullptr) {
+        SPDLOG_ERROR("[VR][DUAL-VIEW-GATE-CALLER] client-win64-shippingbase.dll not found, falling back to exe base (this will likely be wrong)");
+        module_base = (HMODULE)utility::get_executable();
+    }
+
+    const auto target = (uintptr_t)module_base + rva;
+
+    SPDLOG_INFO("[VR][DUAL-VIEW-GATE-CALLER] Attempting to hook dual-view gate CALLER at {:x} (module_base={:x} + {:x})", target, (uintptr_t)module_base, rva);
+
+    if (!IsBadReadPtr((void*)target, 16)) {
+        const auto* bytes = (const uint8_t*)target;
+        SPDLOG_INFO("[VR][DUAL-VIEW-GATE-CALLER] Bytes at target: {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}",
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+            bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]);
+    } else {
+        SPDLOG_ERROR("[VR][DUAL-VIEW-GATE-CALLER] Target address is not readable!");
+    }
+
+    auto hook_result = safetyhook::MidHook::create((void*)target, &FFakeStereoRenderingHook::dual_view_gate_caller_hook);
+
+    if (!hook_result) {
+        const auto& err = hook_result.error();
+
+        if (err.type == safetyhook::MidHook::Error::BAD_ALLOCATION) {
+            SPDLOG_ERROR("[VR][DUAL-VIEW-GATE-CALLER] Failed to hook: BAD_ALLOCATION: {}", (uint8_t)err.allocator_error);
+        } else {
+            SPDLOG_ERROR("[VR][DUAL-VIEW-GATE-CALLER] Failed to hook: BAD_INLINE_HOOK: {}", (uint8_t)err.inline_hook_error.type);
+        }
+
+        return;
+    }
+
+    m_dual_view_gate_caller_hook = std::move(*hook_result);
+
+    SPDLOG_INFO("[VR][DUAL-VIEW-GATE-CALLER] Hooked dual-view gate caller!");
+}
+
 bool FFakeStereoRenderingHook::hook() {
     SPDLOG_INFO("Entering FFakeStereoRenderingHook::hook");
 
@@ -806,6 +1138,33 @@ bool FFakeStereoRenderingHook::hook() {
     // Locking the hook monitor mutex stops our code from trying to re-hook DX11 and 12 after
     // Long pauses in code execution, due to us doing massive scans for code in this function.
     std::scoped_lock _{g_framework->get_hook_monitor_mutex()};
+
+    // DIAG/MITIGATION: This title only ever calls CalculateStereoProjectionMatrix once per frame
+    // (confirmed by the runtime STEREO-SETUP logs, which show proj_calls=0 for the left eye on
+    // every single frame in the reported double-vision window, while AdjustViewRect and
+    // CalculateStereoViewOffset both correctly fire once per eye). That single-call-per-frame
+    // projection pattern is the signature of Instanced Stereo Rendering (ISR), where the engine
+    // computes one shared projection matrix instead of calling this function twice. Force ISR off
+    // so the engine falls back to two genuine, separate per-eye stereo passes, which is what the
+    // existing per-eye projection override logic below assumes.
+    {
+        static bool attempted_disable_instanced_stereo = false;
+
+        if (!attempted_disable_instanced_stereo) {
+            attempted_disable_instanced_stereo = true;
+
+            for (const auto& cvar_name : {L"vr.InstancedStereo", L"r.Mobile.InstancedStereo"}) {
+                auto cvar = sdk::find_cvar_cached(L"Engine", cvar_name);
+
+                if (cvar != nullptr && *cvar != nullptr) {
+                    SPDLOG_INFO("[VR] Forcing {} to 0 to disable Instanced Stereo Rendering", utility::narrow(cvar_name));
+                    (*cvar)->Set(L"0");
+                } else {
+                    SPDLOG_WARN("[VR] Could not find cvar {} to disable Instanced Stereo Rendering", utility::narrow(cvar_name));
+                }
+            }
+        }
+    }
 
     const auto vtable = locate_fake_stereo_rendering_vtable();
 
@@ -7321,6 +7680,28 @@ sdk::FSceneView* FFakeStereoRenderingHook::sceneview_constructor(sdk::FSceneView
                 init_options_projection_matrix = proj_mat;
             }
         }
+
+        // DIAG: NSF-SCENEVIEW-DIVERGE. Logs the actual pose (view origin + euler rotation) that was
+        // just sampled and written into this FSceneView's init_options, tagged by frame and true_index
+        // (0=left, 1=right). Unlike calculate_stereo_view_offset()'s own internal diagnostics, this
+        // captures the pose at the exact point of construction for THIS specific view, so Pass1 (left)
+        // and Pass2 (right) can be directly diffed per-frame to prove/disprove whether one eye is
+        // reading a stale/un-updated pose relative to the other (the core double-vision hypothesis).
+        if (vr->is_diag_log_raw_view_index_enabled()) {
+            static thread_local uint32_t s_last_diverge_log_frame[2] = {0xFFFFFFFFu, 0xFFFFFFFFu};
+
+            const auto idx = (uint32_t)true_index & 1u;
+
+            if (s_last_diverge_log_frame[idx] != g_frame_count) {
+                s_last_diverge_log_frame[idx] = g_frame_count;
+
+                SPDLOG_WARN("[VR][NSF-SCENEVIEW-DIVERGE] frame={} true_index={} view_origin=({:.3f},{:.3f},{:.3f}) euler=({:.3f},{:.3f},{:.3f}) view={:x}",
+                    g_frame_count, true_index,
+                    init_options_view_origin.x, init_options_view_origin.y, init_options_view_origin.z,
+                    euler.x, euler.y, euler.z,
+                    (uintptr_t)view);
+            }
+        }
     }
 
     const auto init_options_stereo_pass = init_options->get_stereo_pass();
@@ -7504,6 +7885,14 @@ sdk::FSceneView* FFakeStereoRenderingHook::sceneview_constructor(sdk::FSceneView
     last_index++;
 
     auto result = g_hook->m_sceneview_data.constructor_hook.unsafe_call<sdk::FSceneView*>(view, init_options, a3, a4);
+
+    // FALLBACK: cache this eye's constructed FSceneView* so calculate_stereo_projection_matrix's
+    // dual-write fallback can find the OTHER eye's view when the engine only calls
+    // CalculateStereoProjectionMatrix once per frame. Only cache confirmed real stereo eyes.
+    if (!is_confirmed_non_eye_pass && result != nullptr && true_index < 2) {
+        g_hook->m_sceneview_data.cached_view_for_eye[true_index] = result;
+        g_hook->m_sceneview_data.cached_view_frame_count[true_index] = g_frame_count;
+    }
 
     if (vr->is_native_stereo_fix_same_pass_force_primary_enabled()) {
         SPDLOG_INFO(
@@ -10505,6 +10894,11 @@ void FFakeStereoRenderingHook::adjust_view_rect(FFakeStereoRendering* stereo, in
     }
     g_hook->m_has_seen_eye_x_offsets = true;
 
+    // DIAG: feed this eye's final viewport rect into the runtime stereo-setup summary (see
+    // report_stereo_setup_view_rect for rationale). true_index here matches the same classification
+    // reported to calculate_stereo_view_offset, so the two can be correlated in the summary line.
+    g_hook->report_stereo_setup_view_rect(true_index, *x, *y, *w, *h);
+
     // DIAG: throttled visibility into the final per-eye viewport rect produced by AdjustViewRect.
     // If one eye's rect is ever zero-sized (w/h == 0) or has an out-of-range x/y offset, the engine
     // simply never renders any scene geometry into that eye's portion of the backbuffer, which would
@@ -10583,15 +10977,18 @@ __forceinline void FFakeStereoRenderingHook::calculate_stereo_view_offset(
     // frame with no matching FSceneView construction at all (consistent with a shadow-cascade/light-
     // view transform query). NSF-CALLER-SITE alone can't distinguish these, since it only captures
     // the immediate return address, which both behaviors apparently share. Walk further up the stack
-    // (skipping this function and its immediate caller) to capture a short chain of return addresses,
-    // and bucket the sample by how many times view_index==1 has already fired THIS frame, so we get
-    // one sample from a low-count ("UI capture"-like) frame and one from a high-count ("shadow-view"-
-    // like, 900+/frame) frame per session, without spamming every single call.
+    // (skipping this function and its immediate caller) to capture a short chain of return addresses.
+    //
+    // UPGRADED: instead of sampling only one LOW_COUNT and one HIGH_COUNT frame per session (which
+    // only ever showed 1-2 of the possibly many distinct subsystems that reuse view_index==1), this
+    // now logs EVERY distinct stack signature seen for view_index==1, deduplicated by a hash of the
+    // captured RVA chain, so all distinct callers polluting true_index==0 can be enumerated once each
+    // (not spammed every frame) and then individually identified/filtered.
     if (view_index == 1 && VR::get() != nullptr && VR::get()->is_diag_log_raw_view_index_enabled()) {
         static uint32_t s_index1_calls_this_frame = 0;
         static uint32_t s_index1_last_frame = 0xFFFFFFFFu;
-        static bool s_logged_low_count_sample = false;
-        static bool s_logged_high_count_sample = false;
+        static std::unordered_set<uint64_t> s_seen_stack_signatures;
+        static std::mutex s_seen_stack_signatures_mutex;
 
         if (g_frame_count != s_index1_last_frame) {
             s_index1_last_frame = g_frame_count;
@@ -10600,18 +10997,30 @@ __forceinline void FFakeStereoRenderingHook::calculate_stereo_view_offset(
 
         ++s_index1_calls_this_frame;
 
-        // "Low count" sample: first time we see view_index==1 fire only a handful of times in a
-        // frame (matches the tiled-64x64-capture behavior observed earlier in sessions).
-        const bool want_low_sample = !s_logged_low_count_sample && s_index1_calls_this_frame >= 2 && s_index1_calls_this_frame <= 5;
-        // "High count" sample: fires far more than a real per-eye call ever should in one frame
-        // (matches the 900+/frame no-FSceneView behavior observed later in the same session).
-        const bool want_high_sample = !s_logged_high_count_sample && s_index1_calls_this_frame >= 100;
+        constexpr auto max_stack_depth = 16;
+        uintptr_t stack[max_stack_depth]{};
+        const auto depth = RtlCaptureStackBackTrace(0, max_stack_depth, (void**)&stack, nullptr);
 
-        if (want_low_sample || want_high_sample) {
-            constexpr auto max_stack_depth = 16;
-            uintptr_t stack[max_stack_depth]{};
-            const auto depth = RtlCaptureStackBackTrace(0, max_stack_depth, (void**)&stack, nullptr);
+        // Hash the raw (module-relative where possible) RVA chain so the same calling subsystem
+        // always produces the same signature regardless of which specific call-count this is.
+        uint64_t signature = 1469598103934665603ull; // FNV-1a offset basis
 
+        for (auto i = 0; i < depth; ++i) {
+            const auto frame_addr = stack[i];
+            const auto module_within = utility::get_module_within(frame_addr);
+            const auto key = module_within ? (frame_addr - (uintptr_t)*module_within) : frame_addr;
+
+            signature ^= key;
+            signature *= 1099511628211ull; // FNV-1a prime
+        }
+
+        bool is_new_signature = false;
+        {
+            std::scoped_lock _{s_seen_stack_signatures_mutex};
+            is_new_signature = s_seen_stack_signatures.insert(signature).second;
+        }
+
+        if (is_new_signature) {
             std::string chain;
             for (auto i = 0; i < depth; ++i) {
                 const auto frame_addr = stack[i];
@@ -10625,16 +11034,8 @@ __forceinline void FFakeStereoRenderingHook::calculate_stereo_view_offset(
                 }
             }
 
-            SPDLOG_WARN("[VR][NSF-STACKWALK-INDEX1] sample_kind={} frame={} calls_this_frame={} stack_rvas=[ {}]",
-                want_low_sample ? "LOW_COUNT" : "HIGH_COUNT", g_frame_count, s_index1_calls_this_frame, chain);
-
-            if (want_low_sample) {
-                s_logged_low_count_sample = true;
-            }
-
-            if (want_high_sample) {
-                s_logged_high_count_sample = true;
-            }
+            SPDLOG_WARN("[VR][NSF-STACKWALK-INDEX1] NEW_SIGNATURE sig=0x{:x} frame={} calls_this_frame={} stack_rvas=[ {}]",
+                signature, g_frame_count, s_index1_calls_this_frame, chain);
         }
     }
 
@@ -10680,6 +11081,18 @@ __forceinline void FFakeStereoRenderingHook::calculate_stereo_view_offset(
     // This is eSSP_FULL, we don't care. It will cause the view to become monoscopic if we do anything.
     if (index_was_ever_two && view_index == 0) {
         SPDLOG_INFO_ONCE("calculate stereo view offset called with view index 0 after 2, ignoring.");
+        return;
+    }
+
+    // EXPERIMENT: on titles where real eye indices land at 2/3 instead of the stock 1/2 (this game
+    // logs raw view_index 2/3 for its two eyes), index 1 is suspected to be an extra/monoscopic view
+    // slot inserted ahead of the real eyes (mirroring the eSSP_MONOSCOPIC_EYE-style insertion Epic
+    // later did upstream to EStereoscopicPass). Treat it the same way index 0 is already treated
+    // above once we've confirmed we're in the 2/3 scheme: skip it entirely so it can't pollute the
+    // NSF sync-pose cache or the eye-offset math with a third, non-stereo view's pose.
+    if (index_was_ever_two && view_index == 1 && vr->is_diag_treat_view_index_1_as_monoscopic_enabled()) {
+        SPDLOG_INFO_EVERY_N_SEC(2, "[VR][DIAG-INDEX1-MONO] calculate_stereo_view_offset called with view_index=1 after 2, treating as monoscopic/extra view and ignoring. frame={}",
+            g_frame_count);
         return;
     }
 
@@ -10737,6 +11150,11 @@ __forceinline void FFakeStereoRenderingHook::calculate_stereo_view_offset(
                 index_starts_from_one ? ((view_index + 1) % 2) : (view_index % 2));
         }
     }
+
+    // DIAG: feed this eye's classification into the runtime stereo-setup summary (see
+    // report_stereo_setup_view_offset for rationale). Uses the same true_index/view_index this
+    // function itself just computed, so it reflects exactly what the rest of this function will act on.
+    g_hook->report_stereo_setup_view_offset(true_index, view_index, vr->is_using_afr());
 
     // DIAG: world_to_meters is supplied per-call (effectively per-eye) but immediately clobbers a single
     // shared vr->m_world_to_meters value that is then read back later (as world_scale) for whichever eye
@@ -11791,6 +12209,10 @@ __forceinline Matrix4x4f* FFakeStereoRenderingHook::calculate_stereo_projection_
             ++proj_call_index;
         }
 
+        // DIAG: feed this eye's projection-matrix touch into the runtime stereo-setup summary (see
+        // report_stereo_setup_projection_matrix for rationale).
+        g_hook->report_stereo_setup_projection_matrix(true_index);
+
         // DIAG: NSF (native_stereo_fix_enabled && !is_using_afr) projection-matrix divergence trace.
         // calculate_stereo_view_offset's NSF-POSE-DIVERGE-TRACE proved rot/pos delta is consistently
         // 0.0000 during the reported "zoom" artifact (menu open, conversation camera switch), which
@@ -11865,6 +12287,63 @@ __forceinline Matrix4x4f* FFakeStereoRenderingHook::calculate_stereo_projection_
         } else {
             const auto fmat = VR::get()->get_projection_matrix((VRRuntime::Eye)(true_index));
             double_matrix = fmat;
+        }
+
+        // FALLBACK: this title only ever calls CalculateStereoProjectionMatrix ONCE per frame (it
+        // is natively a 2D game; forcing vr.InstancedStereo=0 did not change this - confirmed via
+        // runtime STEREO-SETUP logs still showing proj_calls=0 for the un-called eye on every
+        // frame). Since the engine will never call this function a second time for the other eye
+        // this frame, directly patch that eye's cached FSceneView's ViewProjectionMatrix ourselves,
+        // using the byte offset of `out` relative to THIS eye's cached FSceneView* (found via
+        // sceneview_constructor) applied to the OTHER eye's cached FSceneView*. This avoids needing
+        // init_canvas()'s offset scan, which never runs in this title.
+        if (!vr->is_using_afr() && vr->is_native_stereo_fix_dual_write_projection_enabled()) {
+            const auto other_index = 1 - true_index;
+
+            auto& sceneview_data = g_hook->m_sceneview_data;
+            auto* this_eye_view = sceneview_data.cached_view_for_eye[true_index];
+            auto* other_eye_view = sceneview_data.cached_view_for_eye[other_index];
+
+            const bool views_fresh =
+                this_eye_view != nullptr && other_eye_view != nullptr &&
+                sceneview_data.cached_view_frame_count[true_index] == g_frame_count &&
+                sceneview_data.cached_view_frame_count[other_index] == g_frame_count;
+
+            if (views_fresh) {
+                const auto this_eye_view_addr = (uintptr_t)this_eye_view;
+                const auto out_addr = (uintptr_t)out;
+
+                // Sanity: `out` must actually live inside this eye's FSceneView, and the computed
+                // offset must be small/plausible, otherwise bail rather than write to a wild address.
+                constexpr uintptr_t max_plausible_offset = 0x2000;
+
+                if (out_addr >= this_eye_view_addr && (out_addr - this_eye_view_addr) < max_plausible_offset) {
+                    const auto matrix_offset = out_addr - this_eye_view_addr;
+                    auto* other_out = (Matrix4x4f*)((uintptr_t)other_eye_view + matrix_offset);
+
+                    if (!IsBadWritePtr(other_out, g_hook->m_has_double_precision ? sizeof(Matrix4x4d) : sizeof(Matrix4x4f))) {
+                        if (!g_hook->m_has_double_precision) {
+                            *other_out = VR::get()->get_projection_matrix((VRRuntime::Eye)(other_index));
+                        } else {
+                            auto& other_double_matrix = *(Matrix4x4d*)other_out;
+                            const auto other_fmat = VR::get()->get_projection_matrix((VRRuntime::Eye)(other_index));
+                            other_double_matrix = other_fmat;
+                        }
+
+                        SPDLOG_INFO_EVERY_N_SEC(2, "[VR][NSF-PROJ-DUAL-WRITE] frame={} wrote other_index={} at offset={:x} (this_view={:x} other_view={:x})",
+                            g_frame_count, other_index, matrix_offset, (uintptr_t)this_eye_view, (uintptr_t)other_eye_view);
+                    } else {
+                        SPDLOG_WARNING_EVERY_N_SEC(2, "[VR][NSF-PROJ-DUAL-WRITE] frame={} SKIPPED: computed other_out address {:x} failed write-access check",
+                            g_frame_count, (uintptr_t)other_out);
+                    }
+                } else {
+                    SPDLOG_WARNING_EVERY_N_SEC(2, "[VR][NSF-PROJ-DUAL-WRITE] frame={} SKIPPED: implausible offset (out={:x} this_view={:x})",
+                        g_frame_count, out_addr, this_eye_view_addr);
+                }
+            } else {
+                SPDLOG_WARNING_EVERY_N_SEC(2, "[VR][NSF-PROJ-DUAL-WRITE] frame={} SKIPPED: cached views not fresh (this_view={:x} other_view={:x})",
+                    g_frame_count, (uintptr_t)this_eye_view, (uintptr_t)other_eye_view);
+            }
         }
 
         // DIAG: NSF-PROJ-VALUE. Capture the FINAL (post-override) per-eye projection FOV terms so
@@ -12153,10 +12632,24 @@ EStereoscopicPass FFakeStereoRenderingHook::get_view_pass_for_index_hook(FFakeSt
     // On 5.0.3 this check is not here, it was only added in 5.1
     // So we need to imitate it here to prevent a crash
     if (!stereo_requested || view_index < 0) {
+        SPDLOG_INFO_EVERY_N_SEC(2, "[DIAG] get_view_pass_for_index_hook: retaddr={:x} stereo_requested={} view_index={} -> returning eSSP_FULL({})",
+            (uintptr_t)_ReturnAddress(), stereo_requested, view_index, (uint32_t)EStereoscopicPass::eSSP_FULL);
         return EStereoscopicPass::eSSP_FULL;
     }
 
-    return view_index % 2 == 0 ? EStereoscopicPass::eSSP_PRIMARY : EStereoscopicPass::eSSP_SECONDARY;
+    const auto assigned_pass = view_index % 2 == 0 ? EStereoscopicPass::eSSP_PRIMARY : EStereoscopicPass::eSSP_SECONDARY;
+
+    // DIAG: this is the raw integer UEVR is telling the engine to use for this view_index via the
+    // virtual GetViewPassForIndex call. Compare against the raw_stereo_pass logged from
+    // FSceneViewInitOptionsBase::get_stereo_pass() (see ~line 7227) for the SAME view_index/frame.
+    // If the values captured off the live FSceneView/init_options diverge from what's returned here,
+    // it proves this hook is not authoritative for StereoPass assignment on this title, and some other
+    // native code path (not routed through GetViewPassForIndex) is setting StereoPass independently.
+    SPDLOG_INFO_EVERY_N_SEC(2, "[DIAG] get_view_pass_for_index_hook: retaddr={:x} stereo_requested={} view_index={} -> assigned_pass={} (eSSP_PRIMARY={}, eSSP_SECONDARY={})",
+        (uintptr_t)_ReturnAddress(), stereo_requested, view_index, (uint32_t)assigned_pass,
+        (uint32_t)EStereoscopicPass::eSSP_PRIMARY, (uint32_t)EStereoscopicPass::eSSP_SECONDARY);
+
+    return assigned_pass;
 }
 
 IStereoRenderTargetManager* FFakeStereoRenderingHook::get_render_target_manager_hook(FFakeStereoRendering* stereo) {
