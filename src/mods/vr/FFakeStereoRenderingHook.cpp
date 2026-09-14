@@ -825,13 +825,13 @@ void FFakeStereoRenderingHook::maybe_log_stereo_setup_summary() {
     if (!left.got_view_offset || !right.got_view_offset) {
         return;
     }
-
-    SPDLOG_WARN("[VR][STEREO-SETUP] frame={} is_afr={}/{} | L: raw_idx={} true_idx={} x={} y={} w={} h={} avr_calls={} svo_calls={} proj_calls={} | R: raw_idx={} true_idx={} x={} y={} w={} h={} avr_calls={} svo_calls={} proj_calls={}",
-        m_stereo_setup_frame,
-        left.is_afr, right.is_afr,
-        left.raw_view_index, left.true_index, left.x, left.y, left.w, left.h, left.adjust_view_rect_calls, left.view_offset_calls, left.projection_matrix_calls,
-        right.raw_view_index, right.true_index, right.x, right.y, right.w, right.h, right.adjust_view_rect_calls, right.view_offset_calls, right.projection_matrix_calls);
-
+    if (VR::get()->is_stereopass_diagnostics()) {
+        SPDLOG_WARN("[VR][STEREO-SETUP] frame={} is_afr={}/{} | L: raw_idx={} true_idx={} x={} y={} w={} h={} avr_calls={} svo_calls={} "
+                    "proj_calls={} | R: raw_idx={} true_idx={} x={} y={} w={} h={} avr_calls={} svo_calls={} proj_calls={}",
+            m_stereo_setup_frame, left.is_afr, right.is_afr, left.raw_view_index, left.true_index, left.x, left.y, left.w, left.h,
+            left.adjust_view_rect_calls, left.view_offset_calls, left.projection_matrix_calls, right.raw_view_index, right.true_index,
+            right.x, right.y, right.w, right.h, right.adjust_view_rect_calls, right.view_offset_calls, right.projection_matrix_calls);
+    }
     left = {};
     right = {};
     m_stereo_setup_frame = 0xFFFFFFFF;
@@ -4555,9 +4555,11 @@ static void lgui_note_a3_seen(uintptr_t a3_key, uint64_t frame, int32_t w, int32
         // same heap address for a brand-new, unrelated FRDGTexture object - a textbook precondition for
         // a use-after-free in any OTHER code (e.g. the game's own menu-blur pass) that still holds a
         // pointer/index referencing the old object at this address.
-        SPDLOG_WARN("[LGUI_A3_LIFECYCLE] address REUSE: a3={:x} was reclaimed {}ms ago and has reappeared "
-                    "(seen {} times previously, first seen frame {}) - engine likely allocated a new object at a freed address",
-            a3_key, (now - hist.reclaimed_time_us) / 1000, hist.redirect_count, hist.first_seen_frame);
+        if (VR::get()->is_lgui_logging_enabled()) {
+            SPDLOG_WARN("[LGUI_A3_LIFECYCLE] address REUSE: a3={:x} was reclaimed {}ms ago and has reappeared "
+                        "(seen {} times previously, first seen frame {}) - engine likely allocated a new object at a freed address",
+                a3_key, (now - hist.reclaimed_time_us) / 1000, hist.redirect_count, hist.first_seen_frame);
+        }
         hist.reclaimed = false;
         hist.first_seen_frame = frame; // treat as a new "generation" for lifetime purposes
         hist.first_seen_time_us = now;
@@ -4667,9 +4669,11 @@ static void lgui_note_new_a3_for_rate_tracking() {
         // popup/menu open) so this only fires on genuine churn spikes, not routine 1-2/sec background noise.
         constexpr uint64_t LGUI_A3_CHURN_SPIKE_THRESHOLD = 5;
         if (count >= LGUI_A3_CHURN_SPIKE_THRESHOLD) {
-            SPDLOG_WARN("[LGUI_A3_CHURN] {} new distinct a3 render targets created in the last ~{}ms - "
-                        "possible menu/popup transition causing a burst of new RDG texture allocations",
-                count, elapsed_ms);
+            if (VR::get()->is_lgui_logging_enabled()) {
+                SPDLOG_WARN("[LGUI_A3_CHURN] {} new distinct a3 render targets created in the last ~{}ms - "
+                            "possible menu/popup transition causing a burst of new RDG texture allocations",
+                    count, elapsed_ms);
+            }
         }
     } else {
         g_lgui_new_a3_this_window.fetch_add(1, std::memory_order_relaxed);
@@ -5196,75 +5200,79 @@ static void* lgui_slot24_hook(void* self, void* a2, void* a3, void* a4, void* a5
     // "the cutscene box appeared/disappeared" or "HP bars started following the HUD" without touching
     // behavior at all yet.
     constexpr bool LGUI_DIAG_LIST_IDENTITIES = true;
-    if (LGUI_DIAG_LIST_IDENTITIES) {
-        struct LguiSelfInfo {
-            uint32_t index;
-            uintptr_t vtable;
-            uint64_t call_count{0};
-            uint64_t last_seen_frame{0};
-        };
-        struct LguiA3Info {
-            uint32_t index;
-            uint64_t call_count{0};
-            uint64_t last_seen_frame{0};
-            int32_t last_w{0}, last_h{0};
-        };
+    if (VR::get()->is_lgui_logging_enabled()) {
+        if (LGUI_DIAG_LIST_IDENTITIES) {
+            struct LguiSelfInfo {
+                uint32_t index;
+                uintptr_t vtable;
+                uint64_t call_count{0};
+                uint64_t last_seen_frame{0};
+            };
+            struct LguiA3Info {
+                uint32_t index;
+                uint64_t call_count{0};
+                uint64_t last_seen_frame{0};
+                int32_t last_w{0}, last_h{0};
+            };
 
-        static std::unordered_map<uintptr_t, LguiSelfInfo> s_lgui_self_ids{};
-        static std::unordered_map<uintptr_t, LguiA3Info> s_lgui_a3_ids{};
-        static uint32_t s_lgui_next_self_id = 0;
-        static uint32_t s_lgui_next_a3_id = 0;
-        static uint64_t s_lgui_ident_last_log_frame = 0;
+            static std::unordered_map<uintptr_t, LguiSelfInfo> s_lgui_self_ids{};
+            static std::unordered_map<uintptr_t, LguiA3Info> s_lgui_a3_ids{};
+            static uint32_t s_lgui_next_self_id = 0;
+            static uint32_t s_lgui_next_a3_id = 0;
+            static uint64_t s_lgui_ident_last_log_frame = 0;
 
-        const auto ident_frame = (uint64_t)VR::get()->get_frame_count();
+            const auto ident_frame = (uint64_t)VR::get()->get_frame_count();
 
-        auto& self_info = s_lgui_self_ids[(uintptr_t)self];
-        const bool self_is_new = (self_info.call_count == 0 && self_info.last_seen_frame == 0);
-        if (self_is_new) {
-            self_info.index = s_lgui_next_self_id++;
-            self_info.vtable = vtable;
-            SPDLOG_INFO("[LGUI_IDENT] new self instance idx={} self={:x} vtable_rva={:x}",
-                self_info.index, (uintptr_t)self,
-                utility::get_module_within((void*)vtable).has_value()
-                    ? vtable - (uintptr_t)*utility::get_module_within((void*)vtable) : vtable);
-        }
-        ++self_info.call_count;
-        self_info.last_seen_frame = ident_frame;
-
-        if (a3 != nullptr && !IsBadReadPtr(a3, TEX_EXTENT_OFF_DIAG + 8)) {
-            auto& a3_info = s_lgui_a3_ids[(uintptr_t)a3];
-            const bool a3_is_new = (a3_info.call_count == 0 && a3_info.last_seen_frame == 0);
-            const auto a3_w = *(int32_t*)((uintptr_t)a3 + TEX_EXTENT_OFF_DIAG);
-            const auto a3_h = *(int32_t*)((uintptr_t)a3 + TEX_EXTENT_OFF_DIAG + 4);
-            if (a3_is_new) {
-                a3_info.index = s_lgui_next_a3_id++;
-                SPDLOG_INFO("[LGUI_IDENT] new a3 target idx={} a3={:x} self_idx={} extent={}x{}",
-                    a3_info.index, (uintptr_t)a3, self_info.index, a3_w, a3_h);
+            auto& self_info = s_lgui_self_ids[(uintptr_t)self];
+            const bool self_is_new = (self_info.call_count == 0 && self_info.last_seen_frame == 0);
+            if (self_is_new) {
+                self_info.index = s_lgui_next_self_id++;
+                self_info.vtable = vtable;
+                SPDLOG_INFO("[LGUI_IDENT] new self instance idx={} self={:x} vtable_rva={:x}", self_info.index, (uintptr_t)self,
+                    utility::get_module_within((void*)vtable).has_value() ? vtable - (uintptr_t)*utility::get_module_within((void*)vtable)
+                                                                          : vtable);
             }
-            ++a3_info.call_count;
-            a3_info.last_seen_frame = ident_frame;
-            a3_info.last_w = a3_w;
-            a3_info.last_h = a3_h;
-        }
+            ++self_info.call_count;
+            self_info.last_seen_frame = ident_frame;
 
-        // Periodic full listing (~every 5s at 60fps) of everything seen recently, so you can correlate an
-        // on-screen symptom (cutscene box, floating HP bar) against which indices are currently active.
-        if (ident_frame - s_lgui_ident_last_log_frame >= 300) {
-            s_lgui_ident_last_log_frame = ident_frame;
-
-            std::string self_list{};
-            for (auto& [ptr, info] : s_lgui_self_ids) {
-                const bool active_recently = (ident_frame - info.last_seen_frame) < 300;
-                self_list += fmt::format("idx{}:{}calls{} ", info.index, active_recently ? "*" : "", info.call_count);
+            if (a3 != nullptr && !IsBadReadPtr(a3, TEX_EXTENT_OFF_DIAG + 8)) {
+                auto& a3_info = s_lgui_a3_ids[(uintptr_t)a3];
+                const bool a3_is_new = (a3_info.call_count == 0 && a3_info.last_seen_frame == 0);
+                const auto a3_w = *(int32_t*)((uintptr_t)a3 + TEX_EXTENT_OFF_DIAG);
+                const auto a3_h = *(int32_t*)((uintptr_t)a3 + TEX_EXTENT_OFF_DIAG + 4);
+                if (a3_is_new) {
+                    a3_info.index = s_lgui_next_a3_id++;
+                    SPDLOG_INFO("[LGUI_IDENT] new a3 target idx={} a3={:x} self_idx={} extent={}x{}", a3_info.index, (uintptr_t)a3,
+                        self_info.index, a3_w, a3_h);
+                }
+                ++a3_info.call_count;
+                a3_info.last_seen_frame = ident_frame;
+                a3_info.last_w = a3_w;
+                a3_info.last_h = a3_h;
             }
+            // Toggle this to true whenever you want to re-enable logging
+            static constexpr bool ENABLE_LGUI_IDENT_LOGGING = false;
 
-            std::string a3_list{};
-            for (auto& [ptr, info] : s_lgui_a3_ids) {
-                const bool active_recently = (ident_frame - info.last_seen_frame) < 300;
-                a3_list += fmt::format("idx{}:{}{}x{}calls{} ", info.index, active_recently ? "*" : "", info.last_w, info.last_h, info.call_count);
+            // Periodic full listing (~every 5s at 60fps) of everything seen recently, so you can correlate an
+            // on-screen symptom (cutscene box, floating HP bar) against which indices are currently active.
+            if (ENABLE_LGUI_IDENT_LOGGING && (ident_frame - s_lgui_ident_last_log_frame >= 300)) {
+                s_lgui_ident_last_log_frame = ident_frame;
+
+                std::string self_list{};
+                for (auto& [ptr, info] : s_lgui_self_ids) {
+                    const bool active_recently = (ident_frame - info.last_seen_frame) < 300;
+                    self_list += fmt::format("idx{}:{}calls{} ", info.index, active_recently ? "*" : "", info.call_count);
+                }
+
+                std::string a3_list{};
+                for (auto& [ptr, info] : s_lgui_a3_ids) {
+                    const bool active_recently = (ident_frame - info.last_seen_frame) < 300;
+                    a3_list += fmt::format(
+                        "idx{}:{}{}x{}calls{} ", info.index, active_recently ? "*" : "", info.last_w, info.last_h, info.call_count);
+                }
+
+                SPDLOG_INFO("[LGUI_IDENT] snapshot: self_instances=[{}] a3_targets=[{}] ('*' = active in last 5s)", self_list, a3_list);
             }
-
-            SPDLOG_INFO("[LGUI_IDENT] snapshot: self_instances=[{}] a3_targets=[{}] ('*' = active in last 5s)", self_list, a3_list);
         }
     }
 
@@ -5379,22 +5387,25 @@ static void* lgui_slot24_hook(void* self, void* a2, void* a3, void* a4, void* a5
         };
 
         if (n < 6) {
-            // a3/a4 share a vtable (16759ec60) and look like FRDGResource: [vtable, const TCHAR* Name, ...]
-            auto rdg_name = [](void* p) -> std::string {
-                if (p == nullptr || IsBadReadPtr(p, 0x10)) return "<bad>";
-                const auto name = *(wchar_t**)((uintptr_t)p + 8);
-                if (name == nullptr || IsBadReadPtr(name, 64)) return "<noname>";
-                std::wstring w{name, wcsnlen(name, 64)};
-                return utility::narrow(w);
-            };
-            SPDLOG_INFO("[LGUI_DRAW]   a3 raw=[{}] {} name=\"{}\"", dump_qwords(a3, 12), probe_view(a3), rdg_name(a3));
-            SPDLOG_INFO("[LGUI_DRAW]   a4 raw=[{}] {} name=\"{}\"", dump_qwords(a4, 12), probe_view(a4), rdg_name(a4));
-            // a5 is packed data (two floats: looks like 1/w, 1/h of the target), a6 == 0
-            const auto a5v = (uintptr_t)a5;
-            float a5f[2]{};
-            memcpy(a5f, &a5v, sizeof(a5f));
-            SPDLOG_INFO("[LGUI_DRAW]   a5={:x} as_floats=({}, {}) inv=({}, {}) a6={:x}", a5v, a5f[0], a5f[1],
-                a5f[0] != 0.0f ? 1.0f / a5f[0] : 0.0f, a5f[1] != 0.0f ? 1.0f / a5f[1] : 0.0f, (uintptr_t)a6);
+            // a3/a4 share a vtable (16759ec60) and look like FRDGResource: [vtable, const TCHAR* Name, ...]         
+                auto rdg_name = [](void* p) -> std::string {
+                    if (p == nullptr || IsBadReadPtr(p, 0x10))
+                        return "<bad>";
+                    const auto name = *(wchar_t**)((uintptr_t)p + 8);
+                    if (name == nullptr || IsBadReadPtr(name, 64))
+                        return "<noname>";
+                    std::wstring w{name, wcsnlen(name, 64)};
+                    return utility::narrow(w);
+                };
+                SPDLOG_INFO("[LGUI_DRAW]   a3 raw=[{}] {} name=\"{}\"", dump_qwords(a3, 12), probe_view(a3), rdg_name(a3));
+                SPDLOG_INFO("[LGUI_DRAW]   a4 raw=[{}] {} name=\"{}\"", dump_qwords(a4, 12), probe_view(a4), rdg_name(a4));
+                // a5 is packed data (two floats: looks like 1/w, 1/h of the target), a6 == 0
+                const auto a5v = (uintptr_t)a5;
+                float a5f[2]{};
+                memcpy(a5f, &a5v, sizeof(a5f));
+                SPDLOG_INFO("[LGUI_DRAW]   a5={:x} as_floats=({}, {}) inv=({}, {}) a6={:x}", a5v, a5f[0], a5f[1],
+                    a5f[0] != 0.0f ? 1.0f / a5f[0] : 0.0f, a5f[1] != 0.0f ? 1.0f / a5f[1] : 0.0f, (uintptr_t)a6);
+            
 
             // LGUI gets no FSceneView here, so its viewport/projection must come from its own state: dump the extension object
             if (n < 2) {
@@ -5538,40 +5549,53 @@ static void* lgui_slot24_hook(void* self, void* a2, void* a3, void* a4, void* a5
     // a2 is NOT an FSceneView: its first qword equals a5 (packed 1/w,1/h floats), it is stable across frames (58883b3d0),
     // and it is >0x1000 readable with the eye size repeated at 0x3e0/0x410/0x4a0/0x4f8. That layout matches a per-view
     // uniform-parameter block (ViewSizeAndInvSize / BufferSizeAndInvSize / ViewRect...). Dump that block as int+float pairs.
-    if (n < 3 && a2 != nullptr && !IsBadReadPtr(a2, 0x520)) {
-        std::string head{};
-        for (uint32_t off = 0; off < 0x60; off += 4) head += fmt::format("{:x}={:.4f} ", off, *(float*)((uintptr_t)a2 + off));
-        SPDLOG_INFO("[LGUI_DRAW]   a2 head floats: {}", head);
+    if (VR::get()->is_lgui_logging_enabled()) {
+        if (n < 3 && a2 != nullptr && !IsBadReadPtr(a2, 0x520)) {
+            std::string head{};
+            for (uint32_t off = 0; off < 0x60; off += 4)
+                head += fmt::format("{:x}={:.4f} ", off, *(float*)((uintptr_t)a2 + off));
+            SPDLOG_INFO("[LGUI_DRAW]   a2 head floats: {}", head);
 
-        std::string rb{};
-        for (uint32_t off = 0x3d0; off < 0x510; off += 4) {
-            const auto iv = *(int32_t*)((uintptr_t)a2 + off);
-            const auto fv = *(float*)((uintptr_t)a2 + off);
-            if (iv > -16384 && iv < 16384) rb += fmt::format("{:x}=i{} ", off, iv);
-            else rb += fmt::format("{:x}=f{:.4f} ", off, fv);
-        }
-        SPDLOG_INFO("[LGUI_DRAW]   a2 size block: {}", rb);
+            std::string rb{};
+            for (uint32_t off = 0x3d0; off < 0x510; off += 4) {
+                const auto iv = *(int32_t*)((uintptr_t)a2 + off);
+                const auto fv = *(float*)((uintptr_t)a2 + off);
+                if (iv > -16384 && iv < 16384)
+                    rb += fmt::format("{:x}=i{} ", off, iv);
+                else
+                    rb += fmt::format("{:x}=f{:.4f} ", off, fv);
+            }
+            SPDLOG_INFO("[LGUI_DRAW]   a2 size block: {}", rb);
 
-        // Nothing in the block equals the real target width (2*hmd_w). Look for it as an inverse (1/w, 1/h) or ratio
-        // (hmd_w / 2hmd_w = 0.5) anywhere in the block, and dump every "interesting" float in 0x60..0x3d0.
-        const auto hw = (float)VR::get()->get_hmd_width();
-        const auto hh = (float)VR::get()->get_hmd_height();
-        std::string inv{};
-        std::string mid{};
-        for (uint32_t off = 0; off < 0x1000; off += 4) {
-            const auto fv = *(float*)((uintptr_t)a2 + off);
-            if (!std::isfinite(fv) || fv == 0.0f) continue;
-            auto approx = [&](float a, float b) { return std::fabs(a - b) <= std::fabs(b) * 0.002f; };
-            if (approx(fv, 1.0f / hw)) inv += fmt::format("{:x}=1/hmd_w ", off);
-            else if (approx(fv, 1.0f / hh)) inv += fmt::format("{:x}=1/hmd_h ", off);
-            else if (approx(fv, 1.0f / (hw * 2.0f))) inv += fmt::format("{:x}=1/(2hmd_w) ", off);
-            else if (approx(fv, hw * 2.0f)) inv += fmt::format("{:x}=2hmd_w ", off);
-            else if (approx(fv, hw / hh)) inv += fmt::format("{:x}=hmd_aspect ", off);
-            else if (approx(fv, (hw * 2.0f) / hh)) inv += fmt::format("{:x}=2hmd_aspect ", off);
-            if (off >= 0x60 && off < 0x3d0 && std::fabs(fv) > 1e-6f && std::fabs(fv) < 1e6f && fv != 1.0f) mid += fmt::format("{:x}={:.4f} ", off, fv);
+            // Nothing in the block equals the real target width (2*hmd_w). Look for it as an inverse (1/w, 1/h) or ratio
+            // (hmd_w / 2hmd_w = 0.5) anywhere in the block, and dump every "interesting" float in 0x60..0x3d0.
+            const auto hw = (float)VR::get()->get_hmd_width();
+            const auto hh = (float)VR::get()->get_hmd_height();
+            std::string inv{};
+            std::string mid{};
+            for (uint32_t off = 0; off < 0x1000; off += 4) {
+                const auto fv = *(float*)((uintptr_t)a2 + off);
+                if (!std::isfinite(fv) || fv == 0.0f)
+                    continue;
+                auto approx = [&](float a, float b) { return std::fabs(a - b) <= std::fabs(b) * 0.002f; };
+                if (approx(fv, 1.0f / hw))
+                    inv += fmt::format("{:x}=1/hmd_w ", off);
+                else if (approx(fv, 1.0f / hh))
+                    inv += fmt::format("{:x}=1/hmd_h ", off);
+                else if (approx(fv, 1.0f / (hw * 2.0f)))
+                    inv += fmt::format("{:x}=1/(2hmd_w) ", off);
+                else if (approx(fv, hw * 2.0f))
+                    inv += fmt::format("{:x}=2hmd_w ", off);
+                else if (approx(fv, hw / hh))
+                    inv += fmt::format("{:x}=hmd_aspect ", off);
+                else if (approx(fv, (hw * 2.0f) / hh))
+                    inv += fmt::format("{:x}=2hmd_aspect ", off);
+                if (off >= 0x60 && off < 0x3d0 && std::fabs(fv) > 1e-6f && std::fabs(fv) < 1e6f && fv != 1.0f)
+                    mid += fmt::format("{:x}={:.4f} ", off, fv);
+            }
+            SPDLOG_INFO("[LGUI_DRAW]   a2 hmd-derived floats: {}", inv.empty() ? "<none>" : inv);
+            SPDLOG_INFO("[LGUI_DRAW]   a2 mid floats: {}", mid);
         }
-        SPDLOG_INFO("[LGUI_DRAW]   a2 hmd-derived floats: {}", inv.empty() ? "<none>" : inv);
-        SPDLOG_INFO("[LGUI_DRAW]   a2 mid floats: {}", mid);
     }
 
     // EXPERIMENT 3: a2's size block only knows the eye size (hmd_w x hmd_h) while the RDG target is 2*hmd_w wide.
@@ -5756,9 +5780,12 @@ static void* lgui_slot24_hook(void* self, void* a2, void* a3, void* a4, void* a5
                 if (!rhi_keyed && pool_it != lgui_copy_pool.end() && pool_it->second.data != nullptr &&
                     pool_it->second.identity_vtable != 0 && pool_it->second.identity_vtable != a3_vtable_now) {
                     const auto mismatch_total = g_lgui_identity_mismatch_count.fetch_add(1, std::memory_order_relaxed) + 1;
-                    SPDLOG_WARN("[LGUI_REDIRECT_STATS] [DIAG] a3={:x} identity mismatch #{} (vtable {:x} -> {:x}) - address reused by a "
-                                "different object, quarantining old shadow copy and starting a fresh slot",
-                        a3_key, mismatch_total, pool_it->second.identity_vtable, a3_vtable_now);
+                    if (VR::get()->is_lgui_logging_enabled()) {
+                        SPDLOG_WARN(
+                            "[LGUI_REDIRECT_STATS] [DIAG] a3={:x} identity mismatch #{} (vtable {:x} -> {:x}) - address reused by a "
+                            "different object, quarantining old shadow copy and starting a fresh slot",
+                            a3_key, mismatch_total, pool_it->second.identity_vtable, a3_vtable_now);
+                    }
                     // DIAG: track this buffer's [begin,end) range + retirement time so the exception handler can
                     // report whether a later crash faulted inside it (see lgui_quarantine_lookup above).
                     {
@@ -5823,7 +5850,9 @@ static void* lgui_slot24_hook(void* self, void* a2, void* a3, void* a4, void* a5
                         // still "in flight"). If this climbs unboundedly instead of settling, that itself is a
                         // signal something is failing to ever be recognized as stale (leak), which is exactly
                         // the kind of root cause we want visible before it manifests as an OOM/crash.
-                        SPDLOG_INFO("[LGUI_REDIRECT_STATS] shadow-copy pool grew to {} live entries (key={:x}, rhi_keyed={})", lgui_copy_pool.size(), pool_key, rhi_keyed);
+                        if (VR::get()->is_lgui_logging_enabled()) {
+                            SPDLOG_INFO("[LGUI_REDIRECT_STATS] shadow-copy pool grew to {} live entries (key={:x}, rhi_keyed={})", lgui_copy_pool.size(), pool_key, rhi_keyed);
+                        }
                     }
                 }
 
@@ -5855,10 +5884,13 @@ static void* lgui_slot24_hook(void* self, void* a2, void* a3, void* a4, void* a5
 
                     for (auto it = lgui_copy_pool.begin(); it != lgui_copy_pool.end();) {
                         if (lgui_current_frame - it->second.last_used_frame > stale_frames_threshold) {
-                            SPDLOG_INFO("[LGUI_REDIRECT_STATS] reclaiming stale shadow copy for key={:x} (idle {} frames, pool size {} -> {}, "
-                                        "quarantined for {} more frames, rhi_keyed={})",
-                                it->first, lgui_current_frame - it->second.last_used_frame, lgui_copy_pool.size(), lgui_copy_pool.size() - 1,
-                                LGUI_COPY_QUARANTINE_FRAMES, rhi_keyed);
+                            if (VR::get()->is_lgui_logging_enabled()) {
+                                SPDLOG_INFO(
+                                    "[LGUI_REDIRECT_STATS] reclaiming stale shadow copy for key={:x} (idle {} frames, pool size {} -> {}, "
+                                    "quarantined for {} more frames, rhi_keyed={})",
+                                    it->first, lgui_current_frame - it->second.last_used_frame, lgui_copy_pool.size(),
+                                    lgui_copy_pool.size() - 1, LGUI_COPY_QUARANTINE_FRAMES, rhi_keyed);
+                            }
                             lgui_note_a3_reclaimed(it->first);
                             // DIAG: track range so a fault landing here later is directly attributable.
                             {
@@ -5912,11 +5944,13 @@ static void* lgui_slot24_hook(void* self, void* a2, void* a3, void* a4, void* a5
                         if (qsize > g_lgui_quarantine_high_water.load(std::memory_order_relaxed)) {
                             g_lgui_quarantine_high_water.store(qsize, std::memory_order_relaxed);
                         }
-                        SPDLOG_INFO("[LGUI_REDIRECT_STATS] [DIAG] quarantine health: size={} high_water={} freed_total={} "
-                                    "identity_mismatches_total={} pool_size={}",
-                            qsize, g_lgui_quarantine_high_water.load(std::memory_order_relaxed),
-                            g_lgui_quarantine_freed_count.load(std::memory_order_relaxed),
-                            g_lgui_identity_mismatch_count.load(std::memory_order_relaxed), lgui_copy_pool.size());
+                        if (VR::get()->is_lgui_logging_enabled()) {
+                            SPDLOG_INFO("[LGUI_REDIRECT_STATS] [DIAG] quarantine health: size={} high_water={} freed_total={} "
+                                        "identity_mismatches_total={} pool_size={}",
+                                qsize, g_lgui_quarantine_high_water.load(std::memory_order_relaxed),
+                                g_lgui_quarantine_freed_count.load(std::memory_order_relaxed),
+                                g_lgui_identity_mismatch_count.load(std::memory_order_relaxed), lgui_copy_pool.size());
+                        }
                     }
                 }
 
@@ -6077,7 +6111,7 @@ static void* lgui_slot24_hook(void* self, void* a2, void* a3, void* a4, void* a5
                 // When enabled, only those three known-good offsets are checked/patched, closing off that collision
                 // risk entirely instead of trying to validate matches after the fact.
                 static constexpr uint32_t LGUI_KNOWN_GOOD_REF_OFFS[] = {0x270, 0x348, 0x3a0};
-                const bool lgui_restrict_scan = VR::get()->is_lgui_restrict_ref_scan_to_known_offsets_enabled();
+                const bool lgui_restrict_scan = true;
 
                 if (lgui_restrict_scan) {
                     for (auto off : LGUI_KNOWN_GOOD_REF_OFFS) {
@@ -6144,16 +6178,23 @@ static void* lgui_slot24_hook(void* self, void* a2, void* a3, void* a4, void* a5
 
                     // a2 appears to hold FScreenPassTexture entries {FRDGTexture* Texture; FIntRect ViewRect} (e.g. 0x3d0 -> rect at
                     // 0x3d8..0x3e4 = (0,0,hw,hh)). Dump every such entry whose pointer shares a3's vtable so the table is on record.
-                    std::string spt{};
-                    const auto a3_vt = *(uintptr_t*)a3;
-                    const uint32_t spt_end = std::min<uint32_t>(a2_len, 0x1400);
-                    for (uint32_t off = 0; off + 0x18 <= spt_end; off += 8) {
-                        const auto p = *(uintptr_t*)((uintptr_t)a2 + off);
-                        if (p < 0x10000 || (p & 7) != 0 || IsBadReadPtr((void*)p, 0x60) || *(uintptr_t*)p != a3_vt) continue;
-                        const auto r = (int32_t*)((uintptr_t)a2 + off + 8);
-                        spt += fmt::format("{:x}:{}{}({},{},{},{}) ", off, p == (uintptr_t)a3 ? "A3" : "tex", p == (uintptr_t)a3 ? "" : fmt::format("[{}x{}]", *(int32_t*)(p + TEX_EXTENT_OFF), *(int32_t*)(p + TEX_EXTENT_OFF + 4)), r[0], r[1], r[2], r[3]);
+                    if (VR::get()->is_lgui_logging_enabled()) {
+                        std::string spt{};
+                        const auto a3_vt = *(uintptr_t*)a3;
+                        const uint32_t spt_end = std::min<uint32_t>(a2_len, 0x1400);
+                        for (uint32_t off = 0; off + 0x18 <= spt_end; off += 8) {
+                            const auto p = *(uintptr_t*)((uintptr_t)a2 + off);
+                            if (p < 0x10000 || (p & 7) != 0 || IsBadReadPtr((void*)p, 0x60) || *(uintptr_t*)p != a3_vt)
+                                continue;
+                            const auto r = (int32_t*)((uintptr_t)a2 + off + 8);
+                            spt += fmt::format("{:x}:{}{}({},{},{},{}) ", off, p == (uintptr_t)a3 ? "A3" : "tex",
+                                p == (uintptr_t)a3
+                                    ? ""
+                                    : fmt::format("[{}x{}]", *(int32_t*)(p + TEX_EXTENT_OFF), *(int32_t*)(p + TEX_EXTENT_OFF + 4)),
+                                r[0], r[1], r[2], r[3]);
+                        }
+                        SPDLOG_INFO("[LGUI_REFS]   a2 screen-pass entries: {}", spt.empty() ? "<none>" : spt);
                     }
-                    SPDLOG_INFO("[LGUI_REFS]   a2 screen-pass entries: {}", spt.empty() ? "<none>" : spt);
                 }
 
                 // OPTION 3 PROBE: find the a2 slot(s) that point at the FSceneView object LGUI reads for its canvas
@@ -8483,15 +8524,16 @@ void FFakeStereoRenderingHook::begin_render_viewfamily_real(
                 scene->decrement_frame_count();
                 break;
             }
+            if (vr->is_diag_sync_pose_verbose_logging_enabled()) {
+                static const char* const mode_names[] = {"Decrement", "None", "Increment"};
+                const auto mode_name = (mutation_mode >= 0 && mutation_mode <= 2) ? mode_names[mutation_mode] : "Unknown";
+                const auto now_us =
+                    std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
 
-            static const char* const mode_names[] = {"Decrement", "None", "Increment"};
-            const auto mode_name = (mutation_mode >= 0 && mutation_mode <= 2) ? mode_names[mutation_mode] : "Unknown";
-            const auto now_us = std::chrono::duration_cast<std::chrono::microseconds>(
-                std::chrono::steady_clock::now().time_since_epoch()).count();
-
-            SPDLOG_INFO_EVERY_N_SEC(1,
-                "[NSF-ANIM-DIAG] Pass2 scene frame_count mutation: mode={} pre={} post={} g_frame_count={} t_us={}",
-                mode_name, pre_mutation_frame_count, scene->get_frame_count(), g_frame_count, now_us);
+                SPDLOG_INFO_EVERY_N_SEC(1,
+                    "[NSF-ANIM-DIAG] Pass2 scene frame_count mutation: mode={} pre={} post={} g_frame_count={} t_us={}", mode_name,
+                    pre_mutation_frame_count, scene->get_frame_count(), g_frame_count, now_us);
+            }
         }
 
         std::swap(views[0], views[1]);
@@ -11364,8 +11406,10 @@ __forceinline void FFakeStereoRenderingHook::calculate_stereo_view_offset(
             // SUBMISSION - so it always advances by ~2 between the Pass1 and Pass2 calls within the SAME
             // engine render frame. That made the old frame_count equality check permanently false, so
             // sync-pose silently never applied. Fixed below to rely on have_left alone.
-            SPDLOG_WARNING_EVERY_N_SEC(1, "[VR][NSF-POSE-DIVERGE-SKIP] Pass2 frame={} has no cached Pass1 pose (have_left=false), sync NOT applied",
-                g_frame_count);
+            if (VR::get()->is_diag_sync_pose_verbose_logging_enabled()) {
+                SPDLOG_WARNING_EVERY_N_SEC(1, "[VR][NSF-POSE-DIVERGE-SKIP] Pass2 frame={} has no cached Pass1 pose (have_left=false), sync NOT applied",
+                    g_frame_count);
+            }
         } else if (hook_data.m_nsf_sync_pose_have_left) {
             // Pass2 (right eye): Pass1 and Pass2 run back-to-back synchronously within the same
             // begin_render_viewfamily_real call (see the immediate std::swap(views[0], views[1]) and
@@ -12240,18 +12284,22 @@ __forceinline Matrix4x4f* FFakeStereoRenderingHook::calculate_stereo_projection_
             if (!s_proj_diag_have_pass1) {
                 s_proj_diag_have_pass1 = true;
                 s_proj_diag_pass1_true_index = true_index;
-
-                SPDLOG_INFO_EVERY_N_SEC(1, "[VR][NSF-PROJ-DIVERGE-TRACE] Pass1 frame={} true_index={} view_index={}",
-                    g_frame_count, true_index, view_index);
+                if (VR::get()->is_diag_sync_pose_verbose_logging_enabled()) {
+                    SPDLOG_INFO_EVERY_N_SEC(1, "[VR][NSF-PROJ-DIVERGE-TRACE] Pass1 frame={} true_index={} view_index={}", g_frame_count,
+                        true_index, view_index);
+                }
             } else {
                 const bool same_eye_twice = true_index == s_proj_diag_pass1_true_index;
-
-                SPDLOG_INFO_EVERY_N_SEC(1, "[VR][NSF-PROJ-DIVERGE-TRACE] Pass2 frame={} true_index={} view_index={} pass1_true_index={} same_eye_twice={}",
-                    g_frame_count, true_index, view_index, s_proj_diag_pass1_true_index, same_eye_twice);
+                if (VR::get()->is_diag_sync_pose_verbose_logging_enabled()) {
+                    SPDLOG_INFO_EVERY_N_SEC(1, "[VR][NSF-PROJ-DIVERGE-TRACE] Pass2 frame={} true_index={} view_index={} pass1_true_index={} same_eye_twice={}",
+                        g_frame_count, true_index, view_index, s_proj_diag_pass1_true_index, same_eye_twice);
+                }
 
                 if (same_eye_twice) {
-                    SPDLOG_WARN("[VR][NSF-PROJ-DIVERGE] frame={} BOTH projection matrix calls resolved to true_index={} - one eye is reusing the wrong eye's projection/FOV matrix this frame",
-                        g_frame_count, true_index);
+                    if (VR::get()->is_diag_sync_pose_verbose_logging_enabled()) {
+                        SPDLOG_WARN("[VR][NSF-PROJ-DIVERGE] frame={} BOTH projection matrix calls resolved to true_index={} - one eye is reusing the wrong eye's projection/FOV matrix this frame",
+                            g_frame_count, true_index);
+                    }
                 }
             }
         }

@@ -2667,6 +2667,12 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
             if (ImGui::IsItemHovered()) {
                 ImGui::SetTooltip("Legacy approach: hides the view family from the FSceneView constructor and\nforces PRIMARY on the secondary view's init options. Crashes in this game\n(null deref inside the engine). Superseded by Right Eye Shadow Fix.");
             }
+            // Stereo Setup Diagnostics Toggle
+            m_enable_stereopass_diagnostics->draw("Enable Stereo Pass Diagnostics");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Emits consolidated per-frame summaries (viewports, call counts, AFR status) to spdlog.\n"
+                                  "Useful for diagnosing eye synchronization issues; keep off during normal play.");
+            }
             m_native_stereo_fix_auto_suspend->draw("Auto-Suspend During Level Transitions");
             if (ImGui::IsItemHovered()) {
                 ImGui::SetTooltip("Automatically turns Native Stereo Fix off while a loading screen / level\ntransition is detected (tick stall, missing pawn/controller, stale world) and\nback on once the world settles - the same as manually toggling it. Untick to\ntest whether the fix is still needed now that the scene capture is no longer\nrooted across LoadMap.");
@@ -2693,22 +2699,6 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
                     "one-frame-stale cached position every single frame of continuous motion - fighting\n"
                     "normal per-eye parallax the whole time, which reads as a slight, constant blur/doubling\n"
                     "during dashes and fast turns even though no real cut is happening.\n\n"
-                    "WHAT THE CAPTURE DATA ACTUALLY SHOWED (NumPad1 arms a 100-frame capture window,\n"
-                    "NumPad2 marks the exact moment blur/glitch was seen, logged to the game log per-frame\n"
-                    "as rot_delta_deg / pos_delta / hard-cut verdict): real double-vision glitch windows\n"
-                    "(skill activations, camera-target swaps, teleports) consistently showed EITHER a\n"
-                    "large rot_delta_deg (observed ~2.4 deg and up) OR a huge pos_delta spike (observed\n"
-                    "climbing from the hundreds up past ~560 units) - frequently with rot_delta_deg still\n"
-                    "reading near 0.0 while pos_delta alone told the whole story (a pure positional cut,\n"
-                    "e.g. a teleport/dash-attack repositioning the character with almost no camera turn).\n"
-                    "Dash/spin repro windows, by contrast, consistently showed rot_delta_deg pinned at\n"
-                    "exactly 0.0000 for the ENTIRE capture (i.e. genuinely no rotational eye mismatch) while\n"
-                    "pos_delta stayed small and steady, roughly 2-90 units, frame after frame - never\n"
-                    "spiking the way a real cut does. This is the key signature: real cuts are IMPULSES\n"
-                    "(the number jumps once, then settles), dash blur is a PLATEAU (the number stays\n"
-                    "mildly elevated continuously). That is what the two scalers below are built to tell\n"
-                    "apart, and why a shared ceiling was added so a big one-off positional impulse is never\n"
-                    "mistaken for a plateau.\n\n"
                     "HOW TO CONFIGURE THE SCALERS: if you still see blur during dashing/spinning, LOWER the\n"
                     "Rotation Gate Threshold and/or RAISE the Sustained-Motion Suppression Frames slightly\n"
                     "so more ordinary motion gets classified as 'plateau' and skipped. If a real cut\n"
@@ -2832,6 +2822,10 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
                                        "value, causing the blind scan to patch a field that was never a real render-target\n"
                                        "reference - a confirmed cause of submenu crashes. When enabled, only the three\n"
                                        "known-good offsets are checked/patched, removing that collision risk entirely.");
+                }          
+                m_enable_lgui_logging->draw("Enable LGUI Screen-Pass Texture Logging");
+                if (ImGui::IsItemHovered()) {
+                
                 }
                 ImGui::TreePop();
             }

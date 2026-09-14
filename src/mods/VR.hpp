@@ -698,10 +698,13 @@ public:
         return m_native_stereo_fix_same_pass_force_primary->value();
     }
 
-    bool is_native_stereo_fix_right_eye_shadows_enabled() const {
-        return m_native_stereo_fix_right_eye_shadows->value();
+    bool is_stereopass_diagnostics() const {
+        return m_enable_stereopass_diagnostics->value(); 
     }
 
+    bool is_native_stereo_fix_right_eye_shadows_enabled() const { 
+         return m_native_stereo_fix_right_eye_shadows->value(); 
+    }
     bool is_native_stereo_fix_auto_suspend_enabled() const {
         return m_native_stereo_fix_auto_suspend->value();
     }
@@ -1304,6 +1307,10 @@ public:
         return m_enable_lgui_restrict_ref_scan_to_known_offsets->value();
     }
 
+    //Logging header for all LGUI logs to identify submenu crash abnd a3/a2 targets
+    bool is_lgui_logging_enabled() const { 
+        return m_enable_lgui_logging->value(); }
+
     // DIAG/EXPERIMENT: alternative keying strategy for the a3 shadow-copy pool in FFakeStereoRenderingHook.cpp.
     // The existing pool is keyed by the a3 pointer itself - a transient per-frame FRDGTexture WRAPPER object that
     // Unreal's RDG allocator recreates at a new address every single frame (confirmed by [LGUI_A3_CHURN]: hundreds
@@ -1868,7 +1875,10 @@ private:
     // EXPERIMENT: see is_lgui_clear_pool_on_new_a3_enabled(). Default OFF.
     const ModToggle::Ptr m_enable_lgui_clear_pool_on_new_a3{ ModToggle::create(generate_name("EnableLGUIClearPoolOnNewA3"), false) };
     // EXPERIMENT: see is_lgui_restrict_ref_scan_to_known_offsets_enabled(). Default OFF.
-    const ModToggle::Ptr m_enable_lgui_restrict_ref_scan_to_known_offsets{ ModToggle::create(generate_name("EnableLGUIRestrictRefScanToKnownOffsets"), false) };
+    const ModToggle::Ptr m_enable_lgui_restrict_ref_scan_to_known_offsets{ ModToggle::create(generate_name("EnableLGUIRestrictRefScanToKnownOffsets"), true) };
+    // DIAG: see is_lgui_logging_enabled(). Controls a2 screen-pass texture inspection logging.
+    const ModToggle::Ptr m_enable_lgui_logging{ModToggle::create(generate_name("EnableLGUISPTLogging"), false)};
+
     // DIAG/EXPERIMENT: see is_lgui_rhi_keyed_copy_pool_enabled(). Default OFF (old a3-pointer-keyed shadow-copy
     // pool active); toggle ON to switch to keying shadow-copy slots by the stable underlying RHI resource instead.
     const ModToggle::Ptr m_enable_lgui_rhi_keyed_copy_pool{ ModToggle::create(generate_name("EnableLGUIRhiKeyedCopyPool"), false) };
@@ -1883,6 +1893,8 @@ private:
     // StereoPass=PRIMARY override for Pass2 that was previously disabled due to black-screen reports.
     // Default OFF - only for deliberate diagnostic re-testing with the added decisive logging.
     const ModToggle::Ptr m_native_stereo_fix_same_pass_force_primary{ ModToggle::create(generate_name("NativeStereoFixSamePassForcePrimary"), false) };
+    //STereopass diagnostics
+    const ModToggle::Ptr m_enable_stereopass_diagnostics{ModToggle::create(generate_name("EnableStereoPassDiagnostics"), false)};
     // Flip the Pass2 (right eye) FSceneView's eye-identity metadata (StereoPass + cached copy, view index,
     // primary flag) to the left eye's values while it renders, so whole-scene shadows are set up for it.
     // Offsets/values are discovered at runtime by sceneview_xref, never hardcoded. Camera data untouched.
