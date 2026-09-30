@@ -1,0 +1,1243 @@
+00007FF9D6000710  ?? ?????? 
+00007FF9D6000711  ?? ?????? 
+00007FF9D6000712  ?? ?????? 
+00007FF9D6000713  ?? ?????? 
+00007FF9D6000714  ?? ?????? 
+00007FF9D6000715  ?? ?????? 
+00007FF9D6000716  ?? ?????? 
+00007FF9D6000717  ?? ?????? 
+00007FF9D6000718  ?? ?????? 
+00007FF9D6000719  ?? ?????? 
+00007FF9D600071A  ?? ?????? 
+00007FF9D600071B  ?? ?????? 
+00007FF9D600071C  ?? ?????? 
+00007FF9D600071D  ?? ?????? 
+00007FF9D600071E  ?? ?????? 
+00007FF9D600071F  ?? ?????? 
+00007FF9D6000720  ?? ?????? 
+00007FF9D6000721  ?? ?????? 
+00007FF9D6000722  ?? ?????? 
+00007FF9D6000723  ?? ?????? 
+00007FF9D6000724  and         byte ptr [rcx-26145E3Fh],al  
+00007FF9D600072A  ?? ?????? 
+00007FF9D600072B  ?? ?????? 
+00007FF9D600072C  ?? ?????? 
+00007FF9D600072D  ?? ?????? 
+00007FF9D600072E  ?? ?????? 
+00007FF9D600072F  ?? ?????? 
+00007FF9D6000730  ?? ?????? 
+00007FF9D6000731  ?? ?????? 
+00007FF9D6000732  ?? ?????? 
+00007FF9D6000733  ?? ?????? 
+00007FF9D6000734  ?? ?????? 
+00007FF9D6000735  ?? ?????? 
+00007FF9D6000736  ?? ?????? 
+00007FF9D6000737  ?? ?????? 
+00007FF9D6000738  ?? ?????? 
+00007FF9D6000739  ?? ?????? 
+00007FF9D600073A  ?? ?????? 
+00007FF9D600073B  ?? ?????? 
+00007FF9D600073C  ?? ?????? 
+00007FF9D600073D  ?? ?????? 
+00007FF9D600073E  ?? ?????? 
+00007FF9D600073F  ?? ?????? 
+00007FF9D6000740  ?? ?????? 
+00007FF9D6000741  ?? ?????? 
+00007FF9D6000742  ?? ?????? 
+00007FF9D6000743  ?? ?????? 
+00007FF9D6000744  ?? ?????? 
+00007FF9D6000745  ?? ?????? 
+00007FF9D6000746  ?? ?????? 
+00007FF9D6000747  ?? ?????? 
+00007FF9D6000748  ?? ?????? 
+00007FF9D6000749  ?? ?????? 
+00007FF9D600074A  ?? ?????? 
+00007FF9D600074B  ?? ?????? 
+00007FF9D600074C  ?? ?????? 
+00007FF9D600074D  ?? ?????? 
+00007FF9D600074E  ?? ?????? 
+00007FF9D600074F  ?? ?????? 
+00007FF9D6000750  ?? ?????? 
+00007FF9D6000751  ?? ?????? 
+00007FF9D6000752  ?? ?????? 
+00007FF9D6000753  ?? ?????? 
+00007FF9D6000754  ?? ?????? 
+00007FF9D6000755  ?? ?????? 
+00007FF9D6000756  ?? ?????? 
+00007FF9D6000757  ?? ?????? 
+00007FF9D6000758  ?? ?????? 
+00007FF9D6000759  ?? ?????? 
+00007FF9D600075A  ?? ?????? 
+00007FF9D600075B  ?? ?????? 
+00007FF9D600075C  ?? ?????? 
+00007FF9D600075D  ?? ?????? 
+00007FF9D600075E  ?? ?????? 
+00007FF9D600075F  ?? ?????? 
+00007FF9D6000760  ?? ?????? 
+00007FF9D6000761  ?? ?????? 
+00007FF9D6000762  ?? ?????? 
+00007FF9D6000763  ?? ?????? 
+00007FF9D6000764  ?? ?????? 
+00007FF9D6000765  ?? ?????? 
+00007FF9D6000766  ?? ?????? 
+00007FF9D6000767  cmp         byte ptr [rcx-3Fh],al  
+00007FF9D600076A  ret         490Fh  
+00007FF9D600076D  ?? ?????? 
+00007FF9D600076E  ?? ?????? 
+00007FF9D600076F  ?? ?????? 
+00007FF9D6000770  ?? ?????? 
+00007FF9D6000771  ?? ?????? 
+00007FF9D6000772  ?? ?????? 
+00007FF9D6000773  ?? ?????? 
+00007FF9D6000774  ?? ?????? 
+00007FF9D6000775  ?? ?????? 
+00007FF9D6000776  ?? ?????? 
+00007FF9D6000777  ?? ?????? 
+00007FF9D6000778  ?? ?????? 
+00007FF9D6000779  ?? ?????? 
+00007FF9D600077A  ?? ?????? 
+00007FF9D600077B  ?? ?????? 
+00007FF9D600077C  ?? ?????? 
+00007FF9D600077D  ?? ?????? 
+00007FF9D600077E  ?? ?????? 
+00007FF9D600077F  ?? ?????? 
+00007FF9D6000780  ?? ?????? 
+00007FF9D6000781  sbb         al,89h  
+00007FF9D6000783  ?? ?????? 
+00007FF9D6000784  ?? ?????? 
+00007FF9D6000785  ?? ?????? 
+00007FF9D6000786  ?? ?????? 
+00007FF9D6000787  ?? ?????? 
+00007FF9D6000788  ?? ?????? 
+00007FF9D6000789  ?? ?????? 
+00007FF9D600078A  ?? ?????? 
+00007FF9D600078B  ?? ?????? 
+00007FF9D600078C  ?? ?????? 
+00007FF9D600078D  ?? ?????? 
+00007FF9D600078E  ?? ?????? 
+00007FF9D600078F  ?? ?????? 
+00007FF9D6000790  ?? ?????? 
+00007FF9D6000791  ?? ?????? 
+00007FF9D6000792  ?? ?????? 
+00007FF9D6000793  ?? ?????? 
+00007FF9D6000794  ?? ?????? 
+00007FF9D6000795  ?? ?????? 
+00007FF9D6000796  ?? ?????? 
+00007FF9D6000797  ?? ?????? 
+00007FF9D6000798  ?? ?????? 
+00007FF9D6000799  ?? ?????? 
+00007FF9D600079A  ?? ?????? 
+00007FF9D600079B  ?? ?????? 
+00007FF9D600079C  ?? ?????? 
+00007FF9D600079D  ?? ?????? 
+00007FF9D600079E  ?? ?????? 
+00007FF9D600079F  ?? ?????? 
+00007FF9D60007A0  ?? ?????? 
+00007FF9D60007A1  ?? ?????? 
+00007FF9D60007A2  ?? ?????? 
+00007FF9D60007A3  ?? ?????? 
+00007FF9D60007A4  ?? ?????? 
+00007FF9D60007A5  ?? ?????? 
+00007FF9D60007A6  ?? ?????? 
+00007FF9D60007A7  ?? ?????? 
+00007FF9D60007A8  ?? ?????? 
+00007FF9D60007A9  ?? ?????? 
+00007FF9D60007AA  ?? ?????? 
+00007FF9D60007AB  ?? ?????? 
+00007FF9D60007AC  ?? ?????? 
+00007FF9D60007AD  ?? ?????? 
+00007FF9D60007AE  ?? ?????? 
+00007FF9D60007AF  ?? ?????? 
+00007FF9D60007B0  ?? ?????? 
+00007FF9D60007B1  ?? ?????? 
+00007FF9D60007B2  ?? ?????? 
+00007FF9D60007B3  ?? ?????? 
+00007FF9D60007B4  ?? ?????? 
+00007FF9D60007B5  ?? ?????? 
+00007FF9D60007B6  ?? ?????? 
+00007FF9D60007B7  ?? ?????? 
+00007FF9D60007B8  ?? ?????? 
+00007FF9D60007B9  ?? ?????? 
+00007FF9D60007BA  ?? ?????? 
+00007FF9D60007BB  ?? ?????? 
+00007FF9D60007BC  ?? ?????? 
+00007FF9D60007BD  test        byte ptr [rax+rax*4],ah  
+00007FF9D60007C0  add         byte ptr [rax],al  
+00007FF9D60007C2  add         byte ptr [rax-77h],cl  
+00007FF9D60007C5  test        byte ptr [rax+rcx*4],ah  
+00007FF9D60007C8  add         byte ptr [rax],al  
+00007FF9D60007CA  ?? ?????? 
+00007FF9D60007CB  ?? ?????? 
+00007FF9D60007CC  ?? ?????? 
+00007FF9D60007CD  ?? ?????? 
+00007FF9D60007CE  ?? ?????? 
+00007FF9D60007CF  ?? ?????? 
+00007FF9D60007D0  ?? ?????? 
+00007FF9D60007D1  ?? ?????? 
+00007FF9D60007D2  ?? ?????? 
+00007FF9D60007D3  ?? ?????? 
+00007FF9D60007D4  ?? ?????? 
+00007FF9D60007D5  ?? ?????? 
+00007FF9D60007D6  ?? ?????? 
+00007FF9D60007D7  ?? ?????? 
+00007FF9D60007D8  ?? ?????? 
+00007FF9D60007D9  ?? ?????? 
+00007FF9D60007DA  ?? ?????? 
+00007FF9D60007DB  ?? ?????? 
+00007FF9D60007DC  ?? ?????? 
+00007FF9D60007DD  ?? ?????? 
+00007FF9D60007DE  ?? ?????? 
+00007FF9D60007DF  ?? ?????? 
+00007FF9D60007E0  ?? ?????? 
+00007FF9D60007E1  ?? ?????? 
+00007FF9D60007E2  ?? ?????? 
+00007FF9D60007E3  ?? ?????? 
+00007FF9D60007E4  ?? ?????? 
+00007FF9D60007E5  ?? ?????? 
+00007FF9D60007E6  ?? ?????? 
+00007FF9D60007E7  ?? ?????? 
+00007FF9D60007E8  ?? ?????? 
+00007FF9D60007E9  ?? ?????? 
+00007FF9D60007EA  ?? ?????? 
+00007FF9D60007EB  ?? ?????? 
+00007FF9D60007EC  ?? ?????? 
+00007FF9D60007ED  ?? ?????? 
+00007FF9D60007EE  ?? ?????? 
+00007FF9D60007EF  ?? ?????? 
+00007FF9D60007F0  ?? ?????? 
+00007FF9D60007F1  ?? ?????? 
+00007FF9D60007F2  ?? ?????? 
+00007FF9D60007F3  add         byte ptr [rax],al  
+00007FF9D60007F5  add         byte ptr [rcx+5Fh],al  
+00007FF9D60007F8  pop         r14  
+00007FF9D60007FA  pop         r13  
+00007FF9D60007FC  pop         r12  
+00007FF9D60007FE  pop         rdi  
+00007FF9D60007FF  pop         rsi  
+00007FF9D6000800  pop         rbp  
+00007FF9D6000801  ret  
+00007FF9D6000802  int         3  
+00007FF9D6000803  int         3  
+00007FF9D6000804  int         3  
+00007FF9D6000805  int         3  
+00007FF9D6000806  int         3  
+00007FF9D6000807  int         3  
+00007FF9D6000808  int         3  
+00007FF9D6000809  int         3  
+00007FF9D600080A  int         3  
+00007FF9D600080B  int         3  
+00007FF9D600080C  int         3  
+00007FF9D600080D  int         3  
+00007FF9D600080E  int         3  
+00007FF9D600080F  int         3  
+00007FF9D6000810  xor         eax,eax  
+00007FF9D6000812  mov         qword ptr [rcx+10h],rax  
+00007FF9D6000816  mov         qword ptr [rcx+18h],rax  
+00007FF9D600081A  mov         dword ptr [rcx],eax  
+00007FF9D600081C  movups      xmm0,xmmword ptr [LdrpComPlusVersionName+20h (07FF9D603CA38h)]  
+00007FF9D6000823  movdqu      xmmword ptr [rcx+60h],xmm0  
+00007FF9D6000828  ret  
+00007FF9D6000829  int         3  
+00007FF9D600082A  int         3  
+00007FF9D600082B  int         3  
+00007FF9D600082C  int         3  
+00007FF9D600082D  int         3  
+00007FF9D600082E  int         3  
+00007FF9D600082F  int         3  
+00007FF9D6000830  mov         qword ptr [rsp+8],rbx  
+00007FF9D6000835  push        rdi  
+00007FF9D6000836  sub         rsp,20h  
+00007FF9D600083A  mov         rbx,rdx  
+00007FF9D600083D  mov         rdi,rcx  
+00007FF9D6000840  mov         rdx,rcx  
+00007FF9D6000843  lea         rcx,[SymCryptMd4Algorithm_default (07FF9D6014780h)]  
+00007FF9D600084A  call        SymCryptHashCommonPaddingMd4Style (07FF9D5FBF9C0h)  
+00007FF9D600084F  movups      xmm0,xmmword ptr [rdi+60h]  
+00007FF9D6000853  mov         edx,70h  
+00007FF9D6000858  mov         rcx,rdi  
+00007FF9D600085B  movdqu      xmmword ptr [rbx],xmm0  
+00007FF9D600085F  call        SymCryptWipeAsm (07FF9D5FD4560h)  
+00007FF9D6000864  mov         rbx,qword ptr [rsp+30h]  
+00007FF9D6000869  xor         eax,eax  
+00007FF9D600086B  mov         qword ptr [rdi+10h],rax  
+00007FF9D600086F  mov         qword ptr [rdi+18h],rax  
+00007FF9D6000873  mov         dword ptr [rdi],eax  
+00007FF9D6000875  movups      xmm0,xmmword ptr [LdrpComPlusVersionName+20h (07FF9D603CA38h)]  
+00007FF9D600087C  movdqu      xmmword ptr [rdi+60h],xmm0  
+00007FF9D6000881  add         rsp,20h  
+00007FF9D6000885  pop         rdi  
+00007FF9D6000886  ret  
+00007FF9D6000887  int         3  
+00007FF9D6000888  int         3  
+00007FF9D6000889  int         3  
+00007FF9D600088A  int         3  
+00007FF9D600088B  ?? ?????? 
+00007FF9D600088C  ?? ?????? 
+00007FF9D600088D  ?? ?????? 
+00007FF9D600088E  ?? ?????? 
+00007FF9D600088F  ?? ?????? 
+00007FF9D6000890  ?? ?????? 
+00007FF9D6000891  ?? ?????? 
+00007FF9D6000892  ?? ?????? 
+00007FF9D6000893  ?? ?????? 
+00007FF9D6000894  ?? ?????? 
+00007FF9D6000895  ?? ?????? 
+00007FF9D6000896  ?? ?????? 
+00007FF9D6000897  ?? ?????? 
+00007FF9D6000898  ?? ?????? 
+00007FF9D6000899  ?? ?????? 
+00007FF9D600089A  ?? ?????? 
+00007FF9D600089B  ?? ?????? 
+00007FF9D600089C  ?? ?????? 
+00007FF9D600089D  ?? ?????? 
+00007FF9D600089E  ?? ?????? 
+00007FF9D600089F  ?? ?????? 
+00007FF9D60008A0  ?? ?????? 
+00007FF9D60008A1  ?? ?????? 
+00007FF9D60008A2  ?? ?????? 
+00007FF9D60008A3  ?? ?????? 
+00007FF9D60008A4  ?? ?????? 
+00007FF9D60008A5  ?? ?????? 
+00007FF9D60008A6  ?? ?????? 
+00007FF9D60008A7  ?? ?????? 
+00007FF9D60008A8  ?? ?????? 
+00007FF9D60008A9  ?? ?????? 
+00007FF9D60008AA  ?? ?????? 
+00007FF9D60008AB  ?? ?????? 
+00007FF9D60008AC  ?? ?????? 
+00007FF9D60008AD  ?? ?????? 
+00007FF9D60008AE  ?? ?????? 
+00007FF9D60008AF  ?? ?????? 
+00007FF9D60008B0  ?? ?????? 
+00007FF9D60008B1  ?? ?????? 
+00007FF9D60008B2  ?? ?????? 
+00007FF9D60008B3  ?? ?????? 
+00007FF9D60008B4  ?? ?????? 
+00007FF9D60008B5  ?? ?????? 
+00007FF9D60008B6  ?? ?????? 
+00007FF9D60008B7  ?? ?????? 
+00007FF9D60008B8  ?? ?????? 
+00007FF9D60008B9  ?? ?????? 
+00007FF9D60008BA  ?? ?????? 
+00007FF9D60008BB  ?? ?????? 
+00007FF9D60008BC  ?? ?????? 
+00007FF9D60008BD  ?? ?????? 
+00007FF9D60008BE  ?? ?????? 
+00007FF9D60008BF  ?? ?????? 
+00007FF9D60008C0  ?? ?????? 
+00007FF9D60008C1  ?? ?????? 
+00007FF9D60008C2  ?? ?????? 
+00007FF9D60008C3  ?? ?????? 
+00007FF9D60008C4  ?? ?????? 
+00007FF9D60008C5  ?? ?????? 
+00007FF9D60008C6  ?? ?????? 
+00007FF9D60008C7  ?? ?????? 
+00007FF9D60008C8  ?? ?????? 
+00007FF9D60008C9  ?? ?????? 
+00007FF9D60008CA  ?? ?????? 
+00007FF9D60008CB  ?? ?????? 
+00007FF9D60008CC  ?? ?????? 
+00007FF9D60008CD  ?? ?????? 
+00007FF9D60008CE  ?? ?????? 
+00007FF9D60008CF  ?? ?????? 
+00007FF9D60008D0  ?? ?????? 
+00007FF9D60008D1  ?? ?????? 
+00007FF9D60008D2  ?? ?????? 
+00007FF9D60008D3  ?? ?????? 
+00007FF9D60008D4  ?? ?????? 
+00007FF9D60008D5  ?? ?????? 
+00007FF9D60008D6  ?? ?????? 
+00007FF9D60008D7  ?? ?????? 
+00007FF9D60008D8  ?? ?????? 
+00007FF9D60008D9  ?? ?????? 
+00007FF9D60008DA  ?? ?????? 
+00007FF9D60008DB  add         byte ptr [rax],al  
+00007FF9D60008DD  add         byte ptr [rbx],bl  
+00007FF9D60008DF  sal         bh,cl  
+00007FF9D60008E1  fiadd       dword ptr [rbx]  
+00007FF9D60008E3  ?? ?????? 
+00007FF9D60008E4  ?? ?????? 
+00007FF9D60008E5  ?? ?????? 
+00007FF9D60008E6  ?? ?????? 
+00007FF9D60008E7  ?? ?????? 
+00007FF9D60008E8  ?? ?????? 
+00007FF9D60008E9  ?? ?????? 
+00007FF9D60008EA  ?? ?????? 
+00007FF9D60008EB  ?? ?????? 
+00007FF9D60008EC  ?? ?????? 
+00007FF9D60008ED  ?? ?????? 
+00007FF9D60008EE  ?? ?????? 
+00007FF9D60008EF  ?? ?????? 
+00007FF9D60008F0  ?? ?????? 
+00007FF9D60008F1  ?? ?????? 
+00007FF9D60008F2  ?? ?????? 
+00007FF9D60008F3  ?? ?????? 
+00007FF9D60008F4  int         0E8h  
+00007FF9D60008F6  jbe         NpClose+15h (07FF9D6000935h)  
+00007FF9D60008F8  cld  
+00007FF9D60008F9  dec         dword ptr [rax-75h]  
+00007FF9D60008FC  ?? ?????? 
+00007FF9D60008FD  ?? ?????? 
+00007FF9D60008FE  ?? ?????? 
+00007FF9D60008FF  ?? ?????? 
+00007FF9D6000900  ?? ?????? 
+00007FF9D6000901  ?? ?????? 
+00007FF9D6000902  ?? ?????? 
+00007FF9D6000903  ?? ?????? 
+00007FF9D6000904  ?? ?????? 
+00007FF9D6000905  ?? ?????? 
+00007FF9D6000906  ?? ?????? 
+00007FF9D6000907  ?? ?????? 
+00007FF9D6000908  ?? ?????? 
+00007FF9D6000909  ?? ?????? 
+00007FF9D600090A  ?? ?????? 
+00007FF9D600090B  ?? ?????? 
+00007FF9D600090C  ?? ?????? 
+00007FF9D600090D  ?? ?????? 
+00007FF9D600090E  ?? ?????? 
+00007FF9D600090F  ?? ?????? 
+00007FF9D6000910  ?? ?????? 
+00007FF9D6000911  and         byte ptr [rcx+5Eh],al  
+00007FF9D6000914  ret  
+00007FF9D6000915  int         3  
+00007FF9D6000916  int         3  
+00007FF9D6000917  int         3  
+00007FF9D6000918  int         3  
+00007FF9D6000919  int         3  
+00007FF9D600091A  int         3  
+00007FF9D600091B  int         3  
+00007FF9D600091C  int         3  
+00007FF9D600091D  int         3  
+00007FF9D600091E  int         3  
+00007FF9D600091F  int         3  
+00007FF9D6000920  mov         r10,rcx  
+00007FF9D6000923  mov         eax,0Fh  
+00007FF9D6000928  test        byte ptr [7FFE0308h],1  
+00007FF9D6000930  jne         NpClose+15h (07FF9D6000935h)  
+00007FF9D6000932  syscall  
+00007FF9D6000934  ret  
+00007FF9D6000935  int         2Eh  
+00007FF9D6000937  ret  
+00007FF9D6000938  nop         dword ptr [rax+rax]  
+00007FF9D6000940  mov         r10,rcx  
+00007FF9D6000943  mov         eax,23h  
+00007FF9D6000948  test        byte ptr [7FFE0308h],1  
+00007FF9D6000950  jne         NpQueryVirtualMemory+15h (07FF9D6000955h)  
+00007FF9D6000952  syscall  
+00007FF9D6000954  ret  
+00007FF9D6000955  int         2Eh  
+00007FF9D6000957  ret  
+00007FF9D6000958  nop         dword ptr [rax+rax]  
+00007FF9D6000960  mov         r10,rcx  
+00007FF9D6000963  mov         eax,28h  
+00007FF9D6000968  test        byte ptr [7FFE0308h],1  
+00007FF9D6000970  jne         NpMapViewOfSection+15h (07FF9D6000975h)  
+00007FF9D6000972  syscall  
+00007FF9D6000974  ret  
+00007FF9D6000975  int         2Eh  
+00007FF9D6000977  ret  
+00007FF9D6000978  nop         dword ptr [rax+rax]  
+00007FF9D6000980  mov         r10,rcx  
+00007FF9D6000983  mov         eax,2Ah  
+00007FF9D6000988  test        byte ptr [7FFE0308h],1  
+00007FF9D6000990  jne         NpUnmapViewOfSection+15h (07FF9D6000995h)  
+00007FF9D6000992  syscall  
+00007FF9D6000994  ret  
+00007FF9D6000995  int         2Eh  
+00007FF9D6000997  ret  
+00007FF9D6000998  nop         dword ptr [rax+rax]  
+00007FF9D60009A0  mov         r10,rcx  
+00007FF9D60009A3  mov         eax,33h  
+00007FF9D60009A8  test        byte ptr [7FFE0308h],1  
+00007FF9D60009B0  jne         NpOpenFile+15h (07FF9D60009B5h)  
+00007FF9D60009B2  syscall  
+00007FF9D60009B4  ret  
+00007FF9D60009B5  int         2Eh  
+00007FF9D60009B7  ret  
+00007FF9D60009B8  nop         dword ptr [rax+rax]  
+00007FF9D60009C0  mov         r10,rcx  
+00007FF9D60009C3  mov         eax,4Ah  
+00007FF9D60009C8  test        byte ptr [7FFE0308h],1  
+00007FF9D60009D0  jne         NpCreateSection+15h (07FF9D60009D5h)  
+00007FF9D60009D2  syscall  
+00007FF9D60009D4  ret  
+00007FF9D60009D5  int         2Eh  
+00007FF9D60009D7  ret  
+00007FF9D60009D8  int         3  
+00007FF9D60009D9  int         3  
+00007FF9D60009DA  int         3  
+00007FF9D60009DB  int         3  
+00007FF9D60009DC  int         3  
+00007FF9D60009DD  int         3  
+00007FF9D60009DE  int         3  
+00007FF9D60009DF  int         3  
+00007FF9D60009E0  jmp         qword ptr [NtUserPfn (07FF9D6087130h)]  
+00007FF9D60009E6  nop         word ptr [rax+rax]  
+00007FF9D60009F0  jmp         qword ptr [NtUserPfn+0C0h (07FF9D60871F0h)]  
+00007FF9D60009F6  nop         word ptr [rax+rax]  
+00007FF9D6000A00  jmp         qword ptr [NtUserPfn+8h (07FF9D6087138h)]  
+00007FF9D6000A06  nop         word ptr [rax+rax]  
+00007FF9D6000A10  jmp         qword ptr [NtUserPfn+0C8h (07FF9D60871F8h)]  
+00007FF9D6000A16  nop         word ptr [rax+rax]  
+00007FF9D6000A20  jmp         qword ptr [NtUserPfn+10h (07FF9D6087140h)]  
+00007FF9D6000A26  nop         word ptr [rax+rax]  
+00007FF9D6000A30  jmp         qword ptr [NtUserPfn+0D0h (07FF9D6087200h)]  
+00007FF9D6000A36  nop         word ptr [rax+rax]  
+00007FF9D6000A40  jmp         qword ptr [NtUserPfn+18h (07FF9D6087148h)]  
+00007FF9D6000A46  nop         word ptr [rax+rax]  
+00007FF9D6000A50  jmp         qword ptr [NtUserPfn+0D8h (07FF9D6087208h)]  
+00007FF9D6000A56  nop         word ptr [rax+rax]  
+00007FF9D6000A60  jmp         qword ptr [NtUserPfn+20h (07FF9D6087150h)]  
+00007FF9D6000A66  nop         word ptr [rax+rax]  
+00007FF9D6000A70  jmp         qword ptr [NtUserPfn+0E0h (07FF9D6087210h)]  
+00007FF9D6000A76  nop         word ptr [rax+rax]  
+00007FF9D6000A80  jmp         qword ptr [NtUserPfn+28h (07FF9D6087158h)]  
+00007FF9D6000A86  nop         word ptr [rax+rax]  
+00007FF9D6000A90  jmp         qword ptr [NtUserPfn+0E8h (07FF9D6087218h)]  
+00007FF9D6000A96  nop         word ptr [rax+rax]  
+00007FF9D6000AA0  jmp         qword ptr [NtUserPfn+30h (07FF9D6087160h)]  
+00007FF9D6000AA6  nop         word ptr [rax+rax]  
+00007FF9D6000AB0  jmp         qword ptr [NtUserPfn+0F0h (07FF9D6087220h)]  
+00007FF9D6000AB6  nop         word ptr [rax+rax]  
+00007FF9D6000AC0  jmp         qword ptr [NtUserPfn+38h (07FF9D6087168h)]  
+00007FF9D6000AC6  nop         word ptr [rax+rax]  
+00007FF9D6000AD0  jmp         qword ptr [NtUserPfn+0F8h (07FF9D6087228h)]  
+00007FF9D6000AD6  nop         word ptr [rax+rax]  
+00007FF9D6000AE0  jmp         qword ptr [NtUserPfn+40h (07FF9D6087170h)]  
+00007FF9D6000AE6  nop         word ptr [rax+rax]  
+00007FF9D6000AF0  jmp         qword ptr [NtUserPfn+100h (07FF9D6087230h)]  
+00007FF9D6000AF6  nop         word ptr [rax+rax]  
+00007FF9D6000B00  jmp         qword ptr [NtUserPfn+48h (07FF9D6087178h)]  
+00007FF9D6000B06  nop         word ptr [rax+rax]  
+00007FF9D6000B10  jmp         qword ptr [NtUserPfn+108h (07FF9D6087238h)]  
+00007FF9D6000B16  nop         word ptr [rax+rax]  
+00007FF9D6000B20  jmp         qword ptr [NtUserPfn+50h (07FF9D6087180h)]  
+00007FF9D6000B26  nop         word ptr [rax+rax]  
+00007FF9D6000B30  jmp         qword ptr [NtUserPfn+110h (07FF9D6087240h)]  
+00007FF9D6000B36  nop         word ptr [rax+rax]  
+00007FF9D6000B40  jmp         qword ptr [NtUserPfn+58h (07FF9D6087188h)]  
+00007FF9D6000B46  nop         word ptr [rax+rax]  
+00007FF9D6000B50  jmp         qword ptr [NtUserPfn+118h (07FF9D6087248h)]  
+00007FF9D6000B56  nop         word ptr [rax+rax]  
+00007FF9D6000B60  jmp         qword ptr [NtUserPfn+60h (07FF9D6087190h)]  
+00007FF9D6000B66  nop         word ptr [rax+rax]  
+00007FF9D6000B70  jmp         qword ptr [NtUserPfn+120h (07FF9D6087250h)]  
+00007FF9D6000B76  nop         word ptr [rax+rax]  
+00007FF9D6000B80  jmp         qword ptr [NtUserPfn+68h (07FF9D6087198h)]  
+00007FF9D6000B86  nop         word ptr [rax+rax]  
+00007FF9D6000B90  jmp         qword ptr [NtUserPfn+128h (07FF9D6087258h)]  
+00007FF9D6000B96  nop         word ptr [rax+rax]  
+00007FF9D6000BA0  jmp         qword ptr [NtUserPfn+70h (07FF9D60871A0h)]  
+00007FF9D6000BA6  nop         word ptr [rax+rax]  
+00007FF9D6000BB0  jmp         qword ptr [NtUserPfn+130h (07FF9D6087260h)]  
+00007FF9D6000BB6  nop         word ptr [rax+rax]  
+00007FF9D6000BC0  jmp         qword ptr [NtUserPfn+78h (07FF9D60871A8h)]  
+00007FF9D6000BC6  nop         word ptr [rax+rax]  
+00007FF9D6000BD0  jmp         qword ptr [NtUserPfn+138h (07FF9D6087268h)]  
+00007FF9D6000BD6  nop         word ptr [rax+rax]  
+00007FF9D6000BE0  jmp         qword ptr [NtUserPfn+80h (07FF9D60871B0h)]  
+00007FF9D6000BE6  nop         word ptr [rax+rax]  
+00007FF9D6000BF0  jmp         qword ptr [NtUserPfn+140h (07FF9D6087270h)]  
+00007FF9D6000BF6  nop         word ptr [rax+rax]  
+00007FF9D6000C00  jmp         qword ptr [NtUserPfn+88h (07FF9D60871B8h)]  
+00007FF9D6000C06  nop         word ptr [rax+rax]  
+00007FF9D6000C10  jmp         qword ptr [NtUserPfn+148h (07FF9D6087278h)]  
+00007FF9D6000C16  nop         word ptr [rax+rax]  
+00007FF9D6000C20  jmp         qword ptr [NtUserPfn+90h (07FF9D60871C0h)]  
+00007FF9D6000C26  nop         word ptr [rax+rax]  
+00007FF9D6000C30  jmp         qword ptr [NtUserPfn+150h (07FF9D6087280h)]  
+00007FF9D6000C36  nop         word ptr [rax+rax]  
+00007FF9D6000C40  jmp         qword ptr [NtUserPfn+98h (07FF9D60871C8h)]  
+00007FF9D6000C46  nop         word ptr [rax+rax]  
+00007FF9D6000C50  jmp         qword ptr [NtUserPfn+158h (07FF9D6087288h)]  
+00007FF9D6000C56  nop         word ptr [rax+rax]  
+00007FF9D6000C60  jmp         qword ptr [NtUserPfn+0A0h (07FF9D60871D0h)]  
+00007FF9D6000C66  nop         word ptr [rax+rax]  
+00007FF9D6000C70  jmp         qword ptr [NtUserPfn+160h (07FF9D6087290h)]  
+00007FF9D6000C76  nop         word ptr [rax+rax]  
+00007FF9D6000C80  jmp         qword ptr [NtUserPfn+0A8h (07FF9D60871D8h)]  
+00007FF9D6000C86  nop         word ptr [rax+rax]  
+00007FF9D6000C90  jmp         qword ptr [NtUserPfn+168h (07FF9D6087298h)]  
+00007FF9D6000C96  nop         word ptr [rax+rax]  
+00007FF9D6000CA0  jmp         qword ptr [NtUserPfn+0B0h (07FF9D60871E0h)]  
+00007FF9D6000CA6  nop         word ptr [rax+rax]  
+00007FF9D6000CB0  jmp         qword ptr [NtUserPfn+170h (07FF9D60872A0h)]  
+00007FF9D6000CB6  nop         word ptr [rax+rax]  
+00007FF9D6000CC0  jmp         qword ptr [NtUserPfn+0B8h (07FF9D60871E8h)]  
+00007FF9D6000CC6  nop         word ptr [rax+rax]  
+00007FF9D6000CD0  jmp         qword ptr [NtUserPfn+178h (07FF9D60872A8h)]  
+00007FF9D6000CD6  nop         word ptr [rax+rax]  
+00007FF9D6000CE0  jmp         qword ptr [NtUserPfn+180h (07FF9D60872B0h)]  
+00007FF9D6000CE6  nop         word ptr [rax+rax]  
+00007FF9D6000CF0  jmp         qword ptr [NtUserPfn+188h (07FF9D60872B8h)]  
+00007FF9D6000CF6  nop         word ptr [rax+rax]  
+00007FF9D6000D00  jmp         qword ptr [NtUserPfn+190h (07FF9D60872C0h)]  
+00007FF9D6000D06  nop         word ptr [rax+rax]  
+00007FF9D6000D10  jmp         qword ptr [NtUserPfn+198h (07FF9D60872C8h)]  
+00007FF9D6000D16  nop         word ptr [rax+rax]  
+00007FF9D6000D20  jmp         qword ptr [NtUserPfn+1A0h (07FF9D60872D0h)]  
+00007FF9D6000D26  nop         word ptr [rax+rax]  
+00007FF9D6000D30  jmp         qword ptr [NtUserPfn+1A8h (07FF9D60872D8h)]  
+00007FF9D6000D36  nop         word ptr [rax+rax]  
+00007FF9D6000D40  jmp         qword ptr [NtUserPfn+1B0h (07FF9D60872E0h)]  
+00007FF9D6000D46  nop         word ptr [rax+rax]  
+00007FF9D6000D50  jmp         qword ptr [NtUserPfn+1B8h (07FF9D60872E8h)]  
+00007FF9D6000D56  nop         word ptr [rax+rax]  
+00007FF9D6000D60  jmp         qword ptr [NtUserPfn+1C0h (07FF9D60872F0h)]  
+00007FF9D6000D66  nop         word ptr [rax+rax]  
+00007FF9D6000D70  jmp         qword ptr [NtUserPfn+1C8h (07FF9D60872F8h)]  
+00007FF9D6000D76  nop         word ptr [rax+rax]  
+00007FF9D6000D80  jmp         qword ptr [NtUserPfn+1D0h (07FF9D6087300h)]  
+00007FF9D6000D86  nop         word ptr [rax+rax]  
+00007FF9D6000D90  jmp         qword ptr [NtUserPfn+1D8h (07FF9D6087308h)]  
+00007FF9D6000D96  nop         word ptr [rax+rax]  
+00007FF9D6000DA0  jmp         qword ptr [NtUserPfn+1E0h (07FF9D6087310h)]  
+00007FF9D6000DA6  int         3  
+00007FF9D6000DA7  int         3  
+00007FF9D6000DA8  int         3  
+00007FF9D6000DA9  int         3  
+00007FF9D6000DAA  int         3  
+00007FF9D6000DAB  int         3  
+00007FF9D6000DAC  int         3  
+00007FF9D6000DAD  int         3  
+00007FF9D6000DAE  int         3  
+00007FF9D6000DAF  int         3  
+00007FF9D6000DB0  mov         r10,rcx  
+00007FF9D6000DB3  mov         eax,0  
+00007FF9D6000DB8  test        byte ptr [7FFE0308h],1  
+00007FF9D6000DC0  jne         NtAccessCheck+15h (07FF9D6000DC5h)  
+00007FF9D6000DC2  syscall  
+00007FF9D6000DC4  ret  
+00007FF9D6000DC5  int         2Eh  
+00007FF9D6000DC7  ret  
+00007FF9D6000DC8  nop         dword ptr [rax+rax]  
+00007FF9D6000DD0  mov         r10,rcx  
+00007FF9D6000DD3  mov         eax,1  
+00007FF9D6000DD8  test        byte ptr [7FFE0308h],1  
+00007FF9D6000DE0  jne         NtWorkerFactoryWorkerReady+15h (07FF9D6000DE5h)  
+00007FF9D6000DE2  syscall  
+00007FF9D6000DE4  ret  
+00007FF9D6000DE5  int         2Eh  
+00007FF9D6000DE7  ret  
+00007FF9D6000DE8  nop         dword ptr [rax+rax]  
+00007FF9D6000DF0  mov         r10,rcx  
+00007FF9D6000DF3  mov         eax,2  
+00007FF9D6000DF8  test        byte ptr [7FFE0308h],1  
+00007FF9D6000E00  jne         NtAcceptConnectPort+15h (07FF9D6000E05h)  
+00007FF9D6000E02  syscall  
+00007FF9D6000E04  ret  
+00007FF9D6000E05  int         2Eh  
+00007FF9D6000E07  ret  
+00007FF9D6000E08  nop         dword ptr [rax+rax]  
+00007FF9D6000E10  mov         r10,rcx  
+00007FF9D6000E13  mov         eax,3  
+00007FF9D6000E18  test        byte ptr [7FFE0308h],1  
+00007FF9D6000E20  jne         NtMapUserPhysicalPagesScatter+15h (07FF9D6000E25h)  
+00007FF9D6000E22  syscall  
+00007FF9D6000E24  ret  
+00007FF9D6000E25  int         2Eh  
+00007FF9D6000E27  ret  
+00007FF9D6000E28  nop         dword ptr [rax+rax]  
+00007FF9D6000E30  mov         r10,rcx  
+00007FF9D6000E33  mov         eax,4  
+00007FF9D6000E38  test        byte ptr [7FFE0308h],1  
+00007FF9D6000E40  jne         NtWaitForSingleObject+15h (07FF9D6000E45h)  
+00007FF9D6000E42  syscall  
+00007FF9D6000E44  ret  
+00007FF9D6000E45  int         2Eh  
+00007FF9D6000E47  ret  
+00007FF9D6000E48  nop         dword ptr [rax+rax]  
+00007FF9D6000E50  mov         r10,rcx  
+00007FF9D6000E53  mov         eax,5  
+00007FF9D6000E58  test        byte ptr [7FFE0308h],1  
+00007FF9D6000E60  jne         NtCallbackReturn+15h (07FF9D6000E65h)  
+00007FF9D6000E62  syscall  
+00007FF9D6000E64  ret  
+00007FF9D6000E65  int         2Eh  
+00007FF9D6000E67  ret  
+00007FF9D6000E68  nop         dword ptr [rax+rax]  
+00007FF9D6000E70  mov         r10,rcx  
+00007FF9D6000E73  mov         eax,6  
+00007FF9D6000E78  test        byte ptr [7FFE0308h],1  
+00007FF9D6000E80  jne         NtReadFile+15h (07FF9D6000E85h)  
+00007FF9D6000E82  syscall  
+00007FF9D6000E84  ret  
+00007FF9D6000E85  int         2Eh  
+00007FF9D6000E87  ret  
+00007FF9D6000E88  nop         dword ptr [rax+rax]  
+00007FF9D6000E90  mov         r10,rcx  
+00007FF9D6000E93  mov         eax,7  
+00007FF9D6000E98  test        byte ptr [7FFE0308h],1  
+00007FF9D6000EA0  jne         NtDeviceIoControlFile+15h (07FF9D6000EA5h)  
+00007FF9D6000EA2  syscall  
+00007FF9D6000EA4  ret  
+00007FF9D6000EA5  int         2Eh  
+00007FF9D6000EA7  ret  
+00007FF9D6000EA8  nop         dword ptr [rax+rax]  
+00007FF9D6000EB0  mov         r10,rcx  
+00007FF9D6000EB3  mov         eax,8  
+00007FF9D6000EB8  test        byte ptr [7FFE0308h],1  
+00007FF9D6000EC0  jne         NtWriteFile+15h (07FF9D6000EC5h)  
+00007FF9D6000EC2  syscall  
+00007FF9D6000EC4  ret  
+00007FF9D6000EC5  int         2Eh  
+00007FF9D6000EC7  ret  
+00007FF9D6000EC8  nop         dword ptr [rax+rax]  
+00007FF9D6000ED0  mov         r10,rcx  
+00007FF9D6000ED3  mov         eax,9  
+00007FF9D6000ED8  test        byte ptr [7FFE0308h],1  
+00007FF9D6000EE0  jne         NtRemoveIoCompletion+15h (07FF9D6000EE5h)  
+00007FF9D6000EE2  syscall  
+00007FF9D6000EE4  ret  
+00007FF9D6000EE5  int         2Eh  
+00007FF9D6000EE7  ret  
+00007FF9D6000EE8  nop         dword ptr [rax+rax]  
+00007FF9D6000EF0  mov         r10,rcx  
+00007FF9D6000EF3  mov         eax,0Ah  
+00007FF9D6000EF8  test        byte ptr [7FFE0308h],1  
+00007FF9D6000F00  jne         NtReleaseSemaphore+15h (07FF9D6000F05h)  
+00007FF9D6000F02  syscall  
+00007FF9D6000F04  ret  
+00007FF9D6000F05  int         2Eh  
+00007FF9D6000F07  ret  
+00007FF9D6000F08  nop         dword ptr [rax+rax]  
+00007FF9D6000F10  mov         r10,rcx  
+00007FF9D6000F13  mov         eax,0Bh  
+00007FF9D6000F18  test        byte ptr [7FFE0308h],1  
+00007FF9D6000F20  jne         NtReplyWaitReceivePort+15h (07FF9D6000F25h)  
+00007FF9D6000F22  syscall  
+00007FF9D6000F24  ret  
+00007FF9D6000F25  int         2Eh  
+00007FF9D6000F27  ret  
+00007FF9D6000F28  nop         dword ptr [rax+rax]  
+00007FF9D6000F30  mov         r10,rcx  
+00007FF9D6000F33  mov         eax,0Ch  
+00007FF9D6000F38  test        byte ptr [7FFE0308h],1  
+00007FF9D6000F40  jne         NtReplyPort+15h (07FF9D6000F45h)  
+00007FF9D6000F42  syscall  
+00007FF9D6000F44  ret  
+00007FF9D6000F45  int         2Eh  
+00007FF9D6000F47  ret  
+00007FF9D6000F48  nop         dword ptr [rax+rax]  
+00007FF9D6000F50  mov         r10,rcx  
+00007FF9D6000F53  mov         eax,0Dh  
+00007FF9D6000F58  test        byte ptr [7FFE0308h],1  
+00007FF9D6000F60  jne         NtSetInformationThread+15h (07FF9D6000F65h)  
+00007FF9D6000F62  syscall  
+00007FF9D6000F64  ret  
+00007FF9D6000F65  int         2Eh  
+00007FF9D6000F67  ret  
+00007FF9D6000F68  nop         dword ptr [rax+rax]  
+00007FF9D6000F70  mov         r10,rcx  
+00007FF9D6000F73  mov         eax,0Eh  
+00007FF9D6000F78  test        byte ptr [7FFE0308h],1  
+00007FF9D6000F80  jne         NtSetEvent+15h (07FF9D6000F85h)  
+00007FF9D6000F82  syscall  
+00007FF9D6000F84  ret  
+00007FF9D6000F85  int         2Eh  
+00007FF9D6000F87  ret  
+00007FF9D6000F88  nop         dword ptr [rax+rax]  
+00007FF9D6000F90  mov         r10,rcx  
+00007FF9D6000F93  mov         eax,0Fh  
+00007FF9D6000F98  test        byte ptr [7FFE0308h],1  
+00007FF9D6000FA0  jne         NtClose+15h (07FF9D6000FA5h)  
+00007FF9D6000FA2  syscall  
+00007FF9D6000FA4  ret  
+00007FF9D6000FA5  int         2Eh  
+00007FF9D6000FA7  ret  
+00007FF9D6000FA8  nop         dword ptr [rax+rax]  
+00007FF9D6000FB0  mov         r10,rcx  
+00007FF9D6000FB3  mov         eax,10h  
+00007FF9D6000FB8  test        byte ptr [7FFE0308h],1  
+00007FF9D6000FC0  jne         NtQueryObject+15h (07FF9D6000FC5h)  
+00007FF9D6000FC2  syscall  
+00007FF9D6000FC4  ret  
+00007FF9D6000FC5  int         2Eh  
+00007FF9D6000FC7  ret  
+00007FF9D6000FC8  nop         dword ptr [rax+rax]  
+00007FF9D6000FD0  mov         r10,rcx  
+00007FF9D6000FD3  mov         eax,11h  
+00007FF9D6000FD8  test        byte ptr [7FFE0308h],1  
+00007FF9D6000FE0  jne         NtQueryInformationFile+15h (07FF9D6000FE5h)  
+00007FF9D6000FE2  syscall  
+00007FF9D6000FE4  ret  
+00007FF9D6000FE5  int         2Eh  
+00007FF9D6000FE7  ret  
+00007FF9D6000FE8  nop         dword ptr [rax+rax]  
+00007FF9D6000FF0  mov         r10,rcx  
+00007FF9D6000FF3  mov         eax,12h  
+00007FF9D6000FF8  test        byte ptr [7FFE0308h],1  
+00007FF9D6001000  jne         NtOpenKey+15h (07FF9D6001005h)  
+00007FF9D6001002  syscall  
+00007FF9D6001004  ret  
+00007FF9D6001005  int         2Eh  
+00007FF9D6001007  ret  
+00007FF9D6001008  nop         dword ptr [rax+rax]  
+00007FF9D6001010  mov         r10,rcx  
+00007FF9D6001013  mov         eax,13h  
+00007FF9D6001018  test        byte ptr [7FFE0308h],1  
+00007FF9D6001020  jne         NtEnumerateValueKey+15h (07FF9D6001025h)  
+00007FF9D6001022  syscall  
+00007FF9D6001024  ret  
+00007FF9D6001025  int         2Eh  
+00007FF9D6001027  ret  
+00007FF9D6001028  nop         dword ptr [rax+rax]  
+00007FF9D6001030  mov         r10,rcx  
+00007FF9D6001033  mov         eax,14h  
+00007FF9D6001038  test        byte ptr [7FFE0308h],1  
+00007FF9D6001040  jne         NtFindAtom+15h (07FF9D6001045h)  
+00007FF9D6001042  syscall  
+00007FF9D6001044  ret  
+00007FF9D6001045  int         2Eh  
+00007FF9D6001047  ret  
+00007FF9D6001048  nop         dword ptr [rax+rax]  
+00007FF9D6001050  mov         r10,rcx  
+00007FF9D6001053  mov         eax,15h  
+00007FF9D6001058  test        byte ptr [7FFE0308h],1  
+00007FF9D6001060  jne         NtQueryDefaultLocale+15h (07FF9D6001065h)  
+00007FF9D6001062  syscall  
+00007FF9D6001064  ret  
+00007FF9D6001065  int         2Eh  
+00007FF9D6001067  ret  
+00007FF9D6001068  nop         dword ptr [rax+rax]  
+00007FF9D6001070  mov         r10,rcx  
+00007FF9D6001073  mov         eax,16h  
+00007FF9D6001078  test        byte ptr [7FFE0308h],1  
+00007FF9D6001080  jne         NtQueryKey+15h (07FF9D6001085h)  
+00007FF9D6001082  syscall  
+00007FF9D6001084  ret  
+00007FF9D6001085  int         2Eh  
+00007FF9D6001087  ret  
+00007FF9D6001088  nop         dword ptr [rax+rax]  
+00007FF9D6001090  mov         r10,rcx  
+00007FF9D6001093  mov         eax,17h  
+00007FF9D6001098  test        byte ptr [7FFE0308h],1  
+00007FF9D60010A0  jne         NtQueryValueKey+15h (07FF9D60010A5h)  
+00007FF9D60010A2  syscall  
+00007FF9D60010A4  ret  
+00007FF9D60010A5  int         2Eh  
+00007FF9D60010A7  ret  
+00007FF9D60010A8  nop         dword ptr [rax+rax]  
+00007FF9D60010B0  mov         r10,rcx  
+00007FF9D60010B3  mov         eax,18h  
+00007FF9D60010B8  test        byte ptr [7FFE0308h],1  
+00007FF9D60010C0  jne         NtAllocateVirtualMemory+15h (07FF9D60010C5h)  
+00007FF9D60010C2  syscall  
+00007FF9D60010C4  ret  
+00007FF9D60010C5  int         2Eh  
+00007FF9D60010C7  ret  
+00007FF9D60010C8  nop         dword ptr [rax+rax]  
+00007FF9D60010D0  mov         r10,rcx  
+00007FF9D60010D3  mov         eax,19h  
+00007FF9D60010D8  test        byte ptr [7FFE0308h],1  
+00007FF9D60010E0  jne         NtQueryInformationProcess+15h (07FF9D60010E5h)  
+00007FF9D60010E2  syscall  
+00007FF9D60010E4  ret  
+00007FF9D60010E5  int         2Eh  
+00007FF9D60010E7  ret  
+00007FF9D60010E8  nop         dword ptr [rax+rax]  
+00007FF9D60010F0  mov         r10,rcx  
+00007FF9D60010F3  mov         eax,1Ah  
+00007FF9D60010F8  test        byte ptr [7FFE0308h],1  
+00007FF9D6001100  jne         NtWaitForMultipleObjects32+15h (07FF9D6001105h)  
+00007FF9D6001102  syscall  
+00007FF9D6001104  ret  
+00007FF9D6001105  int         2Eh  
+00007FF9D6001107  ret  
+00007FF9D6001108  nop         dword ptr [rax+rax]  
+00007FF9D6001110  mov         r10,rcx  
+00007FF9D6001113  mov         eax,1Bh  
+00007FF9D6001118  test        byte ptr [7FFE0308h],1  
+00007FF9D6001120  jne         NtWriteFileGather+15h (07FF9D6001125h)  
+00007FF9D6001122  syscall  
+00007FF9D6001124  ret  
+00007FF9D6001125  int         2Eh  
+00007FF9D6001127  ret  
+00007FF9D6001128  nop         dword ptr [rax+rax]  
+00007FF9D6001130  mov         r10,rcx  
+00007FF9D6001133  mov         eax,1Ch  
+00007FF9D6001138  test        byte ptr [7FFE0308h],1  
+00007FF9D6001140  jne         NtSetInformationProcess+15h (07FF9D6001145h)  
+00007FF9D6001142  syscall  
+00007FF9D6001144  ret  
+00007FF9D6001145  int         2Eh  
+00007FF9D6001147  ret  
+00007FF9D6001148  nop         dword ptr [rax+rax]  
+00007FF9D6001150  mov         r10,rcx  
+00007FF9D6001153  mov         eax,1Dh  
+00007FF9D6001158  test        byte ptr [7FFE0308h],1  
+00007FF9D6001160  jne         NtCreateKey+15h (07FF9D6001165h)  
+00007FF9D6001162  syscall  
+00007FF9D6001164  ret  
+00007FF9D6001165  int         2Eh  
+00007FF9D6001167  ret  
+00007FF9D6001168  nop         dword ptr [rax+rax]  
+00007FF9D6001170  mov         r10,rcx  
+00007FF9D6001173  mov         eax,1Eh  
+00007FF9D6001178  test        byte ptr [7FFE0308h],1  
+00007FF9D6001180  jne         NtFreeVirtualMemory+15h (07FF9D6001185h)  
+00007FF9D6001182  syscall  
+00007FF9D6001184  ret  
+00007FF9D6001185  int         2Eh  
+00007FF9D6001187  ret  
+00007FF9D6001188  nop         dword ptr [rax+rax]  
+00007FF9D6001190  mov         r10,rcx  
+00007FF9D6001193  mov         eax,1Fh  
+00007FF9D6001198  test        byte ptr [7FFE0308h],1  
+00007FF9D60011A0  jne         NtImpersonateClientOfPort+15h (07FF9D60011A5h)  
+00007FF9D60011A2  syscall  
+00007FF9D60011A4  ret  
+00007FF9D60011A5  int         2Eh  
+00007FF9D60011A7  ret  
+00007FF9D60011A8  nop         dword ptr [rax+rax]  
+00007FF9D60011B0  mov         r10,rcx  
+00007FF9D60011B3  mov         eax,20h  
+00007FF9D60011B8  test        byte ptr [7FFE0308h],1  
+00007FF9D60011C0  jne         NtReleaseMutant+15h (07FF9D60011C5h)  
+00007FF9D60011C2  syscall  
+00007FF9D60011C4  ret  
+00007FF9D60011C5  int         2Eh  
+00007FF9D60011C7  ret  
+00007FF9D60011C8  nop         dword ptr [rax+rax]  
+00007FF9D60011D0  mov         r10,rcx  
+00007FF9D60011D3  mov         eax,21h  
+00007FF9D60011D8  test        byte ptr [7FFE0308h],1  
+00007FF9D60011E0  jne         NtQueryInformationToken+15h (07FF9D60011E5h)  
+00007FF9D60011E2  syscall  
+00007FF9D60011E4  ret  
+00007FF9D60011E5  int         2Eh  
+00007FF9D60011E7  ret  
+00007FF9D60011E8  nop         dword ptr [rax+rax]  
+00007FF9D60011F0  mov         r10,rcx  
+00007FF9D60011F3  mov         eax,22h  
+00007FF9D60011F8  test        byte ptr [7FFE0308h],1  
+00007FF9D6001200  jne         NtRequestWaitReplyPort+15h (07FF9D6001205h)  
+00007FF9D6001202  syscall  
+00007FF9D6001204  ret  
+00007FF9D6001205  int         2Eh  
+00007FF9D6001207  ret  
+00007FF9D6001208  nop         dword ptr [rax+rax]  
+00007FF9D6001210  mov         r10,rcx  
+00007FF9D6001213  mov         eax,23h  
+00007FF9D6001218  test        byte ptr [7FFE0308h],1  
+00007FF9D6001220  jne         NtQueryVirtualMemory+15h (07FF9D6001225h)  
+00007FF9D6001222  syscall  
+00007FF9D6001224  ret  
+00007FF9D6001225  int         2Eh  
+00007FF9D6001227  ret  
+00007FF9D6001228  nop         dword ptr [rax+rax]  
+00007FF9D6001230  mov         r10,rcx  
+00007FF9D6001233  mov         eax,24h  
+00007FF9D6001238  test        byte ptr [7FFE0308h],1  
+00007FF9D6001240  jne         NtOpenThreadToken+15h (07FF9D6001245h)  
+00007FF9D6001242  syscall  
+00007FF9D6001244  ret  
+00007FF9D6001245  int         2Eh  
+00007FF9D6001247  ret  
+00007FF9D6001248  nop         dword ptr [rax+rax]  
+00007FF9D6001250  mov         r10,rcx  
+00007FF9D6001253  mov         eax,25h  
+00007FF9D6001258  test        byte ptr [7FFE0308h],1  
+00007FF9D6001260  jne         NtQueryInformationThread+15h (07FF9D6001265h)  
+00007FF9D6001262  syscall  
+00007FF9D6001264  ret  
+00007FF9D6001265  int         2Eh  
+00007FF9D6001267  ret  
+00007FF9D6001268  nop         dword ptr [rax+rax]  
+00007FF9D6001270  mov         r10,rcx  
+00007FF9D6001273  mov         eax,26h  
+00007FF9D6001278  test        byte ptr [7FFE0308h],1  
+00007FF9D6001280  jne         NtOpenProcess+15h (07FF9D6001285h)  
+00007FF9D6001282  syscall  
+00007FF9D6001284  ret  
+00007FF9D6001285  int         2Eh  
+00007FF9D6001287  ret  
+00007FF9D6001288  nop         dword ptr [rax+rax]  
+00007FF9D6001290  mov         r10,rcx  
+00007FF9D6001293  mov         eax,27h  
+00007FF9D6001298  test        byte ptr [7FFE0308h],1  
+00007FF9D60012A0  jne         NtSetInformationFile+15h (07FF9D60012A5h)  
+00007FF9D60012A2  syscall  
+00007FF9D60012A4  ret  
+00007FF9D60012A5  int         2Eh  
+00007FF9D60012A7  ret  
+00007FF9D60012A8  nop         dword ptr [rax+rax]  
+00007FF9D60012B0  mov         r10,rcx  
+00007FF9D60012B3  mov         eax,28h  
+00007FF9D60012B8  test        byte ptr [7FFE0308h],1  
+00007FF9D60012C0  jne         NtMapViewOfSection+15h (07FF9D60012C5h)  
+00007FF9D60012C2  syscall  
+00007FF9D60012C4  ret  
+00007FF9D60012C5  int         2Eh  
+00007FF9D60012C7  ret  
+00007FF9D60012C8  nop         dword ptr [rax+rax]  
+00007FF9D60012D0  mov         r10,rcx  
+00007FF9D60012D3  mov         eax,29h  
+00007FF9D60012D8  test        byte ptr [7FFE0308h],1  
+00007FF9D60012E0  jne         NtAccessCheckAndAuditAlarm+15h (07FF9D60012E5h)  
+00007FF9D60012E2  syscall  
+00007FF9D60012E4  ret  
+00007FF9D60012E5  int         2Eh  
+00007FF9D60012E7  ret  
+00007FF9D60012E8  nop         dword ptr [rax+rax]  
+00007FF9D60012F0  mov         r10,rcx  
+00007FF9D60012F3  mov         eax,2Ah  
+00007FF9D60012F8  test        byte ptr [7FFE0308h],1  
+00007FF9D6001300  jne         NtUnmapViewOfSection+15h (07FF9D6001305h)  
+00007FF9D6001302  syscall  
+00007FF9D6001304  ret  
+00007FF9D6001305  int         2Eh  
+00007FF9D6001307  ret  
+00007FF9D6001308  nop         dword ptr [rax+rax]  
+00007FF9D6001310  mov         r10,rcx  
+00007FF9D6001313  mov         eax,2Bh  
+00007FF9D6001318  test        byte ptr [7FFE0308h],1  
+00007FF9D6001320  jne         NtReplyWaitReceivePortEx+15h (07FF9D6001325h)  
+00007FF9D6001322  syscall  
+00007FF9D6001324  ret  
+00007FF9D6001325  int         2Eh  
+00007FF9D6001327  ret  
+00007FF9D6001328  nop         dword ptr [rax+rax]  
+00007FF9D6001330  mov         r10,rcx  
+00007FF9D6001333  mov         eax,2Ch  
+00007FF9D6001338  test        byte ptr [7FFE0308h],1  
+00007FF9D6001340  jne         NtTerminateProcess+15h (07FF9D6001345h)  
+00007FF9D6001342  syscall  
+00007FF9D6001344  ret  
+00007FF9D6001345  int         2Eh  
+00007FF9D6001347  ret  
+00007FF9D6001348  nop         dword ptr [rax+rax]  
+00007FF9D6001350  mov         r10,rcx  
+00007FF9D6001353  mov         eax,2Dh  
+00007FF9D6001358  test        byte ptr [7FFE0308h],1  
+00007FF9D6001360  jne         NtSetEventBoostPriority+15h (07FF9D6001365h)  
+00007FF9D6001362  syscall  
+00007FF9D6001364  ret  
+00007FF9D6001365  int         2Eh  
+00007FF9D6001367  ret  
+00007FF9D6001368  nop         dword ptr [rax+rax]  
+00007FF9D6001370  mov         r10,rcx  
+00007FF9D6001373  mov         eax,2Eh  
+00007FF9D6001378  test        byte ptr [7FFE0308h],1  
+00007FF9D6001380  jne         NtReadFileScatter+15h (07FF9D6001385h)  
+00007FF9D6001382  syscall  
+00007FF9D6001384  ret  
+00007FF9D6001385  int         2Eh  
+00007FF9D6001387  ret  
+00007FF9D6001388  nop         dword ptr [rax+rax]  
+00007FF9D6001390  mov         r10,rcx  
+00007FF9D6001393  mov         eax,2Fh  
+00007FF9D6001398  test        byte ptr [7FFE0308h],1  
+00007FF9D60013A0  jne         NtOpenThreadTokenEx+15h (07FF9D60013A5h)  
+00007FF9D60013A2  syscall  
+00007FF9D60013A4  ret  
+00007FF9D60013A5  int         2Eh  
+00007FF9D60013A7  ret  
+00007FF9D60013A8  nop         dword ptr [rax+rax]  
+00007FF9D60013B0  mov         r10,rcx  
+00007FF9D60013B3  mov         eax,30h  
+00007FF9D60013B8  test        byte ptr [7FFE0308h],1  
+00007FF9D60013C0  jne         NtOpenProcessTokenEx+15h (07FF9D60013C5h)  
+00007FF9D60013C2  syscall  
+00007FF9D60013C4  ret  
+00007FF9D60013C5  int         2Eh  
+00007FF9D60013C7  ret  
+00007FF9D60013C8  nop         dword ptr [rax+rax]  
+00007FF9D60013D0  mov         r10,rcx  
+00007FF9D60013D3  mov         eax,31h  
+00007FF9D60013D8  test        byte ptr [7FFE0308h],1  
+00007FF9D60013E0  jne         NtQueryPerformanceCounter+15h (07FF9D60013E5h)  
+00007FF9D60013E2  syscall  
+00007FF9D60013E4  ret  
+00007FF9D60013E5  int         2Eh  
+00007FF9D60013E7  ret  
+00007FF9D60013E8  nop         dword ptr [rax+rax]  
+00007FF9D60013F0  mov         r10,rcx  
+00007FF9D60013F3  mov         eax,32h  
+00007FF9D60013F8  test        byte ptr [7FFE0308h],1  
+00007FF9D6001400  jne         NtEnumerateKey+15h (07FF9D6001405h)  
+00007FF9D6001402  syscall  
+00007FF9D6001404  ret  
+00007FF9D6001405  int         2Eh  
+00007FF9D6001407  ret  
+00007FF9D6001408  nop         dword ptr [rax+rax]  
+00007FF9D6001410  mov         r10,rcx  
+00007FF9D6001413  mov         eax,33h  
+00007FF9D6001418  test        byte ptr [7FFE0308h],1  
+00007FF9D6001420  jne         NtOpenFile+15h (07FF9D6001425h)  
+00007FF9D6001422  syscall  
+00007FF9D6001424  ret  
+00007FF9D6001425  int         2Eh  
+00007FF9D6001427  ret  
+00007FF9D6001428  nop         dword ptr [rax+rax]  
+00007FF9D6001430  mov         r10,rcx  
+00007FF9D6001433  mov         eax,34h  
+00007FF9D6001438  test        byte ptr [7FFE0308h],1  
+00007FF9D6001440  jne         NtDelayExecution+15h (07FF9D6001445h)  
+00007FF9D6001442  syscall  
+00007FF9D6001444  ret  
+00007FF9D6001445  int         2Eh  
+00007FF9D6001447  ret  
+00007FF9D6001448  nop         dword ptr [rax+rax]  
+00007FF9D6001450  mov         r10,rcx  
+00007FF9D6001453  mov         eax,35h  
+00007FF9D6001458  test        byte ptr [7FFE0308h],1  
+00007FF9D6001460  jne         NtQueryDirectoryFile+15h (07FF9D6001465h)  
+00007FF9D6001462  syscall  
+00007FF9D6001464  ret  
+00007FF9D6001465  int         2Eh  
+00007FF9D6001467  ret  
+00007FF9D6001468  nop         dword ptr [rax+rax]  
+00007FF9D6001470  mov         r10,rcx  
+00007FF9D6001473  mov         eax,36h  
+00007FF9D6001478  test        byte ptr [7FFE0308h],1  
+00007FF9D6001480  jne         NtQuerySystemInformation+15h (07FF9D6001485h)  
+00007FF9D6001482  syscall  
+00007FF9D6001484  ret  
+00007FF9D6001485  int         2Eh  
+00007FF9D6001487  ret  
+00007FF9D6001488  nop         dword ptr [rax+rax]  
+00007FF9D6001490  mov         r10,rcx  
+00007FF9D6001493  mov         eax,37h  
+00007FF9D6001498  test        byte ptr [7FFE0308h],1  
+00007FF9D60014A0  jne         NtOpenSection+15h (07FF9D60014A5h)  
+00007FF9D60014A2  syscall  
+00007FF9D60014A4  ret  
+00007FF9D60014A5  int         2Eh  
+00007FF9D60014A7  ret  
+00007FF9D60014A8  nop         dword ptr [rax+rax]  
+00007FF9D60014B0  mov         r10,rcx  
+00007FF9D60014B3  mov         eax,38h  
+00007FF9D60014B8  test        byte ptr [7FFE0308h],1  
+00007FF9D60014C0  jne         NtQueryTimer+15h (07FF9D60014C5h)  
+00007FF9D60014C2  syscall  
+00007FF9D60014C4  ret  
+00007FF9D60014C5  int         2Eh  
+00007FF9D60014C7  ret  
+00007FF9D60014C8  nop         dword ptr [rax+rax]  
+00007FF9D60014D0  mov         r10,rcx  
+00007FF9D60014D3  mov         eax,39h  
+00007FF9D60014D8  test        byte ptr [7FFE0308h],1  
+00007FF9D60014E0  jne         NtFsControlFile+15h (07FF9D60014E5h)  
+00007FF9D60014E2  syscall  
+00007FF9D60014E4  ret  
+00007FF9D60014E5  int         2Eh  
+00007FF9D60014E7  ret  
+00007FF9D60014E8  nop         dword ptr [rax+rax]  
+00007FF9D60014F0  mov         r10,rcx  
+00007FF9D60014F3  mov         eax,3Ah  
+00007FF9D60014F8  test        byte ptr [7FFE0308h],1  
+00007FF9D6001500  jne         NtWriteVirtualMemory+15h (07FF9D6001505h)  
+00007FF9D6001502  syscall  
+00007FF9D6001504  ret  
+00007FF9D6001505  int         2Eh  
+00007FF9D6001507  ret  
+00007FF9D6001508  nop         dword ptr [rax+rax]  
+00007FF9D6001510  mov         r10,rcx  
+00007FF9D6001513  mov         eax,3Bh  
+00007FF9D6001518  test        byte ptr [7FFE0308h],1  
+00007FF9D6001520  jne         NtCloseObjectAuditAlarm+15h (07FF9D6001525h)  
+00007FF9D6001522  syscall  
+00007FF9D6001524  ret  
+00007FF9D6001525  int         2Eh  
+00007FF9D6001527  ret  
+00007FF9D6001528  nop         dword ptr [rax+rax]  
+00007FF9D6001530  mov         r10,rcx  
+00007FF9D6001533  mov         eax,3Ch  
+00007FF9D6001538  test        byte ptr [7FFE0308h],1  
+00007FF9D6001540  jne         NtDuplicateObject+15h (07FF9D6001545h)  
+00007FF9D6001542  syscall  
+00007FF9D6001544  ret  
+00007FF9D6001545  int         2Eh  
+00007FF9D6001547  ret  
+00007FF9D6001548  nop         dword ptr [rax+rax]  
+00007FF9D6001550  mov         r10,rcx  
+00007FF9D6001553  mov         eax,3Dh  
+00007FF9D6001558  test        byte ptr [7FFE0308h],1  
+00007FF9D6001560  jne         NtQueryAttributesFile+15h (07FF9D6001565h)  
+00007FF9D6001562  syscall  
+00007FF9D6001564  ret  
+00007FF9D6001565  int         2Eh  
+00007FF9D6001567  ret  
+00007FF9D6001568  nop         dword ptr [rax+rax]  
+00007FF9D6001570  mov         r10,rcx  
+00007FF9D6001573  mov         eax,3Eh  
+00007FF9D6001578  test        byte ptr [7FFE0308h],1  
+00007FF9D6001580  jne         NtClearEvent+15h (07FF9D6001585h)  
+00007FF9D6001582  syscall  
+00007FF9D6001584  ret  
+00007FF9D6001585  int         2Eh  
+00007FF9D6001587  ret  
+00007FF9D6001588  nop         dword ptr [rax+rax]  
+00007FF9D6001590  mov         r10,rcx  
+00007FF9D6001593  mov         eax,3Fh  
+00007FF9D6001598  test        byte ptr [7FFE0308h],1  
+00007FF9D60015A0  jne         NtReadVirtualMemory+15h (07FF9D60015A5h)  
+00007FF9D60015A2  syscall  
+00007FF9D60015A4  ret  
+00007FF9D60015A5  int         2Eh  
+00007FF9D60015A7  ret  
+00007FF9D60015A8  nop         dword ptr [rax+rax]  
+00007FF9D60015B0  mov         r10,rcx  
+00007FF9D60015B3  mov         eax,40h  
+00007FF9D60015B8  test        byte ptr [7FFE0308h],1  
+00007FF9D60015C0  jne         NtOpenEvent+15h (07FF9D60015C5h)  
+00007FF9D60015C2  syscall  
+00007FF9D60015C4  ret  
+00007FF9D60015C5  int         2Eh  
+00007FF9D60015C7  ret  
+00007FF9D60015C8  nop         dword ptr [rax+rax]  
+00007FF9D60015D0  mov         r10,rcx  
+00007FF9D60015D3  mov         eax,41h  
+00007FF9D60015D8  test        byte ptr [7FFE0308h],1  
+00007FF9D60015E0  jne         NtAdjustPrivilegesToken+15h (07FF9D60015E5h)  
+00007FF9D60015E2  syscall  
+00007FF9D60015E4  ret  
+00007FF9D60015E5  int         2Eh  
+00007FF9D60015E7  ret  
+00007FF9D60015E8  nop         dword ptr [rax+rax]  
+00007FF9D60015F0  mov         r10,rcx  
+00007FF9D60015F3  mov         eax,42h  
+00007FF9D60015F8  test        byte ptr [7FFE0308h],1  
+00007FF9D6001600  jne         NtDuplicateToken+15h (07FF9D6001605h)  
+00007FF9D6001602  syscall  
+00007FF9D6001604  ret  
+00007FF9D6001605  int         2Eh  
+00007FF9D6001607  ret  
+00007FF9D6001608  nop         dword ptr [rax+rax]  
+00007FF9D6001610  mov         r10,rcx  
+00007FF9D6001613  mov         eax,43h  
+00007FF9D6001618  test        byte ptr [7FFE0308h],1  
+00007FF9D6001620  jne         NtContinue+15h (07FF9D6001625h)  
+00007FF9D6001622  syscall  
+00007FF9D6001624  ret  
+00007FF9D6001625  int         2Eh  
+00007FF9D6001627  ret  
+00007FF9D6001628  nop         dword ptr [rax+rax]  
+00007FF9D6001630  mov         r10,rcx  
+00007FF9D6001633  mov         eax,44h  
+00007FF9D6001638  test        byte ptr [7FFE0308h],1  
+00007FF9D6001640  jne         NtQueryDefaultUILanguage+15h (07FF9D6001645h)  
+00007FF9D6001642  syscall  
+00007FF9D6001644  ret  
+00007FF9D6001645  int         2Eh  
+00007FF9D6001647  ret  
+00007FF9D6001648  nop         dword ptr [rax+rax]  
+00007FF9D6001650  mov         r10,rcx  
+00007FF9D6001653  mov         eax,45h  
+00007FF9D6001658  test        byte ptr [7FFE0308h],1  
+00007FF9D6001660  jne         NtQueueApcThread+15h (07FF9D6001665h)  
+00007FF9D6001662  syscall  
+00007FF9D6001664  ret  
+00007FF9D6001665  int         2Eh  
+00007FF9D6001667  ret  
+00007FF9D6001668  nop         dword ptr [rax+rax]  
+00007FF9D6001670  mov         r10,rcx  
+00007FF9D6001673  mov         eax,46h  
+00007FF9D6001678  test        byte ptr [7FFE0308h],1  
+00007FF9D6001680  jne         NtYieldExecution+15h (07FF9D6001685h)  
+00007FF9D6001682  syscall  
+00007FF9D6001684  ret  
+00007FF9D6001685  int         2Eh  
+00007FF9D6001687  ret  
+00007FF9D6001688  nop         dword ptr [rax+rax]  

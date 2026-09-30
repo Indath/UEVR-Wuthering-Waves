@@ -305,6 +305,14 @@ public:
         return m_diag_nsf_frame_diff_logger;
     }
 
+    bool& diag_nsf_eye_view_dump() {
+        return m_diag_nsf_eye_view_dump;
+    }
+
+    bool& diag_nsf_eye_c90_read_scan() {
+        return m_diag_nsf_eye_c90_read_scan;
+    }
+
     bool is_hmd_active() const {
         if (m_disable_vr) {
             return false;
@@ -685,6 +693,9 @@ public:
     bool is_native_stereo_fix_same_pass_enabled() const {
         return m_native_stereo_fix_same_pass->value();
     }
+
+    bool is_nsf_same_secondary_pass_enabled() const {
+        return m_nsf_same_secondary_pass_enabled->value(); }
 
     // DIAG/EXPERIMENTAL: re-enables the previously-disabled StereoPass=PRIMARY override for the
     // secondary (right-eye) view inside sceneview_constructor. This WAS confirmed in an earlier
@@ -1091,7 +1102,7 @@ public:
         return m_diag_apply_synced_pose_to_excluded_view_index->value();
     }
 
-    // Bitmask over sceneview_xref::eye_fields (bit N = flip the N-th discovered field). Default all.
+    // Bitmask over session-stable sceneview_xref eye-field IDs (bit N = flip field FN). Default none for safe retesting.
     uint32_t get_diag_nsf_pass2_eye_field_mask() const {
         return (uint32_t)m_diag_nsf_pass2_eye_field_mask;
     }
@@ -1892,6 +1903,7 @@ private:
     // DIAG/EXPERIMENTAL: see is_native_stereo_fix_same_pass_force_primary_enabled(). Re-arms the
     // StereoPass=PRIMARY override for Pass2 that was previously disabled due to black-screen reports.
     // Default OFF - only for deliberate diagnostic re-testing with the added decisive logging.
+    const ModToggle::Ptr m_nsf_same_secondary_pass_enabled{ModToggle::create(generate_name("NSFSameSecondaryPass"), false)};
     const ModToggle::Ptr m_native_stereo_fix_same_pass_force_primary{ ModToggle::create(generate_name("NativeStereoFixSamePassForcePrimary"), false) };
     //STereopass diagnostics
     const ModToggle::Ptr m_enable_stereopass_diagnostics{ModToggle::create(generate_name("EnableStereoPassDiagnostics"), false)};
@@ -2066,11 +2078,11 @@ private:
     // Not persistent.
     bool m_diag_log_pose_refresh_timing{false};
     uint64_t m_diag_pose_refresh_call_count{0};
-    // Default 0xFB: F2 (a 0/1 "secondary view" flag @0x2ec in WuWa) is NOT flipped. Flipping it made Pass 2 build far
-    // shadow cascades/caster lists with left-eye bounds while rendering the right eye -> far shadows flickering between eyes.
-    int m_diag_nsf_pass2_eye_field_mask{0xFB}; // bisect mask over the runtime-discovered eye identity fields flipped by the right-eye shadow fix; not persistent
+    int m_diag_nsf_pass2_eye_field_mask{0}; // bisect mask over session-stable runtime eye-field IDs; not persistent
     int m_diag_nsf_pass2_frame_count_mode{0};
     bool m_diag_nsf_frame_diff_logger{false}; // one-shot: logs per-frame-changing dwords in FSceneView/FSceneViewFamily to locate the foliage wind update Pass2 misses; not persistent
+    bool m_diag_nsf_eye_view_dump{false}; // one-shot: logs dwords that differ between the live left/right FSceneViews; not persistent
+    bool m_diag_nsf_eye_c90_read_scan{false}; // one-shot: scans executable game-module sections for decoded +0xC90 read candidates; not persistent
 
     const ModKey::Ptr m_keybind_toggle_gui{ ModKey::create(generate_name("ToggleSlateGUIKey")) };
     

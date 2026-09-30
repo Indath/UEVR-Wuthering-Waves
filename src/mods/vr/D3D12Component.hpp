@@ -54,6 +54,7 @@ private:
 
     void draw_spectator_view(ID3D12GraphicsCommandList* command_list, bool is_right_eye_frame);
     void clear_backbuffer();
+    void wait_for_scene_capture_copies();
 
     template <typename T> using ComPtr = Microsoft::WRL::ComPtr<T>;
 

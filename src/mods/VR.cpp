@@ -2667,6 +2667,11 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
             if (ImGui::IsItemHovered()) {
                 ImGui::SetTooltip("Legacy approach: hides the view family from the FSceneView constructor and\nforces PRIMARY on the secondary view's init options. Crashes in this game\n(null deref inside the engine). Superseded by Right Eye Shadow Fix.");
             }
+            m_nsf_same_secondary_pass_enabled->draw("Force Secondary Stereo Pass");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Forces preservation and independent calculation of the secondary (right eye) stereo pass.\nFixes "
+                                  "culling, shadow pop-in, and camera pose asymmetry on backported engine builds.");
+            }
             // Stereo Setup Diagnostics Toggle
             m_enable_stereopass_diagnostics->draw("Enable Stereo Pass Diagnostics");
             if (ImGui::IsItemHovered()) {
@@ -2826,6 +2831,15 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
                 m_enable_lgui_logging->draw("Enable LGUI Screen-Pass Texture Logging");
                 if (ImGui::IsItemHovered()) {
                 
+                }
+                if (ImGui::Button("Dump LGUI A2/A3 Offsets and Functions")) {
+                    if (m_fake_stereo_hook != nullptr) {
+                        m_fake_stereo_hook->request_lgui_diagnostic_dump();
+                        SPDLOG_INFO("[LGUI_DUMP] requested; waiting for the next view-family and LGUI draw callbacks");
+                    }
+                }
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("Writes current view-extension vtable/function RVAs to the log, then dumps live A2/A3 fields if LGUI's slot-24 draw hook runs. No rendering fields are modified.");
                 }
                 ImGui::TreePop();
             }
@@ -3474,15 +3488,30 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
                               "dwords that change every frame but are identical in both eyes (per-frame state Pass 2 reads stale, e.g. a wind/time value) "
                               "and view-family dwords that change every frame. Look for [NSF-DIFF] in the log.");
         }
+        if (ImGui::Button("DIAG: Dump Left/Right FSceneView Differences (one sample)")) {
+            m_diag_nsf_eye_view_dump = true;
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Requires Native Stereo Fix ON. Captures one read-only 0x1000-byte snapshot of each live eye view, "
+                              "then logs differing dwords with raw offsets. Highlights +0x1A0 (resolved StereoPass) and the +0xC90 neighborhood. "
+                              "Look for [NSF-EYE-DUMP]. This does not change view memory.");
+        }
+        if (ImGui::Button("DIAG: Scan game code for +0xC90 read candidates")) {
+            m_diag_nsf_eye_c90_read_scan = true;
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Read-only bounded scan of executable sections in the game module. Logs decoded instructions whose memory operand "
+                              "reads displacement +0xC90. These are static candidates, not proof the instruction executes or addresses FSceneView.");
+        }
         ImGui::Text("DIAG: NSF Pass2 eye-field bisect (Right Eye Shadow Fix)");
-        for (int i = 0; i < 8; ++i) {
+        for (int i = 0; i < 32; ++i) {
             if (i > 0) ImGui::SameLine();
-            char label[8]{};
+            char label[16]{};
             snprintf(label, sizeof(label), "F%d", i);
             ImGui::CheckboxFlags(label, (unsigned int*)&m_diag_nsf_pass2_eye_field_mask, 1u << i);
         }
         if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("Each bit enables flipping one runtime-discovered eye identity field on the\nPass2 view (order as logged by 'sceneview_xref: eye identity fields'). Use to\nisolate which field(s) affect distant foliage culling in the right eye.");
+            ImGui::SetTooltip("All fields start disabled. Each F id is stable for this session and maps to the raw +offset\nlogged by 'sceneview_xref: eye identity fields'. Enable ONE candidate at a time and restart\nthe test after any crash; only validated small-enum values are written.");
         }
         ImGui::Checkbox("Stereo Emulation Mode", &m_stereo_emulation_mode);
         ImGui::Checkbox("Wait for Present", &m_wait_for_present);

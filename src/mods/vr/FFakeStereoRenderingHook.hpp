@@ -386,6 +386,28 @@ public:
     // separately-emitted "Found X at 0x..." lines from different points in the session.
     void dump_stereo_addresses();
 
+    void request_lgui_diagnostic_dump() {
+        m_lgui_diagnostic_dump_state.store(1, std::memory_order_release);
+    }
+
+    bool begin_lgui_diagnostic_extension_dump() {
+        int expected = 1;
+        return m_lgui_diagnostic_dump_state.compare_exchange_strong(expected, 2, std::memory_order_acq_rel);
+    }
+
+    bool is_lgui_diagnostic_dump_requested() const {
+        return m_lgui_diagnostic_dump_state.load(std::memory_order_acquire) == 1;
+    }
+
+    bool is_lgui_diagnostic_dump_active() const {
+        return m_lgui_diagnostic_dump_state.load(std::memory_order_acquire) == 2;
+    }
+
+    bool complete_lgui_diagnostic_dump() {
+        int expected = 2;
+        return m_lgui_diagnostic_dump_state.compare_exchange_strong(expected, 0, std::memory_order_acq_rel);
+    }
+
     // DIAG: runtime-only (no static analysis) per-frame reconstruction of "how the stereo pass is set
     // up". Every call site that participates in the per-eye pipeline (AdjustViewRect,
     // CalculateStereoViewOffset, CalculateStereoProjectionMatrix, GetDesiredNumberOfViews,
@@ -422,6 +444,8 @@ public:
     void report_stereo_setup_projection_matrix(uint32_t true_index);
 
 private:
+    std::atomic<int> m_lgui_diagnostic_dump_state{0};
+
     void maybe_log_stereo_setup_summary();
     void ensure_stereo_setup_frame_locked();
 

@@ -265,21 +265,32 @@ void Framework::hook_monitor() {
             }
 
             if (!m_has_last_chance && now - m_last_chance_time > std::chrono::seconds(1)) {
-                spdlog::info("Sending rehook request for D3D");
-
-                // hook_d3d12 always gets called first.
-                if (m_is_d3d11) {
-                    hook_d3d11();
+                if (m_valid) {
+                    spdlog::warn("Framework::hook_monitor(): suppressing D3D rehook because a D3D hook was previously successful");
+                    m_last_chance_time = now + std::chrono::seconds(5);
+                    m_has_last_chance = true;
                 } else {
-                    hook_d3d12();
-                }
+                    if (!m_stall_dump_written) {
+                        spdlog::error("[STALL DIAGNOSTIC] Capturing process state immediately before D3D rehook");
+                        dump_stalled_process_state();
+                    }
 
-                // so we don't immediately go and hook it again
-                // add some additional time to it to give it some leeway
-                m_last_present_time = std::chrono::steady_clock::now() + std::chrono::seconds(5);
-                m_last_message_time = std::chrono::steady_clock::now() + std::chrono::seconds(5);
-                m_last_chance_time = std::chrono::steady_clock::now() + std::chrono::seconds(1);
-                m_has_last_chance = true;
+                    spdlog::info("Sending rehook request for D3D");
+
+                    // hook_d3d12 always gets called first.
+                    if (m_is_d3d11) {
+                        hook_d3d11();
+                    } else {
+                        hook_d3d12();
+                    }
+
+                    // so we don't immediately go and hook it again
+                    // add some additional time to it to give it some leeway
+                    m_last_present_time = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+                    m_last_message_time = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+                    m_last_chance_time = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+                    m_has_last_chance = true;
+                }
             }
         } else {
             m_last_chance_time = std::chrono::steady_clock::now();

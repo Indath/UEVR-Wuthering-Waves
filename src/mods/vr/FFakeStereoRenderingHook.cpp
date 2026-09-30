@@ -76,6 +76,120 @@
 
 FFakeStereoRenderingHook* g_hook = nullptr;
 uint32_t g_frame_count{};
+static std::atomic<bool> g_nsf_c90_scan_running{false};
+
+static void scan_game_code_for_c90_read_candidates() {
+    constexpr size_t MAX_SCAN_BYTES = 0x8000000;
+    constexpr size_t MAX_LOGGED_CANDIDATES = 128;
+    constexpr uint8_t c90_disp_bytes[]{0x90, 0x0C, 0x00, 0x00};
+
+    if (g_framework == nullptr) {
+        SPDLOG_WARN("[VR][NSF-C90-CODE-SCAN] skipped: framework is null");
+        return;
+    }
+
+    const auto module = static_cast<HMODULE>(g_framework->get_module().ptr());
+    if (module == nullptr || IsBadReadPtr(module, sizeof(IMAGE_DOS_HEADER))) {
+        SPDLOG_WARN("[VR][NSF-C90-CODE-SCAN] skipped: game module/header unreadable module={:x}", (uintptr_t)module);
+        return;
+    }
+
+    const auto* dos = (const IMAGE_DOS_HEADER*)module;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew <= 0) {
+        SPDLOG_WARN("[VR][NSF-C90-CODE-SCAN] skipped: invalid DOS header module={:x}", (uintptr_t)module);
+        return;
+    }
+
+    const auto module_size = utility::get_module_size(module).value_or(0);
+    const auto nt_offset = static_cast<size_t>(dos->e_lfanew);
+    if (module_size == 0 || nt_offset > module_size || sizeof(IMAGE_NT_HEADERS64) > module_size - nt_offset ||
+        IsBadReadPtr((const uint8_t*)module + nt_offset, sizeof(IMAGE_NT_HEADERS64))) {
+        SPDLOG_WARN("[VR][NSF-C90-CODE-SCAN] skipped: invalid NT headers module={:x} module_size={:x}", (uintptr_t)module, module_size);
+        return;
+    }
+
+    const auto* nt = (const IMAGE_NT_HEADERS64*)((const uint8_t*)module + nt_offset);
+    if (nt->Signature != IMAGE_NT_SIGNATURE || nt->FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64 ||
+        nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
+        SPDLOG_WARN("[VR][NSF-C90-CODE-SCAN] skipped: unsupported PE image module={:x}", (uintptr_t)module);
+        return;
+    }
+
+    const auto sections_offset = nt_offset + FIELD_OFFSET(IMAGE_NT_HEADERS64, OptionalHeader) + nt->FileHeader.SizeOfOptionalHeader;
+    const auto sections_size = static_cast<size_t>(nt->FileHeader.NumberOfSections) * sizeof(IMAGE_SECTION_HEADER);
+    if (sections_offset > module_size || sections_size > module_size - sections_offset ||
+        IsBadReadPtr((const uint8_t*)module + sections_offset, sections_size)) {
+        SPDLOG_WARN("[VR][NSF-C90-CODE-SCAN] skipped: invalid section table module={:x}", (uintptr_t)module);
+        return;
+    }
+
+    const auto* sections = (const IMAGE_SECTION_HEADER*)((const uint8_t*)module + sections_offset);
+    const auto module_path = utility::get_module_path(module).value_or("<unknown>");
+    size_t scanned_bytes = 0;
+    size_t candidates = 0;
+    size_t logged = 0;
+    std::unordered_set<uintptr_t> reported_sites{};
+
+    SPDLOG_INFO("[VR][NSF-C90-CODE-SCAN] begin module={} base={:x} image_size={:x} scan_cap={:x}; results are static candidates only",
+        module_path, (uintptr_t)module, module_size, MAX_SCAN_BYTES);
+
+    for (WORD section_index = 0; section_index < nt->FileHeader.NumberOfSections && scanned_bytes < MAX_SCAN_BYTES; ++section_index) {
+        const auto& section = sections[section_index];
+        if ((section.Characteristics & IMAGE_SCN_MEM_EXECUTE) == 0) continue;
+
+        const auto section_rva = static_cast<size_t>(section.VirtualAddress);
+        const auto section_size = static_cast<size_t>(std::max(section.Misc.VirtualSize, section.SizeOfRawData));
+        if (section_rva >= module_size || section_size == 0) continue;
+
+        const auto available_size = std::min(section_size, module_size - section_rva);
+        const auto scan_size = std::min(available_size, MAX_SCAN_BYTES - scanned_bytes);
+        scanned_bytes += scan_size;
+        const auto section_address = (uintptr_t)module + section_rva;
+        if (scan_size < sizeof(c90_disp_bytes) || !utility::isGoodReadPtr(section_address, scan_size)) {
+            SPDLOG_WARN("[VR][NSF-C90-CODE-SCAN] skipped unreadable executable section index={} rva={:x} size={:x}",
+                section_index, section_rva, scan_size);
+            continue;
+        }
+
+        for (size_t byte_offset = 0; byte_offset + sizeof(c90_disp_bytes) <= scan_size; ++byte_offset) {
+            if (std::memcmp((const void*)(section_address + byte_offset), c90_disp_bytes, sizeof(c90_disp_bytes)) != 0) continue;
+
+            const auto match_address = section_address + byte_offset;
+            const auto first_instruction = match_address >= section_address + (ND_MAX_INSTRUCTION_LENGTH - 1)
+                ? match_address - (ND_MAX_INSTRUCTION_LENGTH - 1) : section_address;
+            for (auto instruction_address = first_instruction; instruction_address <= match_address; ++instruction_address) {
+                const auto remaining = scan_size - (instruction_address - section_address);
+                INSTRUX ix{};
+                const auto status = NdDecodeEx(&ix, (ND_UINT8*)instruction_address,
+                    static_cast<ND_UINT32>(std::min<size_t>(remaining, ND_MAX_INSTRUCTION_LENGTH)), ND_CODE_64, ND_DATA_64);
+                if (!ND_SUCCESS(status) || ix.Length == 0 || instruction_address + ix.Length < match_address + sizeof(c90_disp_bytes)) continue;
+
+                for (ND_UINT8 operand_index = 0; operand_index < ix.OperandsCount; ++operand_index) {
+                    const auto& operand = ix.Operands[operand_index];
+                    if (operand.Type != ND_OP_MEM || !operand.Info.Memory.HasDisp || operand.Info.Memory.IsAG ||
+                        static_cast<int64_t>(operand.Info.Memory.Disp) != 0xC90 || !operand.Access.Read) {
+                        continue;
+                    }
+
+                    if (!reported_sites.insert(instruction_address).second) continue;
+                    ++candidates;
+                    if (logged < MAX_LOGGED_CANDIDATES) {
+                        SPDLOG_INFO("[VR][NSF-C90-CODE-SCAN] candidate module={} rva={:x} address={:x} mnemonic={} operand={} base_reg={} index_reg={} disp={:+#x} access=read{}",
+                            module_path, instruction_address - (uintptr_t)module, instruction_address, ix.Mnemonic,
+                            operand_index, operand.Info.Memory.HasBase ? operand.Info.Memory.Base : 0xFF,
+                            operand.Info.Memory.HasIndex ? operand.Info.Memory.Index : 0xFF,
+                            static_cast<int64_t>(operand.Info.Memory.Disp), operand.Access.Write ? "+write" : "");
+                        ++logged;
+                    }
+                }
+            }
+        }
+
+    }
+
+    SPDLOG_INFO("[VR][NSF-C90-CODE-SCAN] end module={} scanned_bytes={:x} candidates={} logged={}{}",
+        module_path, scanned_bytes, candidates, logged, scanned_bytes >= MAX_SCAN_BYTES ? " (scan cap reached)" : "");
+}
 
 // While a new level is streaming in (player controller not yet spawned), the scene-capture actor
 // can be repeatedly garbage-collected/invalidated by the engine well after bIsTearingDown has
@@ -3815,9 +3929,9 @@ struct SceneViewExtensionAnalyzer {
 };
 
 // Diagnostic: enumerates every ISceneViewExtension registered in GEngine->ViewExtensions
-// so we can identify which one belongs to the game's UI renderer (e.g. LGUI's FLGUIRenderer)
-// LGUI screen-space UI draw: ISceneViewExtension slot 24 on the two LGUI classes (vtable rva 26ca0760 / 26ca0830).
-// Confirmed by bisect: stubbing slot 24 on both removes main menu UI and in-game HUD; 25 alone does not.
+// so we can identify the game's UI renderer (e.g. LGUI's FLGUIRenderer) from runtime vtable behavior.
+// LGUI screen-space UI draw was identified as ISceneViewExtension slot 24; game-build vtable RVAs vary.
+// Confirmed by bisect on the prior build: stubbing slot 24 removed menu/HUD UI; slot 25 alone did not.
 static std::unordered_map<uintptr_t, uintptr_t> g_lgui_slot24_originals{}; // vtable -> original fn
 static constexpr int32_t LGUI_DRAW_SLOT = 24;
 
@@ -5184,6 +5298,81 @@ static void* lgui_slot24_hook(void* self, void* a2, void* a3, void* a4, void* a5
 
     static uint32_t call_count = 0;
     const auto n = call_count++;
+
+    const auto vr_for_dump = VR::get();
+    auto* lgui_dump_hook = vr_for_dump != nullptr ? vr_for_dump->get_fake_stereo_hook().get() : nullptr;
+    const bool dump_lgui_args = lgui_dump_hook != nullptr && lgui_dump_hook->is_lgui_diagnostic_dump_active();
+    if (dump_lgui_args) {
+        auto dump_qwords_for_lgui = [](void* ptr, size_t count) {
+            std::string values{};
+            if (ptr == nullptr || IsBadReadPtr(ptr, count * sizeof(uintptr_t))) {
+                return std::string{"<unreadable>"};
+            }
+            for (size_t i = 0; i < count; ++i) {
+                values += fmt::format("{:x},", ((uintptr_t*)ptr)[i]);
+            }
+            return values;
+        };
+        const auto module = utility::get_module_within((void*)vtable);
+        const auto ret = (uintptr_t)_ReturnAddress();
+        const auto ret_module = utility::get_module_within((void*)ret);
+        SPDLOG_INFO("[LGUI_DUMP] draw self={:x} vtable={:x} vtable_rva={:x} slot24_fn={:x} a2={:x} a3={:x} a4={:x} a5={:x} a6={:x} return_rva={:x} frame={} hmd={}x{} game_vp={}x{}",
+            (uintptr_t)self, vtable, module.has_value() ? vtable - (uintptr_t)*module : vtable, it->second,
+            (uintptr_t)a2, (uintptr_t)a3, (uintptr_t)a4, (uintptr_t)a5, (uintptr_t)a6,
+            ret_module.has_value() ? ret - (uintptr_t)*ret_module : ret, vr_for_dump->get_frame_count(),
+            vr_for_dump->get_hmd_width(), vr_for_dump->get_hmd_height(),
+            lgui_dump_hook->get_game_viewport_size().width, lgui_dump_hook->get_game_viewport_size().height);
+
+        constexpr uintptr_t a3_rhi_off = 0x10;
+        constexpr uintptr_t a3_extent_off = 0x54;
+        if (a3 != nullptr && !IsBadReadPtr(a3, a3_extent_off + 8)) {
+            const auto* a3_bytes = (const uint8_t*)a3;
+            const auto rhi = *(uintptr_t*)(a3_bytes + a3_rhi_off);
+            const auto extent_w = *(int32_t*)(a3_bytes + a3_extent_off);
+            const auto extent_h = *(int32_t*)(a3_bytes + a3_extent_off + 4);
+            SPDLOG_INFO("[LGUI_DUMP] A3 fields: +0x10 RHI={:x} +0x54 extent={}x{} raw_qwords=[{}]",
+                rhi, extent_w, extent_h, dump_qwords_for_lgui(a3, 16));
+            if (rhi != 0 && !IsBadReadPtr((void*)rhi, 0x60)) {
+                SPDLOG_INFO("[LGUI_DUMP] A3 RHI object={:x} vtable={:x} first_qwords=[{}]",
+                    rhi, *(uintptr_t*)rhi, dump_qwords_for_lgui((void*)rhi, 12));
+            }
+        } else {
+            SPDLOG_WARN("[LGUI_DUMP] A3 is null or unreadable: a3={:x}", (uintptr_t)a3);
+        }
+
+        if (a2 != nullptr && !IsBadReadPtr(a2, 0x3b0)) {
+            std::string refs{};
+            for (const auto off : {0x270u, 0x348u, 0x3a0u}) {
+                const auto value = *(uintptr_t*)((uintptr_t)a2 + off);
+                refs += fmt::format("+{:x}={:x}{} ", off, value,
+                    value == (uintptr_t)a3 ? "(MATCH_A3)" : "");
+            }
+            std::string rects{};
+            for (const auto off : {0x3e0u, 0x410u, 0x4a0u, 0x4f8u}) {
+                if (IsBadReadPtr((void*)((uintptr_t)a2 + off - 8), 16)) {
+                    rects += fmt::format("+{:x}=<unreadable> ", off);
+                    continue;
+                }
+                const auto* r = (const int32_t*)((uintptr_t)a2 + off - 8);
+                rects += fmt::format("+{:x}=({},{} -> {},{}) ", off, r[0], r[1], r[2], r[3]);
+            }
+            SPDLOG_INFO("[LGUI_DUMP] A2 references: {}", refs);
+            SPDLOG_INFO("[LGUI_DUMP] A2 rect candidates: {}", rects);
+            std::string matching_qwords{};
+            for (uintptr_t off = 0; off + sizeof(uintptr_t) <= 0x1000; off += sizeof(uintptr_t)) {
+                if (IsBadReadPtr((void*)((uintptr_t)a2 + off), sizeof(uintptr_t))) break;
+                const auto value = *(uintptr_t*)((uintptr_t)a2 + off);
+                if (value == (uintptr_t)a3) matching_qwords += fmt::format("+{:x} ", off);
+            }
+            SPDLOG_INFO("[LGUI_DUMP] A2 qwords equal to A3 within first 0x1000: {}",
+                matching_qwords.empty() ? "<none>" : matching_qwords);
+        } else {
+            SPDLOG_WARN("[LGUI_DUMP] A2 is null or unreadable: a2={:x}", (uintptr_t)a2);
+        }
+
+        lgui_dump_hook->complete_lgui_diagnostic_dump();
+        SPDLOG_INFO("[LGUI_DUMP] live A2/A3 dump complete");
+    }
 
     // Same value as TEX_EXTENT_OFF declared further below (FRDGTexture::Desc.Extent); duplicated here
     // under a distinct name since the identity-listing block below runs before that declaration is in scope.
@@ -6859,20 +7048,30 @@ static void diag_dump_engine_view_extensions(sdk::FSceneViewFamily& view_family)
     static uint32_t call_count = 0;
     static uint32_t dump_count = 0;
 
+    const auto vr = VR::get();
+    auto* lgui_hook = vr != nullptr ? vr->get_fake_stereo_hook().get() : nullptr;
+    const bool manual_dump_requested = lgui_hook != nullptr && lgui_hook->is_lgui_diagnostic_dump_requested();
+
     // NOTE: despite the name, this function has a CRITICAL side effect - it installs the LGUI redirect
     // hooks (slot-24 draw hook + game-thread SetupView/BeginRenderViewFamily hooks) below. It must keep
     // running every qualifying call. Only the verbose [VIEWEXT_DIAG] logging is gated by
     // LGUI_DIAG_STEADY_STATE; the hook-installation path is NOT gated.
-    if (dump_count >= 20 || (call_count++ % 300) != 0) {
+    if (!manual_dump_requested && (dump_count >= 20 || (call_count++ % 300) != 0)) {
         return;
     }
 
+    if (manual_dump_requested) {
+        ++call_count;
+    }
     ++dump_count;
 
     const auto exts = g_engine_view_extensions;
 
     if (exts == nullptr) {
         SPDLOG_INFO("[VIEWEXT_DIAG] g_engine_view_extensions is null");
+        if (manual_dump_requested) {
+            SPDLOG_WARN("[LGUI_DUMP] cannot enumerate extensions: GEngine view-extension list is null; request remains pending");
+        }
         return;
     }
 
@@ -6887,7 +7086,38 @@ static void diag_dump_engine_view_extensions(sdk::FSceneViewFamily& view_family)
     }
 
     if (exts->extensions.data == nullptr || exts->extensions.count <= 0 || exts->extensions.count > 64) {
+        if (manual_dump_requested) {
+            SPDLOG_WARN("[LGUI_DUMP] cannot enumerate extensions: data={:x} count={} capacity={}; request remains pending",
+                (uintptr_t)exts->extensions.data, exts->extensions.count, exts->extensions.capacity);
+        }
         return;
+    }
+
+    if (IsBadReadPtr(exts->extensions.data, sizeof(*exts->extensions.data) * exts->extensions.count)) {
+        if (manual_dump_requested) {
+            SPDLOG_WARN("[LGUI_DUMP] extension array unreadable: data={:x} count={}; request remains pending",
+                (uintptr_t)exts->extensions.data, exts->extensions.count);
+        }
+        return;
+    }
+
+    std::unordered_map<uintptr_t, uint32_t> slot24_function_counts{};
+    for (int32_t i = 0; i < exts->extensions.count; ++i) {
+        const auto ext = exts->extensions.data[i].reference;
+        if (ext == nullptr || IsBadReadPtr((void*)ext, sizeof(uintptr_t))) continue;
+        const auto vtable = *(uintptr_t*)ext;
+        if (vtable == 0 || IsBadReadPtr((void*)vtable, sizeof(uintptr_t) * (LGUI_DRAW_SLOT + 1))) continue;
+        const auto fn = ((uintptr_t*)vtable)[LGUI_DRAW_SLOT];
+        if (fn != 0 && !IsBadReadPtr((void*)fn, sizeof(uintptr_t))) {
+            ++slot24_function_counts[fn];
+        }
+    }
+
+    const bool dump_lgui_extensions = manual_dump_requested && lgui_hook->begin_lgui_diagnostic_extension_dump();
+    if (dump_lgui_extensions) {
+        SPDLOG_INFO("[LGUI_DUMP] view extensions begin count={} frame={} family={:x} render_target={:x} views={}",
+            exts->extensions.count, vr->get_frame_count(), (uintptr_t)&view_family, (uintptr_t)rt,
+            views != nullptr ? views->count : -1);
     }
 
     for (int32_t i = 0; i < exts->extensions.count; ++i) try {
@@ -6895,10 +7125,19 @@ static void diag_dump_engine_view_extensions(sdk::FSceneViewFamily& view_family)
 
         if (ext == nullptr || IsBadReadPtr((void*)ext, sizeof(void*))) {
             SPDLOG_INFO("[VIEWEXT_DIAG]   [{}] ext={:x} (invalid)", i, (uintptr_t)ext);
+            if (dump_lgui_extensions) {
+                SPDLOG_WARN("[LGUI_DUMP] ext[{}] is null or unreadable: {:x}", i, (uintptr_t)ext);
+            }
             continue;
         }
 
         const auto vtable = *(uintptr_t*)ext;
+        if (vtable == 0 || IsBadReadPtr((void*)vtable, sizeof(uintptr_t) * 40)) {
+            if (dump_lgui_extensions) {
+                SPDLOG_WARN("[LGUI_DUMP] ext[{}]={:x} has unreadable 40-slot vtable={:x}", i, (uintptr_t)ext, vtable);
+            }
+            continue;
+        }
         const auto is_ours = vtable == (uintptr_t)g_view_extension_vtable.data();
         const auto module = utility::get_module_within((void*)vtable);
         std::string module_name = "<none>";
@@ -6925,17 +7164,50 @@ static void diag_dump_engine_view_extensions(sdk::FSceneViewFamily& view_family)
             fn_rvas += fmt::format("{:x},", fn_module.has_value() ? fn - (uintptr_t)*fn_module : fn);
         }
 
+        if (dump_lgui_extensions) {
+            std::string all_fn_rvas{};
+            for (auto j = 0; j < 40; ++j) {
+                const auto fn = ((uintptr_t*)vtable)[j];
+                if (fn == 0 || IsBadReadPtr((void*)fn, sizeof(void*))) {
+                    all_fn_rvas += fmt::format("{}:?,", j);
+                    continue;
+                }
+                const auto fn_module = utility::get_module_within((void*)fn);
+                all_fn_rvas += fmt::format("{}:{:x},", j,
+                    fn_module.has_value() ? fn - (uintptr_t)*fn_module : fn);
+            }
+            const auto slot24_fn = ((uintptr_t*)vtable)[24];
+            const auto slot24_module = utility::get_module_within((void*)slot24_fn);
+            SPDLOG_INFO("[LGUI_DUMP] ext[{}] ptr={:x} vtable={:x} module={} vtable_rva={:x} ours={} slot24_fn={:x} slot24_fn_rva={:x} functions=[{}]",
+                i, (uintptr_t)ext, vtable, module_name, rva, is_ours, slot24_fn,
+                slot24_module.has_value() ? slot24_fn - (uintptr_t)*slot24_module : slot24_fn, all_fn_rvas);
+        }
+
         if (LGUI_DIAG_STEADY_STATE) {
             SPDLOG_INFO("[VIEWEXT_DIAG]   [{}] ext={:x} vtable={:x} module={} vtable_rva={:x} ours={} fn_rvas=[{}]",
                 i, (uintptr_t)ext, vtable, module_name, rva, is_ours, fn_rvas);
         }
+        const auto slot24_fn = ((uintptr_t*)vtable)[LGUI_DRAW_SLOT];
+        const auto slot24_fn_module = utility::get_module_within((void*)slot24_fn);
+        const auto executable_module = utility::get_executable();
+        const bool slot24_is_unique = slot24_fn != 0 && slot24_function_counts[slot24_fn] == 1;
+        const bool is_lgui_candidate = !is_ours && slot24_is_unique && module.has_value() &&
+            executable_module != nullptr && *module == executable_module &&
+            slot24_fn_module.has_value() && *slot24_fn_module == executable_module;
+
+        if (dump_lgui_extensions) {
+            SPDLOG_INFO("[LGUI_DUMP] candidate ext[{}] vtable_rva={:x} slot24_fn_rva={:x} slot24_use_count={} accepted={} reason={}",
+                i, rva, slot24_fn_module.has_value() ? slot24_fn - (uintptr_t)*slot24_fn_module : slot24_fn,
+                slot24_function_counts[slot24_fn], is_lgui_candidate,
+                is_lgui_candidate ? "unique game-module slot-24 implementation" :
+                    (is_ours ? "UEVR extension" : "slot 24 is shared or outside game module"));
+        }
+
         // One-time deep scan: list every virtual that isn't the shared default stub
         // LGUI's FLGUIHudRenderer registers late (after dump #1); its vtables sit next to the
         // "LGUIHudRenderer::AddHudPrimitive_RenderThread" string at rva 26ca09xx.
         // 26ca0830 = main menu drawer (destroyed on world transition), 26ca0760 = interaction/canvas,
         // 2769cd58 = in-game class that replaces [10] after loading (fully overridden virtuals).
-        const bool is_lgui_candidate = rva == 0x26ca0830 || rva == 0x26ca0760;
-
         if (!is_ours && module.has_value() && (dump_count == 1 || is_lgui_candidate)) {
             // The default no-op virtuals all resolve to a single shared stub; detect it as the most frequent entry
             std::unordered_map<uintptr_t, int> freq{};
@@ -7145,8 +7417,10 @@ static inline uint32_t stereo_pass_right{2};
 // Every dword (< 8) that differs between the two eye views: StereoPass, its cached copies, view index,
 // "is primary" style flags. Used by the Pass2 "full eye identity" test to make the right-eye view
 // carry the left eye's metadata for the duration of its render.
-struct EyeField { uint32_t offset; uint32_t left; uint32_t right; };
+struct EyeField { uint32_t id; uint32_t offset; uint32_t left; uint32_t right; };
 static inline std::vector<EyeField> eye_fields{};
+static inline std::unordered_map<uint32_t, uint32_t> eye_field_ids{};
+static inline uint32_t next_eye_field_id{};
 // Offset of FSceneViewStateInterface* State inside the constructed FSceneView. Found by locating the
 // init options' state pointer (already resolved) inside the live view after the real constructor ran.
 static inline std::optional<uint32_t> live_scene_state_offset{};
@@ -7281,6 +7555,7 @@ static void resolve_live(sdk::FSceneViewFamily* family, sdk::FSceneView* v0, sdk
             std::string s2{};
             std::string skipped{};
             for (uint32_t i = 0; i + 4 <= 0x1000; i += 4) {
+                if (i == 0xC) continue;
                 const auto a = *(uint32_t*)((uintptr_t)v0 + i);
                 const auto b = *(uint32_t*)((uintptr_t)v1 + i);
                 if (a == b || a >= 8 || b >= 8) continue;
@@ -7299,8 +7574,10 @@ static void resolve_live(sdk::FSceneViewFamily* family, sdk::FSceneView* v0, sdk
                     continue;
                 }
 
-                eye_fields.push_back({i, a, b});
-                s2 += fmt::format("F{}={:x}:{}->{} ", eye_fields.size() - 1, i, a, b);
+                auto [id_it, inserted] = eye_field_ids.try_emplace(i, next_eye_field_id < 32 ? next_eye_field_id : 0xFFFFFFFFu);
+                if (inserted && next_eye_field_id < 32) ++next_eye_field_id;
+                eye_fields.push_back({id_it->second, i, a, b});
+                s2 += fmt::format("F{}={:x}:{}->{} ", id_it->second, i, a, b);
             }
             SPDLOG_INFO("[VR] sceneview_xref: eye identity fields (left->right): {} | skipped pointer-like/null-right: {}", s2, skipped);
         }
@@ -7330,6 +7607,7 @@ static void refresh_eye_fields(sdk::FSceneView* v0, sdk::FSceneView* v1) {
     std::vector<EyeField> refreshed{};
     std::string s2{};
     for (uint32_t i = 0; i + 4 <= 0x1000; i += 4) {
+        if (i == 0xC) continue;
         const auto a = *(uint32_t*)((uintptr_t)v0 + i);
         const auto b = *(uint32_t*)((uintptr_t)v1 + i);
         if (a == b || a >= 8 || b >= 8) continue;
@@ -7342,11 +7620,25 @@ static void refresh_eye_fields(sdk::FSceneView* v0, sdk::FSceneView* v1) {
         }
         if (pointer_like || b == 0) continue;
 
-        refreshed.push_back({i, a, b});
-        s2 += fmt::format("F{}={:x}:{}->{} ", refreshed.size() - 1, i, a, b);
+        auto [id_it, inserted] = eye_field_ids.try_emplace(i, next_eye_field_id < 32 ? next_eye_field_id : 0xFFFFFFFFu);
+        if (inserted && next_eye_field_id < 32) ++next_eye_field_id;
+        refreshed.push_back({id_it->second, i, a, b});
     }
 
-    if (refreshed.size() != eye_fields.size()) {
+    bool changed = refreshed.size() != eye_fields.size();
+    if (!changed) {
+        for (size_t i = 0; i < refreshed.size(); ++i) {
+            if (refreshed[i].offset != eye_fields[i].offset) {
+                changed = true;
+                break;
+            }
+        }
+    }
+
+    if (changed) {
+        for (const auto& field : refreshed) {
+            s2 += fmt::format("F{}={:x}:{}->{} ", field.id, field.offset, field.left, field.right);
+        }
         SPDLOG_INFO("[VR] sceneview_xref: eye identity fields refreshed ({} -> {} fields): {}",
             eye_fields.size(), refreshed.size(), s2);
         eye_fields = std::move(refreshed);
@@ -7884,7 +8176,44 @@ sdk::FSceneView* FFakeStereoRenderingHook::sceneview_constructor(sdk::FSceneView
                 is_actively_loading, in_grace_period, is_real_stereo_family, (uintptr_t)candidate_view_family);
         }
     }
+    // UE 4.26 (UE5 Backport) - Safe Guarded 3-Part Fix for WUWA, FIx samestereo pass issuess
+    // =========================================================================
+    bool restore_init_options_after_constructor = false;    
 
+    if (vr->is_native_stereo_fix_enabled() && init_options_stereo_pass > EStereoscopicPass::eSSP_PRIMARY) {
+
+        // KEEP THE GUARD: Ensures render targets exist, level isn't loading/tearing down,
+        // and we are acting on the true HMD stereo family.
+        const bool in_grace_period = g_hook->get_render_target_manager()->is_scene_capture_in_grace_period();
+        auto candidate_view_family = init_options->get_view_family();
+        const bool is_real_stereo_family =
+            candidate_view_family != nullptr && candidate_view_family == g_last_real_stereo_view_family.load(std::memory_order_relaxed);
+
+        const bool capture_generation_ready = g_hook->get_render_target_manager()->get_scene_capture_render_target() != nullptr &&
+                                              !is_actively_loading && !in_grace_period && is_real_stereo_family;
+
+        if (capture_generation_ready && vr->is_nsf_same_secondary_pass_enabled()) {
+
+            auto view_family = init_options->get_view_family();
+            auto views = view_family != nullptr ? view_family->get_views() : nullptr;
+            const bool is_right_eye_missing = (views == nullptr || views->count == 0);
+
+            if (is_right_eye_missing) {
+                // PART 2: Force Preservation of Secondary Pass if Right Eye Missing
+                SPDLOG_INFO_ONCE("[NativeStereoFix] Right eye view missing: Preserving SECONDARY pass identity");
+            } else {
+                // PART 1: Override Pass Selection to Fix Camera/Culling Asymmetry
+                init_options->set_stereo_pass((uint32_t)EStereoscopicPass::eSSP_PRIMARY);
+                restore_init_options_after_constructor = true;
+
+                // PART 3: Clear View Count for 4-Indexed View Compatibility
+                views_original_count = views->count;
+                views->count = 0;
+
+                SPDLOG_INFO_ONCE("[NativeStereoFix] Relabeled SECONDARY pass to PRIMARY and cleared view count");
+            }
+        }
+    }
     // 1. Declare the boolean flag first
         bool new_scene_state_inserted_this_frame = false;
 
@@ -7940,6 +8269,23 @@ sdk::FSceneView* FFakeStereoRenderingHook::sceneview_constructor(sdk::FSceneView
             "[VR][SAME-PASS-FORCE] sceneview_constructor EXIT: init_options={:x} result_view={:x} "
             "init_options_stereo_pass(final)={} is_null_result={}",
             (uintptr_t)init_options, (uintptr_t)result, (int32_t)init_options->get_stereo_pass(), result == nullptr);
+    }
+
+    // -------------------------------------------------------------------------
+    // POST-CONSTRUCTOR CLEANUP / RESTORATION
+    // -------------------------------------------------------------------------
+    if (restore_init_options_after_constructor) {
+        // Revert pass back to SECONDARY for compositor submission
+        init_options->set_stereo_pass((uint32_t)init_options_stereo_pass);
+
+        // Restore original view count array size
+        if (views_original_count.has_value()) {
+            auto view_family = init_options->get_view_family();
+            auto views = view_family != nullptr ? view_family->get_views() : nullptr;
+            if (views != nullptr) {
+                views->count = views_original_count.value();
+            }
+        }
     }
 
     // Restore the hidden view count now that this constructor call (and anything nested inside it)
@@ -8359,6 +8705,68 @@ void FFakeStereoRenderingHook::begin_render_viewfamily_real(
         // on refresh_eye_fields); keep it in sync with live gameplay views on a throttled cadence.
         sceneview_xref::refresh_eye_fields(view_0, view_1);
 
+        if (vr->diag_nsf_eye_view_dump()) {
+            constexpr size_t VIEW_DUMP_SIZE = 0x1000;
+            constexpr size_t VIEW_DUMP_DWORDS = VIEW_DUMP_SIZE / sizeof(uint32_t);
+            constexpr size_t MAX_DUMPED_FIELDS = 256;
+            auto* left_view = (const uint8_t*)view_1;
+            auto* right_view = (const uint8_t*)view_0;
+
+            if (IsBadReadPtr(left_view, VIEW_DUMP_SIZE) || IsBadReadPtr(right_view, VIEW_DUMP_SIZE)) {
+                SPDLOG_WARN("[VR][NSF-EYE-DUMP] Cannot capture unreadable view range: left={:x} right={:x} size={:x}",
+                    (uintptr_t)left_view, (uintptr_t)right_view, VIEW_DUMP_SIZE);
+            } else {
+                SPDLOG_INFO("[VR][NSF-EYE-DUMP] begin frame={} left={:x} right={:x} span={:x} stereo_pass_off={:x}; changed dwords only (L/R raw and f32)",
+                    g_frame_count, (uintptr_t)left_view, (uintptr_t)right_view, VIEW_DUMP_SIZE,
+                    sceneview_xref::live_stereo_pass_offset.value_or(0xFFFFFFFF));
+
+                size_t dumped_fields = 0;
+                size_t omitted_fields = 0;
+                for (size_t i = 0; i < VIEW_DUMP_DWORDS; ++i) {
+                    uint32_t left_value = 0;
+                    uint32_t right_value = 0;
+                    std::memcpy(&left_value, left_view + i * sizeof(uint32_t), sizeof(left_value));
+                    std::memcpy(&right_value, right_view + i * sizeof(uint32_t), sizeof(right_value));
+                    if (left_value == right_value) continue;
+
+                    if (dumped_fields >= MAX_DUMPED_FIELDS) {
+                        ++omitted_fields;
+                        continue;
+                    }
+
+                    float left_float = 0.0f;
+                    float right_float = 0.0f;
+                    std::memcpy(&left_float, &left_value, sizeof(left_float));
+                    std::memcpy(&right_float, &right_value, sizeof(right_float));
+                    const auto offset = i * sizeof(uint32_t);
+                    const bool is_stereo_pass = sceneview_xref::live_stereo_pass_offset.has_value() &&
+                        offset == sceneview_xref::live_stereo_pass_offset.value();
+                    const bool is_c90_neighborhood = offset >= 0xC80 && offset <= 0xCA8;
+                    SPDLOG_INFO("[VR][NSF-EYE-DUMP] +{:04x} L={:08x} ({:.6g}) R={:08x} ({:.6g}){}{}",
+                        offset, left_value, left_float, right_value, right_float,
+                        is_stereo_pass ? " [StereoPass]" : "",
+                        is_c90_neighborhood ? " [near +0xC90]" : "");
+                    ++dumped_fields;
+                }
+
+                SPDLOG_INFO("[VR][NSF-EYE-DUMP] end differing_dwords_logged={} omitted_due_to_limit={}", dumped_fields, omitted_fields);
+            }
+            vr->diag_nsf_eye_view_dump() = false;
+        }
+
+        if (vr->diag_nsf_eye_c90_read_scan()) {
+            vr->diag_nsf_eye_c90_read_scan() = false;
+            bool expected = false;
+            if (g_nsf_c90_scan_running.compare_exchange_strong(expected, true)) {
+                std::thread([] {
+                    scan_game_code_for_c90_read_candidates();
+                    g_nsf_c90_scan_running.store(false);
+                }).detach();
+            } else {
+                SPDLOG_WARN("[VR][NSF-C90-CODE-SCAN] already running; request ignored");
+            }
+        }
+
         auto runtime = vr->get_runtime();
         const auto frame_count = runtime->internal_frame_count;
 
@@ -8569,6 +8977,10 @@ void FFakeStereoRenderingHook::begin_render_viewfamily_real(
         auto pass2_view = views.data[0];
         auto pass1_view = views.data[1];
         std::vector<std::pair<uint32_t*, uint32_t>> pass2_restore{};
+        uint32_t* traced_eye_field = nullptr;
+        uint32_t* traced_stereo_pass = nullptr;
+        uint32_t traced_eye_field_original_value = 0;
+        uint32_t traced_eye_field_replacement_value = 0;
 
         if (vr->is_native_stereo_fix_right_eye_shadows_enabled() && pass2_view != nullptr && pass1_view != nullptr && nsf_pass2_hacks_safe_this_frame) {
             const auto& fields = sceneview_xref::eye_fields;
@@ -8588,15 +9000,98 @@ void FFakeStereoRenderingHook::begin_render_viewfamily_real(
                 // eyes' live values actually still differ right now - this self-corrects for any
                 // per-frame drift instead of betting on the snapshot staying valid indefinitely.
                 for (size_t i = 0; i < fields.size(); ++i) {
-                    if (i < 32 && (mask & (1u << i)) == 0) continue;
                     const auto& f = fields[i];
+                    if (f.id >= 32 || (mask & (1u << f.id)) == 0) continue;
+                    if (f.offset == 0xC) {
+                        SPDLOG_WARN("[VR] NSF right-eye shadow fix: rejecting unsafe upper pointer dword F{} at +{:x}", f.id, f.offset);
+                        continue;
+                    }
                     auto p_right = (uint32_t*)((uintptr_t)pass2_view + f.offset);
                     auto p_left = (uint32_t*)((uintptr_t)pass1_view + f.offset);
+                    if (f.offset + sizeof(uint32_t) > 0x1000 ||
+                        IsBadReadPtr(p_right, sizeof(uint32_t)) || IsBadReadPtr(p_left, sizeof(uint32_t))) {
+                        SPDLOG_WARN("[VR] NSF right-eye shadow fix: skipping unreadable eye field F{} at +{:x}", f.id, f.offset);
+                        continue;
+                    }
+                    if ((f.offset % 8) == 0 &&
+                        (IsBadReadPtr((void*)((uintptr_t)pass1_view + f.offset + 4), sizeof(uint32_t)) ||
+                            IsBadReadPtr((void*)((uintptr_t)pass2_view + f.offset + 4), sizeof(uint32_t)))) {
+                        SPDLOG_WARN("[VR] NSF right-eye shadow fix: skipping unreadable adjacent dword for F{} at +{:x}", f.id, f.offset);
+                        continue;
+                    }
                     const auto live_left_value = *p_left;
+                    const auto live_right_value = *p_right;
+                    if (live_left_value >= 8 || live_right_value >= 8 || live_left_value == live_right_value || live_right_value == 0) {
+                        SPDLOG_WARN("[VR] NSF right-eye shadow fix: skipping changed/non-enum eye field F{} at +{:x} left={} right={}",
+                            f.id, f.offset, live_left_value, live_right_value);
+                        continue;
+                    }
+                    if ((f.offset % 8) == 0 &&
+                        (*(uint32_t*)((uintptr_t)pass1_view + f.offset + 4) != 0 ||
+                            *(uint32_t*)((uintptr_t)pass2_view + f.offset + 4) != 0)) {
+                        SPDLOG_WARN("[VR] NSF right-eye shadow fix: skipping pointer-like eye field F{} at +{:x}", f.id, f.offset);
+                        continue;
+                    }
 
-                    if (*p_right != live_left_value) {
-                        pass2_restore.emplace_back(p_right, *p_right);
+                    if (f.offset == 0xC90 && live_left_value != live_right_value) {
+                        static uint64_t eye_field_samples = 0;
+                        const auto sample = eye_field_samples++;
+                        if (sample < 20 || sample % 120 == 0) {
+                            constexpr uint32_t window_start = 0xC80;
+                            constexpr uint32_t window_size = 0x28;
+                            auto append_window = [](std::string& out, sdk::FSceneView* view) {
+                                for (uint32_t offset = window_start; offset < window_start + window_size; offset += 4) {
+                                    auto value = *(uint32_t*)((uintptr_t)view + offset);
+                                    out += fmt::format(" {:03x}={:08x}", offset, value);
+                                }
+                            };
+                            std::string left_window{"L:"};
+                            std::string right_window{"R:"};
+                            if (!IsBadReadPtr((void*)((uintptr_t)pass1_view + window_start), window_size) &&
+                                !IsBadReadPtr((void*)((uintptr_t)pass2_view + window_start), window_size)) {
+                                append_window(left_window, pass1_view);
+                                append_window(right_window, pass2_view);
+                                SPDLOG_INFO("[VR][NSF-EYE-FIELD] pre-write sample={} frame={} field_id=F{} offset=+{:x} mask={:x} left={:x} right={:x} left_value={} right_value={} {} {}",
+                                    sample, g_frame_count, f.id, f.offset, mask, (uintptr_t)pass1_view, (uintptr_t)pass2_view,
+                                    live_left_value, live_right_value, left_window, right_window);
+                            } else {
+                                SPDLOG_WARN("[VR][NSF-EYE-FIELD] unreadable neighborhood at +{:x} left={:x} right={:x}",
+                                    window_start, (uintptr_t)pass1_view, (uintptr_t)pass2_view);
+                            }
+                        }
+                    }
+
+                    if (live_right_value != live_left_value) {
+                        uint32_t* stereo_pass = nullptr;
+                        if (f.offset == 0xC90 && sceneview_xref::live_stereo_pass_offset.has_value()) {
+                            const auto stereo_pass_offset = sceneview_xref::live_stereo_pass_offset.value();
+                            if (stereo_pass_offset + sizeof(uint32_t) <= 0x1000) {
+                                stereo_pass = (uint32_t*)((uintptr_t)pass2_view + stereo_pass_offset);
+                                if (IsBadReadPtr(stereo_pass, sizeof(*stereo_pass))) {
+                                    stereo_pass = nullptr;
+                                }
+                            }
+                            if (stereo_pass != nullptr) {
+                                SPDLOG_INFO("[VR][NSF-EYE-IDENTITY-TRACE] before-write frame={} pass2_view={:x} stereo_pass@+{:x}={} c90={}",
+                                    g_frame_count, (uintptr_t)pass2_view, stereo_pass_offset, *stereo_pass, live_right_value);
+                            } else {
+                                SPDLOG_WARN("[VR][NSF-EYE-IDENTITY-TRACE] unable to read StereoPass before write frame={} pass2_view={:x}",
+                                    g_frame_count, (uintptr_t)pass2_view);
+                            }
+                        }
+
+                        pass2_restore.emplace_back(p_right, live_right_value);
                         *p_right = live_left_value;
+                        if (f.offset == 0xC90) {
+                            traced_eye_field = p_right;
+                            if (stereo_pass != nullptr) {
+                                traced_stereo_pass = stereo_pass;
+                                SPDLOG_INFO("[VR][NSF-EYE-IDENTITY-TRACE] render-state frame={} pass2_view={:x} stereo_pass={} c90={} original_c90={}",
+                                    g_frame_count, (uintptr_t)pass2_view, *stereo_pass, *p_right, live_right_value);
+                            }
+                            traced_eye_field_original_value = live_right_value;
+                            traced_eye_field_replacement_value = live_left_value;
+                        }
                     }
                 }
 
@@ -8723,6 +9218,23 @@ void FFakeStereoRenderingHook::begin_render_viewfamily_real(
         g_hook->m_render_module_begin_render_viewfamily_hook.unsafe_call<void>(render_module, canvas, view_family_candidate);
         const auto pass2_render_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - pass2_render_start).count();
 
+        if (traced_eye_field != nullptr) {
+            if (!IsBadReadPtr(traced_eye_field, sizeof(*traced_eye_field))) {
+                const bool stereo_pass_readable = traced_stereo_pass != nullptr && !IsBadReadPtr(traced_stereo_pass, sizeof(*traced_stereo_pass));
+                if (stereo_pass_readable) {
+                    SPDLOG_INFO("[VR][NSF-EYE-IDENTITY-TRACE] after-render-before-restore frame={} pass2_view={:x} stereo_pass={} c90={} original_c90={} replacement_c90={} render_ms={:.3f}",
+                        g_frame_count, (uintptr_t)pass2_view, *traced_stereo_pass,
+                        *traced_eye_field, traced_eye_field_original_value, traced_eye_field_replacement_value, pass2_render_ms);
+                } else {
+                    SPDLOG_WARN("[VR][NSF-EYE-IDENTITY-TRACE] StereoPass unreadable after render; view={:x} c90={} render_ms={:.3f}",
+                        (uintptr_t)traced_eye_field, *traced_eye_field, pass2_render_ms);
+                }
+            } else {
+                SPDLOG_WARN("[VR][NSF-EYE-IDENTITY-TRACE] c90 unreadable after render frame={} field={:x}",
+                    g_frame_count, (uintptr_t)traced_eye_field);
+            }
+        }
+
         {
             static double s_pass2_avg_ms = 0.0;
             static bool s_have_pass2_avg = false;
@@ -8748,6 +9260,18 @@ void FFakeStereoRenderingHook::begin_render_viewfamily_real(
 
         for (auto& [p, v] : pass2_restore) {
             *p = v;
+        }
+
+        if (traced_eye_field != nullptr) {
+            const bool c90_readable = !IsBadReadPtr(traced_eye_field, sizeof(*traced_eye_field));
+            const bool stereo_pass_readable = traced_stereo_pass != nullptr && !IsBadReadPtr(traced_stereo_pass, sizeof(*traced_stereo_pass));
+            if (c90_readable && stereo_pass_readable) {
+                SPDLOG_INFO("[VR][NSF-EYE-IDENTITY-TRACE] after-restore frame={} pass2_view={:x} stereo_pass={} c90={} expected_original_c90={}",
+                    g_frame_count, (uintptr_t)pass2_view, *traced_stereo_pass, *traced_eye_field, traced_eye_field_original_value);
+            } else {
+                SPDLOG_WARN("[VR][NSF-EYE-IDENTITY-TRACE] unreadable after restore frame={} pass2_view={:x} c90_readable={} stereo_pass_readable={}",
+                    g_frame_count, (uintptr_t)pass2_view, c90_readable, stereo_pass_readable);
+            }
         }
 
         // Restore view order & original target

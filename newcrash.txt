@@ -1,0 +1,90 @@
+26-09-30 19:49:15.530] [UnrealVR] [info] [OpenXR.cpp:126] Frame already began, skipping xrWaitFrame call.
+[2026-09-30 19:49:15.651] [UnrealVR] [info] [VR.hpp:666] [DIAG] is_native_stereo_fix_enabled (#16829): raw_value=true allow_with_afr=false using_afr=false suspended=false -> result=true
+[2026-09-30 19:49:15.839] [UnrealVR] [info] [VR.hpp:666] [DIAG] is_native_stereo_fix_enabled (#17430): raw_value=true allow_with_afr=false using_afr=false suspended=false -> result=true
+[2026-09-30 19:49:16.029] [UnrealVR] [info] [VR.hpp:666] [DIAG] is_native_stereo_fix_enabled (#18031): raw_value=true allow_with_afr=false using_afr=false suspended=false -> result=true
+[2026-09-30 19:49:16.054] [UnrealVR] [info] [FFakeStereoRenderingHook.cpp:7934] [VR] sceneview_constructor: same_pass_enabled=false force_primary_enabled=false init_options_stereo_pass=2 scene_capture_rt=0x16f017d980
+[2026-09-30 19:49:16.065] [UnrealVR] [info] [OpenXR.cpp:1753] [VR][DIAG] OpenXR::end_frame submitting frame (view_target_generation=6)
+[2026-09-30 19:49:16.207] [UnrealVR] [info] [VR.hpp:666] [DIAG] is_native_stereo_fix_enabled (#18632): raw_value=true allow_with_afr=false using_afr=false suspended=false -> result=true
+[2026-09-30 19:49:16.393] [UnrealVR] [info] [VR.hpp:666] [DIAG] is_native_stereo_fix_enabled (#19233): raw_value=true allow_with_afr=false using_afr=false suspended=false -> result=true
+[2026-09-30 19:49:16.575] [UnrealVR] [info] [VR.hpp:666] [DIAG] is_native_stereo_fix_enabled (#19834): raw_value=true allow_with_afr=false using_afr=false suspended=false -> result=true
+[2026-09-30 19:49:16.764] [UnrealVR] [info] [VR.hpp:666] [DIAG] is_native_stereo_fix_enabled (#20435): raw_value=true allow_with_afr=false using_afr=false suspended=false -> result=true
+[2026-09-30 19:49:16.829] [UnrealVR] [info] [FFakeStereoRenderingHook.cpp:4741] [LGUI_RHI_STABILITY] snapshot: 4 distinct RHI resources total, 2 active in last 5s, highest per-resource wrapper reuse count=310 (low count here = a3 churn is JUST wrapper recycling, not real render-target recreation)
+[2026-09-30 19:49:16.959] [UnrealVR] [info] [VR.hpp:666] [DIAG] is_native_stereo_fix_enabled (#21036): raw_value=true allow_with_afr=false using_afr=false suspended=false -> result=true
+[2026-09-30 19:49:17.125] [UnrealVR] [info] [VR.hpp:666] [DIAG] is_native_stereo_fix_enabled (#21637): raw_value=true allow_with_afr=false using_afr=false suspended=false -> result=true
+[2026-09-30 19:49:17.292] [UnrealVR] [info] [VR.hpp:666] [DIAG] is_native_stereo_fix_enabled (#22238): raw_value=true allow_with_afr=false using_afr=false suspended=false -> result=true
+[2026-09-30 19:49:17.445] [UnrealVR] [info] [VR.hpp:666] [DIAG] is_native_stereo_fix_enabled (#22839): raw_value=true allow_with_afr=false using_afr=false suspended=false -> result=true
+[2026-09-30 19:49:17.524] [UnrealVR] [info] [FFakeStereoRenderingHook.cpp:8543] [VR] begin_render_viewfamily_real FRAME PACING over 2003ms: frames=178 min=3.2ms max=29.4ms avg=11.3ms
+[2026-09-30 19:49:17.524] [UnrealVR] [info] [FFakeStereoRenderingHook.cpp:8552] [VR] begin_render_viewfamily_real: views.count=2 prev_count=2 rt_valid=true
+[2026-09-30 19:49:17.524] [UnrealVR] [info] [FFakeStereoRenderingHook.cpp:7529] [VR] sceneview_xref: eye identity fields refreshed (5 -> 7 fields): F0=130:0->1 F2=164:0->1 F3=1a0:2->3 F13=224:0->1 F6=2ec:0->1 F7=c90:2->3 F14=de4:0->1 
+[2026-09-30 19:49:17.524] [UnrealVR] [info] [FFakeStereoRenderingHook.cpp:8948] [VR] NSF right-eye shadow fix: view=5d7040080 flipped 0/7 eye fields live from pass1=5d7042070 (mask=0)
+[2026-09-30 19:49:17.524] [UnrealVR] [info] [FFakeStereoRenderingHook.cpp:8969] [VR] NSF view state: pass1(left)=5d2a15580 pass2(right)=5d2a12ae0 shared=false known_states=3
+[2026-09-30 19:49:17.531] [UnrealVR] [info] [OpenXR.cpp:126] Frame already began, skipping xrWaitFrame call.
+[2026-09-30 19:49:17.532] [UnrealVR] [info] [D3D12Component.cpp:1001] [VR] left eye composite: game_tex=5098x3016 dst_eye=2549x3016 mode=copy frame=1348 bb_idx=0 is_afr=false is_same_frame=false native_stereo_fix=true view_target_generation=6
+[2026-09-30 19:49:17.532] [UnrealVR] [info] [D3D12Component.cpp:1067] [VR] right eye composite: scene_capture=2549x3016 dst_eye=2549x3016 mode=copy game_tex=0x16474d41a0 view_target_generation=6 stall_ms=0
+[2026-09-30 19:49:17.608] [UnrealVR] [info] [VR.hpp:666] [DIAG] is_native_stereo_fix_enabled (#23440): raw_value=true allow_with_afr=false using_afr=false suspended=false -> result=true
+[2026-09-30 19:49:17.760] [UnrealVR] [info] [VR.hpp:666] [DIAG] is_native_stereo_fix_enabled (#24041): raw_value=true allow_with_afr=false using_afr=false suspended=false -> result=true
+[2026-09-30 19:49:17.934] [UnrealVR] [info] [VR.hpp:666] [DIAG] is_native_stereo_fix_enabled (#24642): raw_value=true allow_with_afr=false using_afr=false suspended=false -> result=true
+[2026-09-30 19:49:18.055] [UnrealVR] [info] [FFakeStereoRenderingHook.cpp:7934] [VR] sceneview_constructor: same_pass_enabled=false force_primary_enabled=false init_options_stereo_pass=2 scene_capture_rt=0x16f017d980
+[2026-09-30 19:49:18.065] [UnrealVR] [info] [OpenXR.cpp:1753] [VR][DIAG] OpenXR::end_frame submitting frame (view_target_generation=6)
+[2026-09-30 19:49:18.111] [UnrealVR] [info] [VR.hpp:666] [DIAG] is_native_stereo_fix_enabled (#25243): raw_value=true allow_with_afr=false using_afr=false suspended=false -> result=true
+[2026-09-30 19:49:18.289] [UnrealVR] [info] [VR.hpp:666] [DIAG] is_native_stereo_fix_enabled (#25844): raw_value=true allow_with_afr=false using_afr=false suspended=false -> result=true
+[2026-09-30 19:49:18.299] [UnrealVR] [info] [FFakeStereoRenderingHook.cpp:8754] [DIAG] begin_render_viewfamily_real Pass1 (left, #603): view_rect=(0,0)-(2549,3016) w=2549 h=3016
+[2026-09-30 19:49:18.299] [UnrealVR] [info] [FFakeStereoRenderingHook.cpp:8837] [DIAG] begin_render_viewfamily_real Pass2 (right/NSF, #603): view_rect=(0,0)-(2549,3016) w=2549 h=3016
+[2026-09-30 19:49:18.475] [UnrealVR] [info] [VR.hpp:666] [DIAG] is_native_stereo_fix_enabled (#26445): raw_value=true allow_with_afr=false using_afr=false suspended=false -> result=true
+[2026-09-30 19:49:18.530] [UnrealVR] [info] [FFakeStereoRenderingHook.cpp:4741] [LGUI_RHI_STABILITY] snapshot: 4 distinct RHI resources total, 2 active in last 5s, highest per-resource wrapper reuse count=460 (low count here = a3 churn is JUST wrapper recycling, not real render-target recreation)
+[2026-09-30 19:49:18.662] [UnrealVR] [info] [VR.hpp:666] [DIAG] is_native_stereo_fix_enabled (#27046): raw_value=true allow_with_afr=false using_afr=false suspended=false -> result=true
+[2026-09-30 19:49:18.834] [UnrealVR] [info] [VR.hpp:666] [DIAG] is_native_stereo_fix_enabled (#27647): raw_value=true allow_with_afr=false using_afr=false suspended=false -> result=true
+[2026-09-30 19:49:19.013] [UnrealVR] [info] [VR.hpp:666] [DIAG] is_native_stereo_fix_enabled (#28248): raw_value=true allow_with_afr=false using_afr=false suspended=false -> result=true
+[2026-09-30 19:49:19.196] [UnrealVR] [info] [VR.hpp:666] [DIAG] is_native_stereo_fix_enabled (#28849): raw_value=true allow_with_afr=false using_afr=false suspended=false -> result=true
+[2026-09-30 19:49:19.409] [UnrealVR] [info] [VR.hpp:666] [DIAG] is_native_stereo_fix_enabled (#29450): raw_value=true allow_with_afr=false using_afr=false suspended=false -> result=true
+[2026-09-30 19:49:19.532] [UnrealVR] [info] [FFakeStereoRenderingHook.cpp:8543] [VR] begin_render_viewfamily_real FRAME PACING over 2008ms: frames=178 min=3.6ms max=41.7ms avg=11.3ms
+[2026-09-30 19:49:19.532] [UnrealVR] [info] [FFakeStereoRenderingHook.cpp:8552] [VR] begin_render_viewfamily_real: views.count=2 prev_count=2 rt_valid=true
+[2026-09-30 19:49:19.532] [UnrealVR] [info] [FFakeStereoRenderingHook.cpp:7529] [VR] sceneview_xref: eye identity fields refreshed (7 -> 5 fields): F0=130:0->1 F2=164:0->1 F3=1a0:2->3 F6=2ec:0->1 F7=c90:2->3 
+[2026-09-30 19:49:19.532] [UnrealVR] [info] [FFakeStereoRenderingHook.cpp:8948] [VR] NSF right-eye shadow fix: view=16cd614060 flipped 0/5 eye fields live from pass1=5d7042070 (mask=0)
+[2026-09-30 19:49:19.532] [UnrealVR] [info] [FFakeStereoRenderingHook.cpp:8969] [VR] NSF view state: pass1(left)=5d2a15580 pass2(right)=5d2a12ae0 shared=false known_states=3
+[2026-09-30 19:49:19.541] [UnrealVR] [info] [OpenXR.cpp:126] Frame already began, skipping xrWaitFrame call.
+[2026-09-30 19:49:19.542] [UnrealVR] [info] [D3D12Component.cpp:1001] [VR] left eye composite: game_tex=5098x3016 dst_eye=2549x3016 mode=copy frame=1704 bb_idx=1 is_afr=false is_same_frame=false native_stereo_fix=true view_target_generation=6
+[2026-09-30 19:49:19.542] [UnrealVR] [info] [D3D12Component.cpp:1067] [VR] right eye composite: scene_capture=2549x3016 dst_eye=2549x3016 mode=copy game_tex=0x16474d41a0 view_target_generation=6 stall_ms=0
+[2026-09-30 19:49:19.586] [UnrealVR] [info] Setting draw ui to false
+[2026-09-30 19:49:19.586] [UnrealVR] [info] Saving config config.txt
+[2026-09-30 19:49:19.586] [UnrealVR] [info] [VR] Saving camera offsets to C:\Users\aaron\AppData\Roaming\UnrealVRMod\Client-Win64-Shipping\cameras.txt
+[2026-09-30 19:49:19.587] [UnrealVR] [info] Saved config
+[2026-09-30 19:49:19.587] [UnrealVR] [info] Signaled frontend config setup
+[2026-09-30 19:49:19.587] [UnrealVR] [info] Removing SetCursorPos patch
+[2026-09-30 19:49:19.611] [UnrealVR] [info] [VR.hpp:666] [DIAG] is_native_stereo_fix_enabled (#30051): raw_value=true allow_with_afr=false using_afr=false suspended=false -> result=true
+[2026-09-30 19:49:19.809] [UnrealVR] [info] [VR.hpp:666] [DIAG] is_native_stereo_fix_enabled (#30652): raw_value=true allow_with_afr=false using_afr=false suspended=false -> result=true
+[2026-09-30 19:49:20.032] [UnrealVR] [info] [VR.hpp:666] [DIAG] is_native_stereo_fix_enabled (#31253): raw_value=true allow_with_afr=false using_afr=false suspended=false -> result=true
+[2026-09-30 19:49:20.065] [UnrealVR] [info] [OpenXR.cpp:1753] [VR][DIAG] OpenXR::end_frame submitting frame (view_target_generation=6)
+[2026-09-30 19:49:20.066] [UnrealVR] [info] [FFakeStereoRenderingHook.cpp:7934] [VR] sceneview_constructor: same_pass_enabled=false force_primary_enabled=false init_options_stereo_pass=2 scene_capture_rt=0x16f017d980
+[2026-09-30 19:49:20.252] [UnrealVR] [info] [FFakeStereoRenderingHook.cpp:4741] [LGUI_RHI_STABILITY] snapshot: 4 distinct RHI resources total, 2 active in last 5s, highest per-resource wrapper reuse count=610 (low count here = a3 churn is JUST wrapper recycling, not real render-target recreation)
+[2026-09-30 19:49:20.254] [UnrealVR] [info] [VR.hpp:666] [DIAG] is_native_stereo_fix_enabled (#31854): raw_value=true allow_with_afr=false using_afr=false suspended=false -> result=true
+[2026-09-30 19:49:20.493] [UnrealVR] [info] [VR.hpp:666] [DIAG] is_native_stereo_fix_enabled (#32455): raw_value=true allow_with_afr=false using_afr=false suspended=false -> result=true
+[2026-09-30 19:49:21.009] [UnrealVR] [info] [VR.hpp:666] [DIAG] is_native_stereo_fix_enabled (#33056): raw_value=true allow_with_afr=false using_afr=false suspended=false -> result=true
+[2026-09-30 19:49:21.539] [UnrealVR] [info] [FFakeStereoRenderingHook.cpp:8543] [VR] begin_render_viewfamily_real FRAME PACING over 2008ms: frames=111 min=1.2ms max=260.0ms avg=18.1ms
+[2026-09-30 19:49:21.539] [UnrealVR] [info] [FFakeStereoRenderingHook.cpp:8552] [VR] begin_render_viewfamily_real: views.count=2 prev_count=2 rt_valid=true
+[2026-09-30 19:49:21.539] [UnrealVR] [info] [FFakeStereoRenderingHook.cpp:7529] [VR] sceneview_xref: eye identity fields refreshed (5 -> 21 fields): F0=130:0->1 F1=13c:5->1 F15=144:0->1 F2=164:0->1 F3=1a0:2->3 F16=20c:0->1 F11=234:0->1 F17=2ac:0->1 F6=2ec:0->1 F18=374:0->1 F19=39c:0->1 F20=834:0->1 F21=85c:0->1 F7=c90:2->3 F22=d1c:0->4 F23=d6c:0->4 F24=dbc:0->4 F14=de4:0->4 F25=e0c:0->4 F26=e34:0->4 F27=e5c:0->4 
+[2026-09-30 19:49:21.539] [UnrealVR] [info] [FFakeStereoRenderingHook.cpp:8948] [VR] NSF right-eye shadow fix: view=1680f6a030 flipped 0/21 eye fields live from pass1=1680f6c020 (mask=0)
+[2026-09-30 19:49:21.539] [UnrealVR] [info] [FFakeStereoRenderingHook.cpp:8969] [VR] NSF view state: pass1(left)=5d2a15580 pass2(right)=5d2a12ae0 shared=false known_states=3
+[2026-09-30 19:49:21.608] [UnrealVR] [info] [OpenXR.cpp:126] Frame already began, skipping xrWaitFrame call.
+[2026-09-30 19:49:21.609] [UnrealVR] [info] [D3D12Component.cpp:1001] [VR] left eye composite: game_tex=5098x3016 dst_eye=2549x3016 mode=copy frame=1930 bb_idx=0 is_afr=false is_same_frame=false native_stereo_fix=true view_target_generation=6
+[2026-09-30 19:49:21.609] [UnrealVR] [info] [D3D12Component.cpp:1067] [VR] right eye composite: scene_capture=2549x3016 dst_eye=2549x3016 mode=copy game_tex=0x16474d41a0 view_target_generation=6 stall_ms=0
+[2026-09-30 19:49:21.875] [UnrealVR] [info] [VR.hpp:666] [DIAG] is_native_stereo_fix_enabled (#33657): raw_value=true allow_with_afr=false using_afr=false suspended=false -> result=true
+[2026-09-30 19:49:21.930] [UnrealVR] [info] [FFakeStereoRenderingHook.cpp:10433] Encountered attempted dereference of null pointer at 7ff9beab965e
+[2026-09-30 19:49:21.930] [UnrealVR] [info] [FFakeStereoRenderingHook.cpp:10442] [Exception Handler]   rva=6f965e base_reg=2 disp=0x2e8 rax=0 rcx=4 rdx=0 rbx=9ab46680 rsi=166d9c0c00 rdi=1 r8=1 r9=1 r12=9ab3b001 r13=1 r14=9b170090 r15=0
+[2026-09-30 19:49:21.930] [UnrealVR] [warning] [FFakeStereoRenderingHook.cpp:10459] [Exception Handler] [LGUI_A3_LIFECYCLE] faulting base_reg value 0 lookup: not a known LGUI a3 address
+[2026-09-30 19:49:21.930] [UnrealVR] [warning] [FFakeStereoRenderingHook.cpp:10462] [Exception Handler] [LGUI_A3_LIFECYCLE] rcx lookup: not a known LGUI a3 address | rdx lookup: not a known LGUI a3 address | r8 lookup: not a known LGUI a3 address
+[2026-09-30 19:49:21.930] [UnrealVR] [error] [FFakeStereoRenderingHook.cpp:10478] [Exception Handler] [LGUI_CRASH_CONTEXT] ms_since_last_redirect=0 last_redirect_a3=1650454048 redirect_count_this_frame=1 shadow_pool_size=64 total_redirect_calls=1381
+[2026-09-30 19:49:21.930] [UnrealVR] [info] [Scan.cpp:1350] Adding 59532 entries for module 7ff9be3c0000
+[2026-09-30 19:49:21.930] [UnrealVR] [info] [Scan.cpp:1367] Filtered and sorted entries down to 59532 for module 7ff9be3c0000
+[2026-09-30 19:49:21.930] [UnrealVR] [info] [Scan.cpp:1406] Adding remaining 140 entries to last bucket for module 7ff9be3c0000
+[2026-09-30 19:49:21.930] [UnrealVR] [info] [Scan.cpp:1489] Found function start for 7ff9beab965d at 6f95ab
+[2026-09-30 19:49:21.930] [UnrealVR] [info] [Scan.cpp:2092] Reference point for 7ff9beab965d: 7ff9beab95ab
+[2026-09-30 19:49:21.930] [UnrealVR] [error] [FFakeStereoRenderingHook.cpp:10498] Previous instruction does not use the same register as the dereference
+[2026-09-30 19:49:21.930] [UnrealVR] [error] [FFakeStereoRenderingHook.cpp:10500] [Exception Handler] module=C:\WINDOWS\system32\DriverStore\FileRepository\nv_dispi.inf_amd64_0373d825005116d0\nvwgf2umx.dll exception_addr=7ff9beab965e exception_mnemonic=MOV
+[2026-09-30 19:49:21.930] [UnrealVR] [error] [FFakeStereoRenderingHook.cpp:10503] [Exception Handler] previous_instr_addr=7ff9beab9658 previous_mnemonic=MOV previous_op0_type=1 previous_op1_type=2
+[2026-09-30 19:49:26.982] [UnrealVR] [info] [Framework.cpp:181] Framework::hook_monitor(): present stalled for 5060ms (has_last_chance=true)
+[2026-09-30 19:49:26.982] [UnrealVR] [info] [Framework.cpp:236] Framework::hook_monitor(): engine tick stalled, backing off rehook (loading screen assumed)
+[2026-09-30 19:49:32.098] [UnrealVR] [info] [Framework.cpp:181] Framework::hook_monitor(): present stalled for 5116ms (has_last_chance=true)
+[2026-09-30 19:49:32.099] [UnrealVR] [info] [Framework.cpp:236] Framework::hook_monitor(): engine tick stalled, backing off rehook (loading screen assumed)
+[2026-09-30 19:49:37.102] [UnrealVR] [info] [Framework.cpp:181] Framework::hook_monitor(): present stalled for 5003ms (has_last_chance=true)
+[2026-09-30 19:49:37.102] [UnrealVR] [info] [Framework.cpp:236] Framework::hook_monitor(): engine tick stalled, backing off rehook (loading screen assumed)

@@ -584,6 +584,14 @@ static DiagContentBounds diag_content_bounds(ID3D12Device* device, ID3D12Command
 } // namespace
 
 namespace vrmod {
+void D3D12Component::wait_for_scene_capture_copies() {
+    m_openxr.wait_for_all_copies();
+
+    for (auto& texture_context : m_openvr.right_eye_tex) {
+        texture_context.commands.wait(INFINITE);
+    }
+}
+
 vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
     if (m_force_reset || m_last_afr_state != vr->is_using_afr()) {
         if (!setup()) {
@@ -915,6 +923,12 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
             SPDLOG_INFO("[VR][DIAG] Binding new scene capture RT {:x} to m_scene_capture_tex (previous bound={:x}, generation={})",
                 (uintptr_t)scene_capture_rt, (uintptr_t)m_scene_capture_tex.texture.Get(), view_target_generation);
 
+            if (m_scene_capture_tex.texture.Get() != nullptr) {
+                SPDLOG_INFO("[VR] Waiting for in-flight eye copies before replacing scene capture texture (old={:x}, new={:x})",
+                    (uintptr_t)m_scene_capture_tex.texture.Get(), (uintptr_t)scene_capture_rt);
+                wait_for_scene_capture_copies();
+            }
+
             if (!m_scene_capture_tex.setup(
                     device, scene_capture_rt, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM, L"Scene Capture Texture")) {
                 spdlog::error("[VR] Failed to fully setup scene capture texture.");
@@ -953,6 +967,9 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
         if (is_world_loading != s_diag_last_reset_reason_loading) {
             SPDLOG_INFO("[VR][DIAG] D3D12 NSF scene capture texture reset: nsf_enabled={} is_world_loading={}", vr->is_native_stereo_fix_enabled(), is_world_loading);
             s_diag_last_reset_reason_loading = is_world_loading;
+        }
+        if (m_scene_capture_tex.texture.Get() != nullptr) {
+            wait_for_scene_capture_copies();
         }
         m_scene_capture_tex.reset();
     }
@@ -2357,6 +2374,10 @@ void D3D12Component::on_reset(VR* vr) {
     m_force_reset = true;
 
     auto runtime = vr->get_runtime();
+
+    if (m_scene_capture_tex.texture.Get() != nullptr) {
+        wait_for_scene_capture_copies();
+    }
 
     for (auto& ctx : m_openvr.left_eye_tex) {
         ctx.reset();
