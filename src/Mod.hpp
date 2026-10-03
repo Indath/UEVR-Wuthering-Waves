@@ -555,15 +555,26 @@ public:
     {
     }
 
-    // No use for actually displaying this yet, so leaving them out for now
     bool draw(std::string_view name) override {
         if (!should_draw_option()) {
             return false;
         }
 
-        // TODO
+        ImGui::PushID(this);
 
-        return false;
+        char buf[512]{};
+        strncpy_s(buf, sizeof(buf), m_value.c_str(), _TRUNCATE);
+
+        auto ret = ImGui::InputText(name.data(), buf, sizeof(buf));
+
+        if (ret) {
+            m_value = buf;
+        }
+
+        context_menu_logic();
+        ImGui::PopID();
+
+        return ret;
     }
 
     void draw_value(std::string_view name) override {

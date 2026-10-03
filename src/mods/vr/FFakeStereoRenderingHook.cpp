@@ -5,6 +5,7 @@
 #include <unordered_set>
 #include <array>
 #include <cmath>
+#include <optional>
 #include <d3d12.h>
 #include <wrl/client.h>
 
@@ -12,6 +13,7 @@
 #include <future>
 #include <filesystem>
 #include <unordered_map>
+#include <set>
 #include <thread>
 #include <mutex>
 
@@ -37,6 +39,8 @@
 #include <sdk/Globals.hpp>
 #include <sdk/FName.hpp>
 #include <sdk/UObjectArray.hpp>
+#include <sdk/UClass.hpp>
+#include <sdk/FProperty.hpp>
 #include <sdk/FBoolProperty.hpp>
 #include <sdk/FViewport.hpp>
 #include <sdk/UKismetRenderingLibrary.hpp>
@@ -66,6 +70,7 @@
 #include "../../utility/Logging.hpp"
 
 #include "FFakeStereoRenderingHook.hpp"
+#include "TraceWriter.hpp"
 
 #include <tracy/Tracy.hpp>
 #include "uevr/API.hpp"
@@ -1253,14 +1258,18 @@ bool FFakeStereoRenderingHook::hook() {
     // Long pauses in code execution, due to us doing massive scans for code in this function.
     std::scoped_lock _{g_framework->get_hook_monitor_mutex()};
 
-    // DIAG/MITIGATION: This title only ever calls CalculateStereoProjectionMatrix once per frame
-    // (confirmed by the runtime STEREO-SETUP logs, which show proj_calls=0 for the left eye on
-    // every single frame in the reported double-vision window, while AdjustViewRect and
-    // CalculateStereoViewOffset both correctly fire once per eye). That single-call-per-frame
-    // projection pattern is the signature of Instanced Stereo Rendering (ISR), where the engine
-    // computes one shared projection matrix instead of calling this function twice. Force ISR off
-    // so the engine falls back to two genuine, separate per-eye stereo passes, which is what the
-    // existing per-eye projection override logic below assumes.
+    // DIAG/EXPERIMENT (ISR-REENABLE): Previously this block force-disabled Instanced Stereo
+    // Rendering (ISR) because this title's single CalculateStereoProjectionMatrix call/frame
+    // pattern looked like ISR, and the existing per-eye override logic below assumed two
+    // genuine separate per-eye stereo passes. That assumption was never re-validated after the
+    // views.count==1-twice serialization in begin_render_viewfamily_real was identified as the
+    // actual root cause of shared culling/shadow/occlusion desync between eyes. ISR is Unreal's
+    // native mechanism for rendering both eyes in a single FSceneRenderer::Render() call with
+    // both FSceneViews genuinely present together, which is exactly what that shared engine
+    // machinery (round-robin occlusion, shared relevance passes, shadow setup) requires to work
+    // correctly. Leaving ISR ON here so we can observe, via the NSF-ISR-DIAG logging in
+    // begin_render_viewfamily_real, whether the engine naturally hands us views.count>=2 with
+    // both FSceneView pointers valid BEFORE any of the mod's manual splitting runs.
     {
         static bool attempted_disable_instanced_stereo = false;
 
@@ -1271,10 +1280,10 @@ bool FFakeStereoRenderingHook::hook() {
                 auto cvar = sdk::find_cvar_cached(L"Engine", cvar_name);
 
                 if (cvar != nullptr && *cvar != nullptr) {
-                    SPDLOG_INFO("[VR] Forcing {} to 0 to disable Instanced Stereo Rendering", utility::narrow(cvar_name));
-                    (*cvar)->Set(L"0");
+                    SPDLOG_INFO("[VR][NSF-ISR-DIAG] Leaving {} untouched (value={}) - ISR re-enable experiment active",
+                        utility::narrow(cvar_name), (*cvar)->GetInt());
                 } else {
-                    SPDLOG_WARN("[VR] Could not find cvar {} to disable Instanced Stereo Rendering", utility::narrow(cvar_name));
+                    SPDLOG_WARN("[VR][NSF-ISR-DIAG] Could not find cvar {} (ISR re-enable experiment active)", utility::narrow(cvar_name));
                 }
             }
         }
@@ -2233,10 +2242,10 @@ bool FFakeStereoRenderingHook::nonstandard_create_stereo_device_hook_4_27() {
             case EStereoscopicPass::eSSP_FULL:
             case EStereoscopicPass::eSSP_PRIMARY:
                 return 0;
-            
+
             case EStereoscopicPass::eSSP_SECONDARY:
                 return 1;
-            
+
             default:
                 SPDLOG_ERROR("Unknown pass: {}", (uint32_t)pass);
                 return -1;
@@ -2257,7 +2266,7 @@ bool FFakeStereoRenderingHook::nonstandard_create_stereo_device_hook_4_27() {
     #endif
 
         return get_stereo_pass(view) != EStereoscopicPass::eSSP_FULL;
-    }; // DeviceIsStereoEyePass
+    }; // DeviceIsStereoEyePass (view)
 
     m_fallback_vtable[DEVICE_IS_A_PRIMARY_PASS_INDEX] = +[](FFakeStereoRendering* stereo, const EStereoscopicPass pass) -> bool {
     #ifdef FFAKE_STEREO_RENDERING_LOG_ALL_CALLS
@@ -7418,11 +7427,134 @@ static inline uint32_t stereo_pass_right{2};
 // "is primary" style flags. Used by the Pass2 "full eye identity" test to make the right-eye view
 // carry the left eye's metadata for the duration of its render.
 struct EyeField { uint32_t id; uint32_t offset; uint32_t left; uint32_t right; };
+
+// resolve_live() (and therefore live_stereo_pass_offset) is only ever invoked from
+// begin_render_viewfamily_real(), which bails out before reaching that call whenever Native Stereo
+// Fix is disabled. That means stereo_pass_left/right above NEVER get learned if the user is only
+// testing SceneView/SplitScreen Compatibility with NSF off - the "confirmed eye" check in
+// sceneview_constructor() silently never fires and the diagnostics (SVC-RAW-STEREO-PASS,
+// SVC-NONEYE-PASS) never print, even though raw_stereo_pass itself (init_options->get_stereo_pass())
+// is available unconditionally on every call via FSceneViewInitOptionsBase::update_offsets(). Learn
+// stereo_pass_left/right here too, from the first two distinct raw_stereo_pass values seen on
+// full-size (real eye) views, completely independent of NSF/resolve_live(), so SVC-only sessions can
+// still classify eyes and emit the diagnostics.
+static inline std::optional<uint32_t> raw_stereo_pass_offset_resolved{};
+
+static void learn_raw_stereo_pass(uint32_t raw_stereo_pass) {
+    if (live_stereo_pass_offset.has_value() || raw_stereo_pass_offset_resolved.has_value()) return;
+
+    static std::optional<uint32_t> s_first_value{};
+    if (!s_first_value) {
+        s_first_value = raw_stereo_pass;
+        stereo_pass_left = raw_stereo_pass;
+        return;
+    }
+
+    if (raw_stereo_pass != *s_first_value) {
+        stereo_pass_right = raw_stereo_pass;
+        raw_stereo_pass_offset_resolved = 0;
+        SPDLOG_INFO("[VR] sceneview_xref: RESOLVED raw stereo pass encoding (NSF-independent) left={} right={}",
+            stereo_pass_left, stereo_pass_right);
+    }
+}
 static inline std::vector<EyeField> eye_fields{};
 static inline std::unordered_map<uint32_t, uint32_t> eye_field_ids{};
 static inline uint32_t next_eye_field_id{};
-// Offset of FSceneViewStateInterface* State inside the constructed FSceneView. Found by locating the
-// init options' state pointer (already resolved) inside the live view after the real constructor ran.
+// Debounce bookkeeping used by refresh_eye_fields() - moved to namespace scope (was function-local
+// static) so reset_state() below can clear it as part of a full in-place NSF state reset.
+static inline std::unordered_map<uint32_t, uint32_t> s_offset_differ_streak{};  // consecutive cycles seen differing
+static inline std::unordered_map<uint32_t, uint32_t> s_offset_match_streak{};   // consecutive cycles seen not differing
+
+// DIAG: parse a user-supplied comma/space-separated list of offsets (hex "0x130" or decimal "304")
+// into a sorted set, for the manual include/exclude override below. Tolerant of extra whitespace,
+// commas, and empty input.
+static std::set<uint32_t> parse_offset_list(const std::string& s) {
+    std::set<uint32_t> out{};
+    std::string token{};
+
+    auto flush = [&]() {
+        if (token.empty()) {
+            return;
+        }
+
+        try {
+            out.insert((uint32_t)std::stoul(token, nullptr, 0));
+        } catch (...) {
+            // ignore malformed tokens
+        }
+
+        token.clear();
+    };
+
+    for (char c : s) {
+        if (std::isspace((unsigned char)c) || c == ',') {
+            flush();
+        } else {
+            token += c;
+        }
+    }
+
+    flush();
+
+    return out;
+}
+
+// DIAG: live re-read of the manual include/exclude lists every call (cheap, user-facing text boxes
+// only change rarely) so edits take effect on the very next scan/refresh without needing a restart.
+// Also honors the six per-offset checkboxes for the known candidate offsets - checked = always
+// included (bypasses normal filters), unchecked = always excluded, regardless of the free-text
+// manual lists (the checkboxes take priority for these six specific offsets since they're
+// unambiguous, unlike a free-text box that's easy to mistype).
+static bool offset_manually_excluded(uint32_t offset) {
+    const auto vr = VR::get();
+    if (!vr) {
+        return false;
+    }
+
+    switch (offset) {
+    case 0x130: return !vr->is_eye_field_offset_130_enabled();
+    case 0x154: return !vr->is_eye_field_offset_154_enabled();
+    case 0x164: return !vr->is_eye_field_offset_164_enabled();
+    case 0x1A0: return !vr->is_eye_field_offset_1A0_enabled();
+    case 0x2EC: return !vr->is_eye_field_offset_2EC_enabled();
+    case 0xC90: return !vr->is_eye_field_offset_C90_enabled();
+    default: break;
+    }
+
+    const auto excluded = parse_offset_list(vr->native_stereo_fix_eye_fields_manual_exclude());
+    return excluded.contains(offset);
+}
+
+static bool offset_manually_force_included(uint32_t offset) {
+    const auto vr = VR::get();
+    if (!vr) {
+        return false;
+    }
+
+    switch (offset) {
+    case 0x130: return vr->is_eye_field_offset_130_enabled();
+    case 0x154: return vr->is_eye_field_offset_154_enabled();
+    case 0x164: return vr->is_eye_field_offset_164_enabled();
+    case 0x1A0: return vr->is_eye_field_offset_1A0_enabled();
+    case 0x2EC: return vr->is_eye_field_offset_2EC_enabled();
+    case 0xC90: return vr->is_eye_field_offset_C90_enabled();
+    default: break;
+    }
+
+    const auto included = parse_offset_list(vr->native_stereo_fix_eye_fields_manual_include());
+    return included.contains(offset);
+}
+
+
+
+// REVERTED: an allowlist restricted to {0x130,0x154,0x164,0x1A0,0x2EC,0xC90} was tried here,
+// since every multi-session collapse-back-to-baseline event converged on exactly that set and
+// every "extra" offset looked like one-off noise. In practice, restricting to only those 6 fields
+// brought BACK the original constant right-eye darkness (confirming the "noise" offsets were
+// actually doing real, necessary work fixing right-eye shadow/lighting) while the flicker remained
+// completely unchanged - proving the flicker is NOT caused by noisy offsets being promoted/dropped
+// from eye_fields. Reverted to the full scan (minus the two confirmed-bad offsets below) while the
+// real flicker cause is investigated elsewhere.
 static inline std::optional<uint32_t> live_scene_state_offset{};
 
 static bool plausible(uintptr_t p);
@@ -7541,6 +7673,10 @@ static void resolve_live(sdk::FSceneViewFamily* family, sdk::FSceneView* v0, sdk
             stereo_pass_left = 1;
             stereo_pass_right = 2;
             SPDLOG_INFO("[VR] sceneview_xref: RESOLVED live stereo pass@{:x} ({} candidates, stock 1/2 encoding)", *live_stereo_pass_offset, hits.size());
+            uevr_trace::TraceWriter::get().record(uevr_trace::EventKind::StereoPassOffsetResolved,
+                (uintptr_t)utility::get_executable(),
+                (uint64_t)*live_stereo_pass_offset,
+                ((uint64_t)stereo_pass_left << 32) | (uint64_t)(uint32_t)stereo_pass_right);
         } else if (!loose.empty()) {
             const auto& [off, a, b] = loose.front();
             live_stereo_pass_offset = off;
@@ -7548,17 +7684,24 @@ static void resolve_live(sdk::FSceneViewFamily* family, sdk::FSceneView* v0, sdk
             stereo_pass_right = b;
             SPDLOG_INFO("[VR] sceneview_xref: RESOLVED live stereo pass@{:x} with engine-specific encoding left={} right={} ({} loose candidates)",
                 off, a, b, loose.size());
+            uevr_trace::TraceWriter::get().record(uevr_trace::EventKind::StereoPassOffsetResolved,
+                (uintptr_t)utility::get_executable(),
+                (uint64_t)off,
+                ((uint64_t)a << 32) | (uint64_t)(uint32_t)b);
         }
 
         if (live_stereo_pass_offset) {
             eye_fields.clear();
             std::string s2{};
             std::string skipped{};
+            const bool exclude_13c = VR::get()->is_eye_field_exclude_13c_enabled();
             for (uint32_t i = 0; i + 4 <= 0x1000; i += 4) {
-                if (i == 0xC) continue;
+                if (i == 0xC || (exclude_13c && i == 0x13C)) continue;
+                if (offset_manually_excluded(i)) continue;
                 const auto a = *(uint32_t*)((uintptr_t)v0 + i);
                 const auto b = *(uint32_t*)((uintptr_t)v1 + i);
-                if (a == b || a >= 8 || b >= 8) continue;
+                const bool force_included = offset_manually_force_included(i);
+                if (!force_included && (a == b || a >= 8 || b >= 8)) continue;
 
                 // Reject anything that looks like the low dword of a pointer (high dword differs or is
                 // non-zero on either side), and "X -> 0" pairs: those are handles/pointers that are null
@@ -7569,7 +7712,7 @@ static void resolve_live(sdk::FSceneViewFamily* family, sdk::FSceneView* v0, sdk
                     const auto hb = *(uint32_t*)((uintptr_t)v1 + i + 4);
                     pointer_like = ha != 0 || hb != 0;
                 }
-                if (pointer_like || b == 0) {
+                if (!force_included && (pointer_like || b == 0)) {
                     skipped += fmt::format("{:x}:{}->{} ", i, a, b);
                     continue;
                 }
@@ -7577,7 +7720,7 @@ static void resolve_live(sdk::FSceneViewFamily* family, sdk::FSceneView* v0, sdk
                 auto [id_it, inserted] = eye_field_ids.try_emplace(i, next_eye_field_id < 32 ? next_eye_field_id : 0xFFFFFFFFu);
                 if (inserted && next_eye_field_id < 32) ++next_eye_field_id;
                 eye_fields.push_back({id_it->second, i, a, b});
-                s2 += fmt::format("F{}={:x}:{}->{} ", id_it->second, i, a, b);
+                s2 += fmt::format("F{}={:x}:{}->{}{} ", id_it->second, i, a, b, force_included ? "*" : "");
             }
             SPDLOG_INFO("[VR] sceneview_xref: eye identity fields (left->right): {} | skipped pointer-like/null-right: {}", s2, skipped);
         }
@@ -7604,13 +7747,29 @@ static void refresh_eye_fields(sdk::FSceneView* v0, sdk::FSceneView* v1) {
     }
     last_eye_fields_refresh = now;
 
+    // Restricted to eye_field_allowlist (see declaration) instead of scanning the full struct -
+    // multi-session logging proved the open-ended scan promotes one-off noise offsets that happen
+    // to differ for a single 2s window, causing a "fighting" flicker as they get force-written and
+    // then dropped again. Only the confirmed-stable offsets are ever considered here. Also honors
+    // the manual include/exclude override (see native_stereo_fix_eye_fields_manual_exclude()/_include()).
     std::vector<EyeField> refreshed{};
-    std::string s2{};
+    // Debounce bookkeeping (see is_eye_field_refresh_debounce_enabled()): a candidate offset must
+    // be observed differing across 2 consecutive refresh cycles before being promoted into
+    // eye_fields, and an existing member must be observed NOT differing across 2 consecutive
+    // cycles before being dropped. Filters one-cycle transient noise offsets (the raw scan churns
+    // e.g. 6->16->6->9->6 fields every 2s) while persistent new identity fields still get picked up.
+    // (s_offset_differ_streak/s_offset_match_streak are namespace-scoped, see declaration above,
+    // so reset_state() can clear them.)
+    const bool debounce = VR::get()->is_eye_field_refresh_debounce_enabled();
+    std::unordered_set<uint32_t> currently_differing{};
+    const bool exclude_13c = VR::get()->is_eye_field_exclude_13c_enabled();
     for (uint32_t i = 0; i + 4 <= 0x1000; i += 4) {
-        if (i == 0xC) continue;
+        if (i == 0xC || (exclude_13c && i == 0x13C)) continue;
+        if (offset_manually_excluded(i)) continue;
         const auto a = *(uint32_t*)((uintptr_t)v0 + i);
         const auto b = *(uint32_t*)((uintptr_t)v1 + i);
-        if (a == b || a >= 8 || b >= 8) continue;
+        const bool force_included = offset_manually_force_included(i);
+        if (!force_included && (a == b || a >= 8 || b >= 8)) continue;
 
         bool pointer_like = false;
         if ((i % 8) == 0 && i + 8 <= 0x1000) {
@@ -7618,11 +7777,53 @@ static void refresh_eye_fields(sdk::FSceneView* v0, sdk::FSceneView* v1) {
             const auto hb = *(uint32_t*)((uintptr_t)v1 + i + 4);
             pointer_like = ha != 0 || hb != 0;
         }
-        if (pointer_like || b == 0) continue;
+        if (!force_included && (pointer_like || b == 0)) continue;
 
         auto [id_it, inserted] = eye_field_ids.try_emplace(i, next_eye_field_id < 32 ? next_eye_field_id : 0xFFFFFFFFu);
         if (inserted && next_eye_field_id < 32) ++next_eye_field_id;
         refreshed.push_back({id_it->second, i, a, b});
+        currently_differing.insert(i);
+    }
+
+    if (debounce) {
+        // Update streaks for every offset observed this cycle or currently tracked.
+        std::unordered_set<uint32_t> tracked{};
+        for (const auto& f : eye_fields) tracked.insert(f.offset);
+        for (const auto off : currently_differing) tracked.insert(off);
+
+        for (const auto off : tracked) {
+            if (currently_differing.contains(off)) {
+                ++s_offset_differ_streak[off];
+                s_offset_match_streak[off] = 0;
+            } else {
+                ++s_offset_match_streak[off];
+                s_offset_differ_streak[off] = 0;
+            }
+        }
+
+        std::unordered_set<uint32_t> current_members{};
+        for (const auto& f : eye_fields) current_members.insert(f.offset);
+
+        // Rebuild "refreshed" so that: existing members stay unless they've matched for >= 2
+        // consecutive cycles; new candidates only join after differing for >= 2 consecutive cycles.
+        // Force-included offsets (checkboxes/manual include) bypass the debounce entirely.
+        std::vector<EyeField> debounced{};
+        for (const auto& f : refreshed) {
+            const bool is_member = current_members.contains(f.offset);
+            const bool force_included = offset_manually_force_included(f.offset);
+            if (force_included || is_member || s_offset_differ_streak[f.offset] >= 2) {
+                debounced.push_back(f);
+            }
+        }
+        // Keep existing members that did NOT differ this cycle unless they've matched for >= 2 cycles.
+        for (const auto& f : eye_fields) {
+            if (!currently_differing.contains(f.offset) && s_offset_match_streak[f.offset] < 2 &&
+                !offset_manually_excluded(f.offset)) {
+                debounced.push_back(f);
+            }
+        }
+        std::sort(debounced.begin(), debounced.end(), [](const EyeField& x, const EyeField& y) { return x.offset < y.offset; });
+        refreshed = std::move(debounced);
     }
 
     bool changed = refreshed.size() != eye_fields.size();
@@ -7636,12 +7837,163 @@ static void refresh_eye_fields(sdk::FSceneView* v0, sdk::FSceneView* v1) {
     }
 
     if (changed) {
+        std::string s2{};
         for (const auto& field : refreshed) {
             s2 += fmt::format("F{}={:x}:{}->{} ", field.id, field.offset, field.left, field.right);
         }
         SPDLOG_INFO("[VR] sceneview_xref: eye identity fields refreshed ({} -> {} fields): {}",
             eye_fields.size(), refreshed.size(), s2);
         eye_fields = std::move(refreshed);
+    }
+}
+
+// DIAG: in-place reset of all accumulated NSF/eye_fields state, WITHOUT a full game relaunch.
+// Rationale: settings toggles (checkboxes/exclude lists/debounce) are read live every scan/refresh,
+// so they only affect FUTURE promotions - they never retroactively clean out offsets, ID
+// assignments, or debounce streaks that already accumulated earlier in the session. Multiple
+// reports showed behavior only ever changing after a full relaunch, never from just flipping a
+// setting mid-session - this is the test for whether that's actually stale accumulated state
+// (fixed by this reset) rather than something only a fresh process can fix.
+static inline void reset_state() {
+    const auto had_fields = eye_fields.size();
+    eye_fields.clear();
+    eye_field_ids.clear();
+    next_eye_field_id = 0;
+    s_offset_differ_streak.clear();
+    s_offset_match_streak.clear();
+    last_eye_fields_refresh = {};
+    SPDLOG_INFO("[VR] sceneview_xref: reset_state() cleared accumulated eye_fields state ({} fields, ID map, debounce streaks, refresh timer)",
+        had_fields);
+}
+}
+
+void FFakeStereoRenderingHook::reset_nsf_eye_field_state() {
+    sceneview_xref::reset_state();
+}
+
+namespace sceneview_xref {
+
+// DIAG: scans the live FSceneView pair for 64-byte (4x4 matrix-sized, 16-byte aligned) regions that
+// are candidates for per-eye view/projection matrices - exactly the data that drives frustum culling
+// and (via shadow/light view matrices) per-eye lighting. A HEALTHY per-eye matrix should differ
+// between the two eyes only in its translation-like terms (a lateral IPD-style offset); if the ENTIRE
+// 64-byte region is bit-identical between v0 and v1, both eyes are reading the exact same matrix data
+// for that region, which is a strong, concrete candidate for why some objects/lighting only resolve
+// correctly in one eye (the other eye inherits stale/shared culling or lighting state instead of its
+// own). This does not require knowing FSceneView's layout ahead of time - it empirically narrows down
+// candidate offsets the same way eye_fields/refresh_eye_fields already does for scalar fields, just at
+// matrix granularity instead of dword granularity.
+static inline std::chrono::steady_clock::time_point last_eye_matrix_scan{};
+
+static void scan_eye_matrix_regions(sdk::FSceneView* v0, sdk::FSceneView* v1) {
+    if (v0 == nullptr || v1 == nullptr) return;
+    if (IsBadReadPtr(v0, 0x1000) || IsBadReadPtr(v1, 0x1000)) return;
+
+    const auto now = std::chrono::steady_clock::now();
+    if (last_eye_matrix_scan.time_since_epoch().count() != 0 &&
+        now - last_eye_matrix_scan < std::chrono::seconds(2)) {
+        return;
+    }
+    last_eye_matrix_scan = now;
+
+    std::string identical_regions{};
+    std::string lateral_offset_regions{};
+    std::string other_diff_regions{};
+    uint32_t identical_count = 0;
+    uint32_t lateral_count = 0;
+    uint32_t other_count = 0;
+
+    for (uint32_t off = 0; off + 0x40 <= 0x1000; off += 0x10) {
+        const auto* a = (const float*)((uintptr_t)v0 + off);
+        const auto* b = (const float*)((uintptr_t)v1 + off);
+
+        // Reject regions that are all-zero or contain NaN/Inf-looking patterns on either side -
+        // not plausible matrix data, just skip rather than classify.
+        bool any_nonzero_a = false;
+        bool any_nonzero_b = false;
+        bool plausible_floats = true;
+        for (int i = 0; i < 16; ++i) {
+            if (a[i] != 0.0f) any_nonzero_a = true;
+            if (b[i] != 0.0f) any_nonzero_b = true;
+            if (!std::isfinite(a[i]) || !std::isfinite(b[i]) || std::fabs(a[i]) > 1.0e7f || std::fabs(b[i]) > 1.0e7f) {
+                plausible_floats = false;
+                break;
+            }
+        }
+        if (!plausible_floats || !any_nonzero_a || !any_nonzero_b) continue;
+
+        const bool bit_identical = std::memcmp(a, b, 0x40) == 0;
+        if (bit_identical) {
+            ++identical_count;
+            if (identical_count <= 12) {
+                identical_regions += fmt::format("{:x} ", off);
+            }
+            continue;
+        }
+
+        // Count how many of the 16 floats differ, and whether the differences are small/plausible
+        // lateral-offset-sized deltas (IPD is typically a few centimeters -> a few hundredths/tenths
+        // in UE units depending on scale) versus wildly different (full pose/rotation swap, garbage).
+        uint32_t differing = 0;
+        float max_abs_delta = 0.0f;
+        for (int i = 0; i < 16; ++i) {
+            const float delta = a[i] - b[i];
+            if (delta != 0.0f) {
+                ++differing;
+                max_abs_delta = std::max(max_abs_delta, std::fabs(delta));
+            }
+        }
+
+        // Heuristic: a plausible lateral-offset-only difference touches a small number of terms
+        // (translation/offset components, not a whole rotated basis) with a bounded magnitude.
+        if (differing > 0 && differing <= 4 && max_abs_delta < 1000.0f) {
+            ++lateral_count;
+            if (lateral_count <= 12) {
+                lateral_offset_regions += fmt::format("{:x}(d={},m={:.2f}) ", off, differing, max_abs_delta);
+            }
+        } else {
+            ++other_count;
+            if (other_count <= 12) {
+                other_diff_regions += fmt::format("{:x}(d={},m={:.2f}) ", off, differing, max_abs_delta);
+            }
+        }
+    }
+
+    SPDLOG_WARN("[VR][EYE-FRUSTUM-DIFF] identical={} (offsets: {}) lateral_offset_like={} (offsets: {}) other_diff={} (offsets: {})",
+        identical_count, identical_regions, lateral_count, lateral_offset_regions, other_count, other_diff_regions);
+}
+
+// DIAG: targeted, unthrottled follow-up to EYE-FRUSTUM-DIFF's +0xF0/+0x100/+0x110 finding - that
+// region was observed to swing by ~355 units intermittently (appearing/disappearing frame to frame
+// and sometimes spreading into neighboring floats), unlike every other per-eye region in this file
+// which is either bit-identical or a small, stable IPD-sized lateral offset. A magnitude that large
+// and that unstable is implausible for a camera-position component but is plausible for a
+// culling-relevant quantity (bounding radius, draw-distance/LOD threshold, occlusion bound). Logs
+// every call (no 2s throttle) so the exact frame(s) where this region changes can be correlated
+// with visible culling/shadow glitches.
+static void scan_culling_region_raw(sdk::FSceneView* v0, sdk::FSceneView* v1, uint32_t frame) {
+    if (v0 == nullptr || v1 == nullptr) return;
+    constexpr uint32_t region_start = 0xE0;
+    constexpr uint32_t region_size = 0x40; // covers 0xE0-0x11C, straddling the 0xF0/0x100/0x110 hits
+    if (IsBadReadPtr((void*)((uintptr_t)v0 + region_start), region_size) ||
+        IsBadReadPtr((void*)((uintptr_t)v1 + region_start), region_size)) {
+        SPDLOG_WARN("[VR][NSF-CULL-REGION] frame={} unreadable region at +{:x}", frame, region_start);
+        return;
+    }
+
+    std::string left_dump{};
+    std::string right_dump{};
+    bool any_diff = false;
+    for (uint32_t off = region_start; off < region_start + region_size; off += 4) {
+        const auto lval = *(const uint32_t*)((uintptr_t)v0 + off);
+        const auto rval = *(const uint32_t*)((uintptr_t)v1 + off);
+        if (lval != rval) any_diff = true;
+        left_dump += fmt::format(" {:03x}={:08x}({:.3f})", off, lval, *(const float*)&lval);
+        right_dump += fmt::format(" {:03x}={:08x}({:.3f})", off, rval, *(const float*)&rval);
+    }
+
+    if (any_diff) {
+        SPDLOG_WARN("[VR][NSF-CULL-REGION] frame={} DIFF L:{} R:{}", frame, left_dump, right_dump);
     }
 }
 
@@ -7704,8 +8056,1354 @@ static void feed(sdk::FSceneView* view, sdk::FSceneViewInitOptions* init_options
 
     SPDLOG_INFO("[VR] sceneview_xref: RESOLVED init_options family@{:x} state@{:x} stereo_pass@{:x} (heuristic had family@{:x} stereo_pass@{:x}; family={:x})",
         init_family_off, init_state_off.value_or(0xFFFFFFFF), init_stereo_off.value_or(0xFFFFFFFF), prev_fam, prev_sp, family_value);
+    uevr_trace::TraceWriter::get().record(uevr_trace::EventKind::InitOptionsOffsetResolved,
+        (uintptr_t)utility::get_executable(),
+        ((uint64_t)init_family_off << 32) | (uint64_t)init_state_off.value_or(0xFFFFFFFF),
+        (uint64_t)init_stereo_off.value_or(0xFFFFFFFF));
 }
+
+// Re-emits trace records for whatever sceneview_xref has ALREADY resolved, without re-running any
+// of the scanning/resolution logic above. The resolve_live()/feed() functions above only ever log
+// and trace their one-shot "RESOLVED ..." events the FIRST time each offset is learned - if the
+// TraceWriter is enabled later in the session (e.g. after menus/loading screens have already
+// passed and these offsets resolved long ago), those original trace records never get written and
+// toggling tracing on captures nothing. Call this once right after TraceWriter::set_enabled(true)
+// so late-enabled tracing still captures the current resolved state immediately.
+void replay_resolved_state_to_trace() {
+    auto& tracer = uevr_trace::TraceWriter::get();
+    if (!tracer.is_enabled()) {
+        return;
+    }
+
+    const auto exe = (uintptr_t)utility::get_executable();
+
+    if (live_stereo_pass_offset) {
+        tracer.record(uevr_trace::EventKind::StereoPassOffsetResolved,
+            exe,
+            (uint64_t)*live_stereo_pass_offset,
+            ((uint64_t)stereo_pass_left << 32) | (uint64_t)(uint32_t)stereo_pass_right);
+    }
+
+    const auto family_off = sdk::FSceneViewInitOptionsBase::get_view_family_offset();
+    const auto state_off = sdk::FSceneViewInitOptionsBase::get_scene_state_offset();
+    const auto stereo_off = sdk::FSceneViewInitOptionsBase::get_stereo_pass_offset();
+
+    if (family_off || state_off || stereo_off) {
+        tracer.record(uevr_trace::EventKind::InitOptionsOffsetResolved,
+            exe,
+            ((uint64_t)family_off.value_or(0xFFFFFFFF) << 32) | (uint64_t)state_off.value_or(0xFFFFFFFF),
+            (uint64_t)stereo_off.value_or(0xFFFFFFFF));
+    }
+}
+
+// DIAG: dump the known eye-identity dwords for a view (StereoPass + the surviving eye_fields
+// candidates: +0x164, +0x1a0, +0x2ec, +0xc90) to pin down exactly when/where Pass1 and Pass2's
+// identity diverge, in order to correlate against the character-shadow/environment-shadow eye
+// split (environment shadows are gated by IStereoRendering::IsAPrimaryView per UE4.26 source,
+// character/per-object shadows use a separate primary/secondary resolution).
+// DIAG: confirms whether the running executable is stock UE4.26 or a modified build, and logs
+// UWorld::TimeSeconds so left-eye-only CSM/cached-direct-light drift can be correlated against
+// in-game time-of-day changes. The SHADOW-DUMP cvar/class dump already found KuroCustomShadowDepthWorldSubsystem,
+// r.kuro.EnableSequenceShadowFix, and r.Kuro.Shadow.* per-object mask filters, which do not exist in
+// stock UE4.26 and are the leading suspects for a custom shadow pass that isn't eye-aware.
+inline void log_engine_build_and_world_time_once_per_second(const char* tag) {
+    static std::atomic<uint64_t> s_last_log_tick{0};
+    const auto now = GetTickCount64();
+    auto last = s_last_log_tick.load();
+    if (now - last < 1000) {
+        return;
+    }
+    s_last_log_tick = now;
+
+    static const std::string s_version_str = [] {
+        const auto str_version = utility::narrow(sdk::search_for_version(utility::get_executable()).value_or(L"0.00"));
+        const auto file_version = sdk::get_file_version_info();
+        return fmt::format("exe_str_version={} file_version={}.{}.{}.{}", str_version,
+            HIWORD(file_version.dwFileVersionMS), LOWORD(file_version.dwFileVersionMS),
+            HIWORD(file_version.dwFileVersionLS), LOWORD(file_version.dwFileVersionLS));
+    }();
+
+    float world_time = -1.0f;
+    float world_real_time = -1.0f;
+
+    try {
+        if (auto engine = sdk::UEngine::get(); engine != nullptr) {
+            if (auto world = engine->get_world(); world != nullptr) {
+                world_time = world->get_property<float>(L"TimeSeconds");
+                world_real_time = world->get_property<float>(L"RealTimeSeconds");
+            }
+        }
+    } catch (...) {
+    }
+
+    SPDLOG_INFO("[VR][SHADOW-PATHWAY-IDENTITY][BUILD-INFO] {} {} world_time={} world_real_time={}",
+        tag, s_version_str, world_time, world_real_time);
+}
+
+inline void log_shadow_pathway_identity(const char* tag, sdk::FSceneView* left, sdk::FSceneView* right) {
+    log_engine_build_and_world_time_once_per_second(tag);
+
+    static constexpr uint32_t probe_offsets[] = {0x164, 0x1a0, 0x2ec, 0xc90};
+
+    auto read_dword = [](sdk::FSceneView* v, uint32_t offset) -> int64_t {
+        if (v == nullptr) {
+            return -1;
+        }
+        auto p = (const uint32_t*)((uintptr_t)v + offset);
+        if (IsBadReadPtr(p, sizeof(uint32_t))) {
+            return -1;
+        }
+        return (int64_t)*p;
+    };
+
+    int64_t left_stereo_pass = -1;
+    int64_t right_stereo_pass = -1;
+
+    if (live_stereo_pass_offset.has_value()) {
+        left_stereo_pass = read_dword(left, *live_stereo_pass_offset);
+        right_stereo_pass = read_dword(right, *live_stereo_pass_offset);
+    }
+
+    std::string left_fields{};
+    std::string right_fields{};
+    for (const auto offset : probe_offsets) {
+        left_fields += fmt::format(" {:x}={}", offset, read_dword(left, offset));
+        right_fields += fmt::format(" {:x}={}", offset, read_dword(right, offset));
+    }
+
+    SPDLOG_INFO("[VR][SHADOW-PATHWAY-IDENTITY] {} frame={} L view={:x} stereo_pass={}{} | R view={:x} stereo_pass={}{}",
+        tag, g_frame_count, (uintptr_t)left, left_stereo_pass, left_fields, (uintptr_t)right, right_stereo_pass, right_fields);
+}
+
+// DIAG: dumps every scalar reflected property (bool/int/float/double/byte) on the live
+// KuroCustomShadowDepthWorldSubsystem instance via UObject::to_json(), once per tag per second.
+// This is a per-UWorld singleton (not per-eye), so the goal isn't to diff L vs R pointers (there's
+// only one instance) -- it's to catch whatever internal state field (last-updated-frame,
+// last-view-index, "already ran this frame" bool, etc.) changes or fails to reset between our
+// Pass1 (left) and Pass2 (right) submissions within the same UWorld frame. r.kuro.EnableSequenceShadowFix
+// existing as a cvar strongly implies Kuro already has a known bug class for "rendered more than
+// once per frame" (sequencer/cutscene multi-cut), which is structurally identical to our stereo
+// dual-submission path, and may not cover the VR stereo case.
+// Forward declaration: raw memory diff dumper defined below log_kuro_shadow_subsystem_state,
+// but needs to be called from within it to reuse the cached subsystem pointer.
+inline void log_kuro_shadow_subsystem_raw_diff(sdk::UObject* subsystem, const char* tag);
+
+inline void log_kuro_shadow_subsystem_state(const char* tag) {
+    static std::atomic<uint64_t> s_last_log_tick{0};
+    const auto now = GetTickCount64();
+    auto last = s_last_log_tick.load();
+    if (now - last < 250) {
+        return;
+    }
+    s_last_log_tick = now;
+
+    static sdk::UObject* s_subsystem{nullptr};
+    static bool s_attempted_find{false};
+
+    if (s_subsystem == nullptr) {
+        if (!s_attempted_find) {
+            s_attempted_find = true;
+        }
+
+        try {
+            if (const auto uobjectarray = sdk::FUObjectArray::get(); uobjectarray != nullptr) {
+                const auto target_class = sdk::find_uobject<sdk::UClass>(L"Class /Script/KuroRenderingRuntimeBPPlugin.KuroCustomShadowDepthWorldSubsystem");
+
+                if (target_class != nullptr) {
+                    for (auto i = 0; i < uobjectarray->get_object_count(); ++i) {
+                        const auto item = uobjectarray->get_object(i);
+                        if (item == nullptr || item->object == nullptr) {
+                            continue;
+                        }
+
+                        const auto object = (sdk::UObject*)item->object;
+
+                        if (object->get_class() == target_class) {
+                            s_subsystem = object;
+                            SPDLOG_INFO("[VR][KURO-SHADOW-STATE] found subsystem instance at {:x}", (uintptr_t)object);
+
+                            // One-shot schema dump: to_json() only reads BoolProperty/IntProperty/
+                            // FloatProperty/DoubleProperty/ByteProperty/UInt16Property. If the
+                            // interesting state here (last-updated-frame, needs-update flag, cached
+                            // view/light pointer) is an EnumProperty, ObjectProperty, StructProperty,
+                            // or NameProperty, to_json() will silently skip it and report nothing.
+                            // Log every field's name/type/offset up front so we know what's actually
+                            // there before deciding how to read it.
+                            try {
+                                SPDLOG_INFO("[VR][KURO-SHADOW-STATE] ---- property schema dump ----");
+
+                                // get_child_properties() only returns fields declared directly on the
+                                // given class/struct, it does NOT walk super_struct. The leaf class here
+                                // reported zero fields previously, which most likely means its reflected
+                                // state (if any) lives on a parent class in the chain. Walk the full
+                                // super_struct chain and dump each class's own fields separately so we
+                                // can see the complete inherited property set.
+                                int class_depth = 0;
+                                for (auto cur_class = (sdk::UStruct*)target_class; cur_class != nullptr; cur_class = cur_class->get_super_struct()) {
+                                    const auto cur_class_name = utility::narrow(cur_class->get_fname().to_string());
+                                    SPDLOG_INFO("[VR][KURO-SHADOW-STATE]  -- class[{}] \"{}\" --", class_depth, cur_class_name);
+
+                                    int field_count = 0;
+                                    for (auto prop = cur_class->get_child_properties(); prop != nullptr; prop = prop->get_next()) {
+                                        const auto prop_c = prop->get_class();
+                                        if (prop_c == nullptr) {
+                                            continue;
+                                        }
+
+                                        const auto prop_c_name = utility::narrow(prop_c->get_name().to_string());
+                                        const auto prop_field_name = utility::narrow(((sdk::FProperty*)prop)->get_field_name().to_string());
+                                        const auto prop_offset = ((sdk::FProperty*)prop)->get_offset();
+
+                                        SPDLOG_INFO("[VR][KURO-SHADOW-STATE]   field \"{}\" type={} offset={:x}",
+                                            prop_field_name, prop_c_name, prop_offset);
+                                        ++field_count;
+                                    }
+
+                                    if (field_count == 0) {
+                                        SPDLOG_INFO("[VR][KURO-SHADOW-STATE]   (no fields declared directly on this class)");
+                                    }
+
+                                    ++class_depth;
+
+                                    if (class_depth > 32) {
+                                        SPDLOG_WARN("[VR][KURO-SHADOW-STATE] class chain depth exceeded 32, stopping (possible bad super_struct offset)");
+                                        break;
+                                    }
+                                }
+
+                                SPDLOG_INFO("[VR][KURO-SHADOW-STATE] ---- end schema dump ----");
+                            } catch (...) {
+                                SPDLOG_ERROR("[VR][KURO-SHADOW-STATE] exception while dumping property schema");
+                            }
+
+                            break;
+                        }
+                    }
+                }
+            }
+        } catch (...) {
+            SPDLOG_ERROR("[VR][KURO-SHADOW-STATE] exception while searching for subsystem instance");
+        }
+    }
+
+    if (s_subsystem == nullptr) {
+        return;
+    }
+
+    log_kuro_shadow_subsystem_raw_diff(s_subsystem, tag);
+
+    try {
+        const auto j = s_subsystem->to_json();
+        SPDLOG_INFO("[VR][KURO-SHADOW-STATE] {} frame={} {}", tag, g_frame_count, j.dump());
+    } catch (...) {
+        SPDLOG_ERROR("[VR][KURO-SHADOW-STATE] exception while dumping subsystem state, invalidating cached pointer");
+        s_subsystem = nullptr;
+    }
+}
+
+// Raw memory diff dumper for KuroCustomShadowDepthWorldSubsystem. The reflection-based dump above
+// proved the entire native class chain (leaf -> WorldSubsystem -> Subsystem -> Object) has zero
+// UPROPERTY fields, so whatever internal state gates the shadow pass (per-eye flag, last-updated
+// frame counter, cached view/light pointer, etc.) is not reflected and can only be found by reading
+// raw bytes directly, the same technique that found the +0x2d0/+0x2d4/+0xca4/+0xca8 FSceneView
+// fields via NSF-DIFF. We snapshot a fixed-size region of the instance at each of the four call
+// sites per frame, then:
+//   1) diff before-pass1-submit vs before-pass2-submit within the SAME frame to find fields that
+//      differ depending on which eye is about to render (candidates for an eye-select/gate field).
+//   2) diff this frame's before-pass1-submit snapshot against the previous frame's to find fields
+//      that normally change every frame but FREEZE when the night-time/time-change bug occurs
+//      (candidates for a stale "needs update"/"last updated frame" flag).
+inline void log_kuro_shadow_subsystem_raw_diff(sdk::UObject* subsystem, const char* tag) {
+    constexpr size_t region_size = 0x600;
+
+    static std::array<uint8_t, region_size> s_pass1_snapshot{};
+    static std::array<uint8_t, region_size> s_pass2_snapshot{};
+    static std::array<uint8_t, region_size> s_prev_pass1_snapshot{};
+    static bool s_have_pass1 = false;
+    static bool s_have_pass2 = false;
+    static bool s_have_prev_pass1 = false;
+
+    if (subsystem == nullptr) {
+        return;
+    }
+
+    const auto base = (uintptr_t)subsystem;
+
+    // Validate the whole region is readable before touching it (same style as the existing
+    // command-queue-offset scanner above: walk in pointer-sized steps and bail on the first
+    // unreadable page rather than assuming the whole region is mapped).
+    for (size_t i = 0; i < region_size; i += sizeof(void*)) {
+        if (IsBadReadPtr((void*)(base + i), sizeof(void*))) {
+            SPDLOG_WARN("[VR][KURO-RAW-DIFF] {} region not fully readable at +{:x}, skipping this capture", tag, i);
+            return;
+        }
+    }
+
+    std::array<uint8_t, region_size> snapshot{};
+    memcpy(snapshot.data(), (const void*)base, region_size);
+
+    const bool is_pass1 = std::string_view{tag}.find("pass1") != std::string_view::npos;
+    const bool is_pass2 = std::string_view{tag}.find("pass2") != std::string_view::npos;
+
+    if (is_pass1) {
+        s_prev_pass1_snapshot = s_pass1_snapshot;
+        s_have_prev_pass1 = s_have_pass1;
+
+        s_pass1_snapshot = snapshot;
+        s_have_pass1 = true;
+    } else if (is_pass2) {
+        s_pass2_snapshot = snapshot;
+        s_have_pass2 = true;
+    }
+
+    // Cross-eye diff: run once we have both snapshots for this frame, right after pass2 is captured.
+    if (is_pass2 && s_have_pass1 && s_have_pass2) {
+        SPDLOG_INFO("[VR][KURO-RAW-DIFF] ---- cross-eye diff (pass1 vs pass2) frame={} ----", g_frame_count);
+
+        int diff_count = 0;
+        for (size_t i = 0; i < region_size; i += sizeof(uint32_t)) {
+            uint32_t l{};
+            uint32_t r{};
+            memcpy(&l, &s_pass1_snapshot[i], sizeof(l));
+            memcpy(&r, &s_pass2_snapshot[i], sizeof(r));
+
+            if (l != r) {
+                SPDLOG_INFO("[VR][KURO-RAW-DIFF]   +{:04x}: pass1_u32={} ({:#x}) pass2_u32={} ({:#x}) pass1_f32={:.6f} pass2_f32={:.6f}",
+                    i, l, l, r, r, *(const float*)&l, *(const float*)&r);
+                ++diff_count;
+            }
+        }
+
+        if (diff_count == 0) {
+            SPDLOG_INFO("[VR][KURO-RAW-DIFF]   (no differences found between pass1/pass2 snapshots)");
+        }
+
+        SPDLOG_INFO("[VR][KURO-RAW-DIFF] ---- end cross-eye diff ({} dwords differ) ----", diff_count);
+    }
+
+    // Frame-to-frame diff on the pass1 snapshot: fields that normally tick every frame but freeze
+    // are strong candidates for the stale-state bug tied to the time-of-day shadow dropout.
+    if (is_pass1 && s_have_prev_pass1) {
+        static std::array<uint32_t, region_size / sizeof(uint32_t)> s_change_counts{};
+        static uint32_t s_sample_count = 0;
+        ++s_sample_count;
+
+        bool any_changed = false;
+        for (size_t i = 0; i < region_size; i += sizeof(uint32_t)) {
+            uint32_t prev{};
+            uint32_t cur{};
+            memcpy(&prev, &s_prev_pass1_snapshot[i], sizeof(prev));
+            memcpy(&cur, &s_pass1_snapshot[i], sizeof(cur));
+
+            if (prev != cur) {
+                s_change_counts[i / sizeof(uint32_t)]++;
+                any_changed = true;
+            }
+        }
+
+        // Every ~5 seconds (assuming ~250ms gate on the caller), report which dwords have been
+        // changing frequently (likely frame counters/timers) vs ones that just changed for the
+        // first time in a while (possible freeze/thaw transition worth correlating with the bug).
+        if (s_sample_count % 20 == 0) {
+            SPDLOG_INFO("[VR][KURO-RAW-DIFF] ---- pass1 frame-to-frame change frequency (samples={}) ----", s_sample_count);
+
+            for (size_t idx = 0; idx < s_change_counts.size(); ++idx) {
+                if (s_change_counts[idx] == 0) {
+                    continue;
+                }
+
+                SPDLOG_INFO("[VR][KURO-RAW-DIFF]   +{:04x}: changed {}/{} samples", idx * sizeof(uint32_t), s_change_counts[idx], s_sample_count);
+            }
+
+            SPDLOG_INFO("[VR][KURO-RAW-DIFF] ---- end change frequency ----");
+        }
+
+        (void)any_changed;
+    }
+}
+
+// Dynamic (in-process) watchpoint tracer: sets a hardware breakpoint (debug register) on a live
+// address for the current thread only, for the duration of this scope, and records every distinct
+// RIP (as module+RVA) that reads or writes it via a vectored exception handler. This lets us find
+// the exact consuming code for a field like FSceneView+0xC90 without needing an external debugger -
+// useful since we can only attach/trace dynamically in this environment (no static disassembler
+// access to the running build). Only ever call this around a single, short, well-understood call
+// (e.g. one eye's BeginRenderingViewFamily) - leaving a hardware breakpoint active is invasive and
+// will fire (and log) for every touch, including completely unrelated code if the address is popular.
+class ScopedWatchpointTracer {
+public:
+    // slot: 0-3, selects which of the 4 hardware breakpoint registers (Dr0-Dr3) to use so multiple
+    // tracers can run concurrently without clobbering each other.
+    ScopedWatchpointTracer(void* address, int slot, const char* tag)
+        : m_address(address), m_slot(slot % 4), m_tag(tag) {
+        install_handler_once();
+
+        CONTEXT ctx{};
+        ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+        const auto thread = GetCurrentThread();
+        if (!GetThreadContext(thread, &ctx)) {
+            SPDLOG_WARN("[VR][WATCHPOINT][{}] GetThreadContext failed, cannot install watchpoint", m_tag);
+            return;
+        }
+
+        switch (m_slot) {
+            case 0: ctx.Dr0 = (DWORD64)address; break;
+            case 1: ctx.Dr1 = (DWORD64)address; break;
+            case 2: ctx.Dr2 = (DWORD64)address; break;
+            case 3: ctx.Dr3 = (DWORD64)address; break;
+        }
+
+        // Dr7: enable local breakpoint (bit 2*slot), RW=11 (read-or-write), LEN=11 (4 bytes).
+        const int enable_bit = 1 << (m_slot * 2);
+        const int rw_len_shift = 16 + (m_slot * 4);
+        const DWORD64 rw_len = 0b1111ull; // RW=11 (read/write), LEN=11 (4 bytes)
+        ctx.Dr7 &= ~(0b1111ull << rw_len_shift);
+        ctx.Dr7 |= (rw_len << rw_len_shift);
+        ctx.Dr7 |= enable_bit;
+
+        if (!SetThreadContext(thread, &ctx)) {
+            SPDLOG_WARN("[VR][WATCHPOINT][{}] SetThreadContext failed, cannot install watchpoint", m_tag);
+            return;
+        }
+
+        m_installed = true;
+        s_active_tag[m_slot] = m_tag;
+        SPDLOG_INFO("[VR][WATCHPOINT][{}] armed Dr{} on address {:x}", m_tag, m_slot, (uintptr_t)address);
+    }
+
+    ~ScopedWatchpointTracer() {
+        if (!m_installed) {
+            return;
+        }
+
+        CONTEXT ctx{};
+        ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+        const auto thread = GetCurrentThread();
+        if (GetThreadContext(thread, &ctx)) {
+            switch (m_slot) {
+                case 0: ctx.Dr0 = 0; break;
+                case 1: ctx.Dr1 = 0; break;
+                case 2: ctx.Dr2 = 0; break;
+                case 3: ctx.Dr3 = 0; break;
+            }
+            const int enable_bit = 1 << (m_slot * 2);
+            ctx.Dr7 &= ~(DWORD64)enable_bit;
+            SetThreadContext(thread, &ctx);
+        }
+
+        s_active_tag[m_slot] = nullptr;
+        disarm_entry_breakpoint(m_slot);
+
+        const auto hits = s_hit_counts[m_slot];
+        SPDLOG_INFO("[VR][WATCHPOINT][{}] disarmed Dr{}, {} distinct call site(s) hit:", m_tag, m_slot, s_hit_sites[m_slot].size());
+        for (const auto& [site, count] : s_hit_sites[m_slot]) {
+            const auto& eye_counts = s_hit_eye_counts[m_slot][site];
+            const auto left = eye_counts.count(1) ? eye_counts.at(1) : 0;
+            const auto right = eye_counts.count(2) ? eye_counts.at(2) : 0;
+            const auto unknown = eye_counts.count(0) ? eye_counts.at(0) : 0;
+            SPDLOG_INFO("[VR][WATCHPOINT][{}]   {} hits={} (left/primary={}, right/secondary={}, unknown={})",
+                m_tag, site, count, left, right, unknown);
+        }
+        s_hit_sites[m_slot].clear();
+        s_hit_eye_counts[m_slot].clear();
+        s_hit_counts[m_slot] = 0;
+        (void)hits;
+    }
+
+    ScopedWatchpointTracer(const ScopedWatchpointTracer&) = delete;
+    ScopedWatchpointTracer& operator=(const ScopedWatchpointTracer&) = delete;
+
+private:
+    void* m_address{};
+    int m_slot{};
+    const char* m_tag{};
+    bool m_installed{false};
+
+    static inline std::array<const char*, 4> s_active_tag{};
+    static inline std::array<std::unordered_map<std::string, uint32_t>, 4> s_hit_sites{};
+    static inline std::array<uint32_t, 4> s_hit_counts{};
+    // Per call-site, per-eye hit tally: key 0 = unknown, 1 = left/primary, 2 = right/secondary.
+    static inline std::array<std::unordered_map<std::string, std::unordered_map<int, uint32_t>>, 4> s_hit_eye_counts{};
+
+    // Entry-breakpoint capture: a one-shot software breakpoint (0xCC) planted at the START of the
+    // immediate caller function (resolved via real unwind info, not the hot leaf where the compiler
+    // has already thrown args out of registers). Per x64 calling convention, the first 4 integer/pointer
+    // args are guaranteed to still be in RCX/RDX/R8/R9 at function entry, so this is the most reliable
+    // place left to recover a genuine FSceneView*/context pointer and check its StereoPass byte - far
+    // more trustworthy than scanning arbitrary registers mid-leaf or scanning raw stack qwords.
+    static inline std::array<uintptr_t, 4> s_entry_bp_addr{};
+    static inline std::array<uint8_t, 4> s_entry_bp_orig_byte{};
+    static inline std::array<bool, 4> s_entry_bp_armed{};
+    static inline std::array<bool, 4> s_entry_bp_hit{};
+
+    static void arm_entry_breakpoint(int slot, uintptr_t address) {
+        if (s_entry_bp_armed[slot] || address == 0 || IsBadReadPtr((void*)address, 1)) {
+            return;
+        }
+
+        DWORD old_protect = 0;
+        if (!VirtualProtect((void*)address, 1, PAGE_EXECUTE_READWRITE, &old_protect)) {
+            return;
+        }
+
+        s_entry_bp_orig_byte[slot] = *(uint8_t*)address;
+        *(uint8_t*)address = 0xCC;
+        VirtualProtect((void*)address, 1, old_protect, &old_protect);
+        FlushInstructionCache(GetCurrentProcess(), (void*)address, 1);
+
+        s_entry_bp_addr[slot] = address;
+        s_entry_bp_armed[slot] = true;
+        s_entry_bp_hit[slot] = false;
+        SPDLOG_INFO("[VR][WATCHPOINT][entry-bp] armed one-shot entry breakpoint for slot {} at {:x}", slot, address);
+    }
+
+    static void disarm_entry_breakpoint(int slot) {
+        if (!s_entry_bp_armed[slot] || s_entry_bp_addr[slot] == 0) {
+            return;
+        }
+
+        const auto address = s_entry_bp_addr[slot];
+        DWORD old_protect = 0;
+        if (VirtualProtect((void*)address, 1, PAGE_EXECUTE_READWRITE, &old_protect)) {
+            *(uint8_t*)address = s_entry_bp_orig_byte[slot];
+            VirtualProtect((void*)address, 1, old_protect, &old_protect);
+            FlushInstructionCache(GetCurrentProcess(), (void*)address, 1);
+        }
+
+        s_entry_bp_addr[slot] = 0;
+        s_entry_bp_armed[slot] = false;
+    }
+
+    static void install_handler_once() {
+        static bool installed = []() {
+            AddVectoredExceptionHandler(1, [](PEXCEPTION_POINTERS exception) -> LONG {
+                // Handle our one-shot entry breakpoints (INT3 / 0xCC) first: these capture genuine
+                // incoming register arguments (RCX/RDX/R8/R9 per x64 ABI) at the START of the immediate
+                // caller function, resolved via real unwind info - the last reliable place to recover a
+                // true FSceneView*/context pointer before the compiler spills/optimizes it away deeper in.
+                if (exception->ExceptionRecord->ExceptionCode == EXCEPTION_BREAKPOINT) {
+                    auto* bctx = exception->ContextRecord;
+                    const auto hit_rip = bctx->Rip;
+
+                    for (int slot = 0; slot < 4; ++slot) {
+                        if (!s_entry_bp_armed[slot] || s_entry_bp_hit[slot] || s_entry_bp_addr[slot] != hit_rip) {
+                            continue;
+                        }
+
+                        s_entry_bp_hit[slot] = true;
+
+                        // Check RCX/RDX/R8/R9 (first 4 integer/pointer args) for a pointer whose
+                        // +0xAF0 byte reads a plausible EStereoscopicPass value (1=left/primary,
+                        // 2=right/secondary), to reliably tag which eye this caller invocation is for.
+                        constexpr uintptr_t FSCENEVIEW_STEREO_PASS_OFFSET_ENTRY = 0xAF0;
+                        const char* arg_names[] = {"RCX", "RDX", "R8", "R9"};
+                        const DWORD64 arg_regs[] = {bctx->Rcx, bctx->Rdx, bctx->R8, bctx->R9};
+                        std::string arg_dump{};
+                        int entry_eye_guess = -1;
+
+                        for (int ai = 0; ai < 4; ++ai) {
+                            const auto reg = arg_regs[ai];
+                            arg_dump += fmt::format("{}={:x} ", arg_names[ai], reg);
+
+                            if (reg == 0 || entry_eye_guess != -1) {
+                                continue;
+                            }
+
+                            const auto candidate_addr = (void*)(reg + FSCENEVIEW_STEREO_PASS_OFFSET_ENTRY);
+                            if (IsBadReadPtr(candidate_addr, sizeof(uint8_t))) {
+                                continue;
+                            }
+
+                            const auto pass_byte = *(uint8_t*)candidate_addr;
+                            if (pass_byte == 1 || pass_byte == 2) {
+                                entry_eye_guess = pass_byte;
+                                arg_dump += fmt::format("(eye-match on {}) ", arg_names[ai]);
+                            }
+                        }
+
+                        SPDLOG_INFO("[VR][WATCHPOINT][entry-bp] slot {} hit at {:x}, args: {} entry_eye_guess={}",
+                            slot, hit_rip, arg_dump, entry_eye_guess);
+
+                        // Restore original byte immediately - this is a one-shot capture, not a
+                        // persistent breakpoint (persistent INT3s on a hot caller would re-introduce
+                        // the same lag problem we already fixed for the watchpoint hits).
+                        DWORD old_protect = 0;
+                        if (VirtualProtect((void*)hit_rip, 1, PAGE_EXECUTE_READWRITE, &old_protect)) {
+                            *(uint8_t*)hit_rip = s_entry_bp_orig_byte[slot];
+                            VirtualProtect((void*)hit_rip, 1, old_protect, &old_protect);
+                            FlushInstructionCache(GetCurrentProcess(), (void*)hit_rip, 1);
+                        }
+
+                        s_entry_bp_armed[slot] = false;
+                        s_entry_bp_addr[slot] = 0;
+
+                        // Do NOT advance Rip - we restored the original byte, so re-executing this
+                        // instruction now runs the real code instead of trapping again.
+                        return EXCEPTION_CONTINUE_EXECUTION;
+                    }
+
+                    return EXCEPTION_CONTINUE_SEARCH;
+                }
+
+                if (exception->ExceptionRecord->ExceptionCode != EXCEPTION_SINGLE_STEP) {
+                    return EXCEPTION_CONTINUE_SEARCH;
+                }
+
+                auto* ctx = exception->ContextRecord;
+                bool handled_any = false;
+
+                for (int slot = 0; slot < 4; ++slot) {
+                    if (s_active_tag[slot] == nullptr) {
+                        continue;
+                    }
+
+                    // Check if this slot's trigger bit is set in Dr6 (bits 0-3 correspond to Dr0-Dr3).
+                    if ((ctx->Dr6 & (1ull << slot)) == 0) {
+                        continue;
+                    }
+
+                    handled_any = true;
+
+                    const auto rip = ctx->Rip;
+                    std::string site_desc;
+                    const auto mod = utility::get_module_within((void*)rip);
+                    if (mod.has_value()) {
+                        const auto rva = rip - (uintptr_t)*mod;
+                        const auto mod_path = utility::get_module_path(*mod).value_or("<unknown>");
+                        const auto slash = mod_path.find_last_of("\\/");
+                        const auto mod_name = slash == std::string::npos ? mod_path : mod_path.substr(slash + 1);
+                        site_desc = fmt::format("{}+{:x}", mod_name, rva);
+                    } else {
+                        site_desc = fmt::format("<no module>:{:x}", rip);
+                    }
+
+                    s_hit_sites[slot][site_desc]++;
+                    s_hit_counts[slot]++;
+
+                    // PERF: the game's executable is packed/obfuscated, so static disassemblers (Ghidra/IDA)
+                    // read garbage bytes at these RVAs - only our live, in-process decoder sees the real
+                    // (unpacked) instruction stream. However, running register scans + decode on every single
+                    // hit (tens of thousands/sec) is what causes severe in-game lag. To get the most
+                    // diagnostic value at a bearable cost, only do the expensive work (eye-guess scan, full
+                    // instruction window dump, return-address walk) for the first few hits of each distinct
+                    // call site; after that, just keep tallying counts.
+                    constexpr uint32_t kDeepDiagHitsPerSite = 5;
+                    const auto site_hit_index = s_hit_sites[slot][site_desc]; // post-increment value, i.e. 1-based count so far
+                    const bool do_deep_diag = site_hit_index <= kDeepDiagHitsPerSite;
+
+                    int eye_guess = -1; // -1 = unknown, 1 = left/primary, 2 = right/secondary
+                    if (do_deep_diag) {
+                        // DIAG: scan the general-purpose registers for a pointer that looks like it points
+                        // at (or near) an FSceneView, by checking whether +FSCENEVIEW_STEREO_PASS_OFFSET
+                        // (0xAF0) reads a plausible EStereoscopicPass value (1=left/primary, 2=right/secondary
+                        // in this engine's convention). Best-effort heuristic, not a guarantee.
+                        constexpr uintptr_t FSCENEVIEW_STEREO_PASS_OFFSET_DIAG = 0xAF0;
+                        const DWORD64 gprs[] = {
+                            ctx->Rax, ctx->Rbx, ctx->Rcx, ctx->Rdx, ctx->Rsi, ctx->Rdi, ctx->Rbp,
+                            ctx->R8, ctx->R9, ctx->R10, ctx->R11, ctx->R12, ctx->R13, ctx->R14, ctx->R15
+                        };
+                        for (const auto reg : gprs) {
+                            if (reg == 0) {
+                                continue;
+                            }
+
+                            const auto candidate_addr = (void*)(reg + FSCENEVIEW_STEREO_PASS_OFFSET_DIAG);
+                            if (IsBadReadPtr(candidate_addr, sizeof(uint8_t))) {
+                                continue;
+                            }
+
+                            const auto pass_byte = *(uint8_t*)candidate_addr;
+                            if (pass_byte == 1 || pass_byte == 2) {
+                                eye_guess = pass_byte;
+                                break;
+                            }
+                        }
+                    }
+
+                    if (eye_guess != -1) {
+                        s_hit_eye_counts[slot][site_desc][eye_guess]++;
+                    } else if (do_deep_diag) {
+                        s_hit_eye_counts[slot][site_desc][0]++; // 0 = unknown bucket
+                    }
+
+                    // DIAG: disassemble a window of live (unpacked) instructions around the hit, and try
+                    // to identify the immediate caller by scanning the stack for the first qword that
+                    // points into a known module (a cheap, unwind-free approximation of a return address -
+                    // good enough since we only need a module+RVA, not exact frame info).
+                    if (do_deep_diag && !IsBadReadPtr((void*)rip, 16)) {
+                        INSTRUX ix{};
+                        const auto status = NdDecodeEx(&ix, (ND_UINT8*)rip, 16, ND_CODE_64, ND_DATA_64);
+                        if (ND_SUCCESS(status) && ix.Length > 0) {
+                            const uint8_t* raw = (const uint8_t*)rip;
+                            std::string bytes_str{};
+                            for (uint32_t bi = 0; bi < ix.Length; ++bi) {
+                                bytes_str += fmt::format("{:02x} ", raw[bi]);
+                            }
+
+                            // Walk forward a handful of instructions from rip to get more context, since
+                            // the single trapped instruction alone is rarely enough to identify the logic.
+                            std::string window_str{};
+                            uintptr_t cursor = rip;
+                            for (int wi = 0; wi < 6; ++wi) {
+                                if (IsBadReadPtr((void*)cursor, 16)) {
+                                    break;
+                                }
+
+                                INSTRUX wix{};
+                                const auto wstatus = NdDecodeEx(&wix, (ND_UINT8*)cursor, 16, ND_CODE_64, ND_DATA_64);
+                                if (!ND_SUCCESS(wstatus) || wix.Length == 0) {
+                                    break;
+                                }
+
+                                window_str += fmt::format("[{:x} {}] ", cursor, wix.Mnemonic);
+                                cursor += wix.Length;
+                            }
+
+                            // Robust caller-chain resolution via real Windows x64 unwind metadata
+                            // (.pdata/.xdata), instead of scanning raw stack qwords for anything that
+                            // "looks like" a module pointer (which produced false positives / stale-stack
+                            // garbage previously - see +0x9a7f9b8 in an earlier capture). Every non-leaf
+                            // function in an x64 PE - even in a packed/obfuscated binary - MUST carry
+                            // correct unwind info, or structured exception handling in the game itself
+                            // would be broken; so RtlVirtualUnwind reliably recovers the true return
+                            // address chain regardless of what garbage static disassembly shows.
+                            std::string caller_chain{};
+                            uintptr_t first_caller_entry_point = 0; // function BeginAddress of the nearest resolved non-leaf caller
+                            {
+                                CONTEXT unwind_ctx = *ctx;
+                                constexpr int kMaxUnwindFrames = 4;
+                                for (int frame = 0; frame < kMaxUnwindFrames; ++frame) {
+                                    DWORD64 image_base = 0;
+                                    const auto func_entry = RtlLookupFunctionEntry(unwind_ctx.Rip, &image_base, nullptr);
+                                    if (func_entry == nullptr) {
+                                        // Leaf function (no unwind info) - return address is at [RSP].
+                                        if (IsBadReadPtr((void*)unwind_ctx.Rsp, sizeof(uintptr_t))) {
+                                            break;
+                                        }
+
+                                        unwind_ctx.Rip = *(DWORD64*)unwind_ctx.Rsp;
+                                        unwind_ctx.Rsp += sizeof(uintptr_t);
+                                    } else {
+                                        void* handler_data = nullptr;
+                                        DWORD64 establisher_frame = 0;
+                                        RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, unwind_ctx.Rip,
+                                            func_entry, &unwind_ctx, &handler_data, &establisher_frame, nullptr);
+
+                                        // The unwound Rip is a return address INSIDE the caller, not its
+                                        // start - we need the function's start (BeginAddress) so an entry
+                                        // breakpoint there captures genuine incoming args, not whatever is
+                                        // live at the mid-function call-return point.
+                                        if (first_caller_entry_point == 0) {
+                                            first_caller_entry_point = (uintptr_t)image_base + func_entry->BeginAddress;
+                                        }
+                                    }
+
+                                    if (unwind_ctx.Rip == 0) {
+                                        break;
+                                    }
+
+                                    const auto frame_mod = utility::get_module_within((void*)unwind_ctx.Rip);
+                                    std::string frame_desc;
+                                    if (frame_mod.has_value()) {
+                                        const auto frva = unwind_ctx.Rip - (uintptr_t)*frame_mod;
+                                        const auto fpath = utility::get_module_path(*frame_mod).value_or("<unknown>");
+                                        const auto fslash = fpath.find_last_of("\\/");
+                                        const auto fname = fslash == std::string::npos ? fpath : fpath.substr(fslash + 1);
+                                        frame_desc = fmt::format("{}+{:x}", fname, frva);
+                                    } else {
+                                        frame_desc = fmt::format("<no module>:{:x}", unwind_ctx.Rip);
+                                    }
+
+                                    caller_chain += (frame == 0 ? "" : " <- ") + frame_desc;
+                                }
+                            }
+
+                            // Arm a one-shot entry breakpoint at the nearest resolved caller's function
+                            // start, so the NEXT time this caller runs, we capture genuine incoming
+                            // RCX/RDX/R8/R9 args (per x64 ABI) instead of inferring context from whatever
+                            // is left in registers deep inside this optimized leaf.
+                            if (first_caller_entry_point != 0) {
+                                arm_entry_breakpoint(slot, first_caller_entry_point);
+                            }
+
+                            if (caller_chain.empty()) {
+                                caller_chain = "<unresolved>";
+                            }
+
+                            SPDLOG_INFO("[VR][WATCHPOINT][{}] call site {} instruction: mnemonic={} bytes=[{}] rip={:x} eye_guess={} window=[{}] caller_chain=[{}]",
+                                s_active_tag[slot], site_desc, ix.Mnemonic, bytes_str, rip, eye_guess, window_str, caller_chain);
+                        } else {
+                            SPDLOG_WARN("[VR][WATCHPOINT][{}] call site {} instruction decode failed at rip={:x}",
+                                s_active_tag[slot], site_desc, rip);
+                        }
+                    }
+
+                    // Clear the trigger bit for this slot so we don't double-report; leave others.
+                    ctx->Dr6 &= ~(1ull << slot);
+                }
+
+                if (handled_any) {
+                    // Single-step trap handled; resume without re-triggering immediately on the same
+                    // instruction (RF flag) and continue execution normally.
+                    ctx->EFlags |= 0x10000; // RF (resume flag)
+                    return EXCEPTION_CONTINUE_EXECUTION;
+                }
+
+                return EXCEPTION_CONTINUE_SEARCH;
+            });
+            return true;
+        }();
+        (void)installed;
+    }
+};
+
+// Precise right-eye shadow fix (community-confirmed, see WuWaShadowPass.hpp from
+// https://github.com/ChronoHaxx/wuwa-vr). The game's primary-view predicate (observed at RVA
+// 0x55CD2C0 in the 3.7 executable) is:
+//     test dword [rdx+0xC90], 0xFFFFFFFD
+//     sete al
+//     ret
+// i.e. only StereoPass values 0 or 2 are treated as primary; anything else (including our
+
+// independently-confirmed cached copy of the same pass value (see eye_fields/probe_offsets);
+// both must be flipped together for the engine to honor the change. This writes ONLY those two
+// dwords, strictly scoped around the secondary view's own BeginRenderingViewFamily call, and
+// restores them immediately after - unlike the broader heuristic eye_fields-based fix, it never
+// touches any other field.
+//
+// Safety: before ever writing, re-validate the exact predicate bytes at the known RVA (if the
+// executable doesn't match - future patch moved the function, different build, etc. - disable
+// silently for this run rather than writing to the wrong location).
+inline bool validate_precise_shadow_fix_predicate_bytes() {
+    static int s_validated = -1; // -1 = not yet checked, 0 = failed, 1 = passed
+    if (s_validated != -1) {
+        return s_validated == 1;
+    }
+
+    s_validated = 0;
+
+    constexpr uintptr_t predicate_rva = 0x55CD2C0;
+    static constexpr uint8_t expected_bytes[] = {
+        0xF7, 0x42, 0x10, 0xFD, 0xFF, 0xFF, 0xFF, // test dword [rdx+0x10], 0xFFFFFFFD (ModRM varies by register/offset encoding)
+    };
+
+    const auto module_base = (uintptr_t)utility::get_executable();
+    if (module_base == 0) {
+        return false;
+    }
+
+    const auto predicate_addr = module_base + predicate_rva;
+    const auto module_size = utility::get_module_size(utility::get_executable()).value_or(0);
+
+    if (module_size == 0 || predicate_rva + 16 > module_size) {
+        SPDLOG_WARN("[VR][NSF-C90-PRECISE] predicate RVA out of module bounds (module_size={:x}); disabling precise shadow fix", module_size);
+        return false;
+    }
+
+    if (IsBadReadPtr((void*)predicate_addr, 16)) {
+        SPDLOG_WARN("[VR][NSF-C90-PRECISE] predicate address unreadable; disabling precise shadow fix");
+        return false;
+    }
+
+    // Looser byte check: confirm a `test dword [reg+0xC90], 0xFFFFFFFD` encoding is present
+    // somewhere in the first 16 bytes at this RVA (ModRM/REX byte can vary slightly by compiler),
+    // by scanning for the signature immediate 0xFFFFFFFD preceded by a test-group opcode (0xF7)
+    // and the disp32 0xC90 (90 0C 00 00) immediately before it.
+    const auto* bytes = (const uint8_t*)predicate_addr;
+    bool found_disp = false;
+    bool found_test_imm = false;
+    for (int i = 0; i < 12; ++i) {
+        if (bytes[i] == 0x90 && bytes[i + 1] == 0x0C && bytes[i + 2] == 0x00 && bytes[i + 3] == 0x00) {
+            found_disp = true;
+            // Immediately after disp32, expect the 0xFFFFFFFD immediate for the `test` instruction.
+            if (i + 8 <= 16 && bytes[i + 4] == 0xFD && bytes[i + 5] == 0xFF && bytes[i + 6] == 0xFF && bytes[i + 7] == 0xFF) {
+                found_test_imm = true;
+            }
+            break;
+        }
+    }
+
+    (void)expected_bytes;
+
+    if (!found_disp || !found_test_imm) {
+        SPDLOG_WARN("[VR][NSF-C90-PRECISE] predicate byte signature mismatch at RVA {:x} (found_disp={} found_test_imm={}); "
+            "offsets may have moved in this build, disabling precise shadow fix",
+            predicate_rva, found_disp, found_test_imm);
+        return false;
+    }
+
+    SPDLOG_INFO("[VR][NSF-C90-PRECISE] predicate byte signature validated at RVA {:x}", predicate_rva);
+    s_validated = 1;
+    return true;
+}
+
+// Inline-hook alternative to the raw memory-patch precise fix above. Per the disassembled
+// signature (`test dword [rdx+0xC90], 0xFFFFFFFD; sete al; ret`), this function takes the stereo
+// device in rcx and the FSceneView* in rdx - exactly the (FFakeStereoRendering*, FSceneView&)
+// shape already used for DEVICE_IS_A_PRIMARY_VIEW_INDEX in the fallback vtable above. Hooking the
+// function directly (instead of writing +0xC90/+0x1A0 and restoring around the game-thread-only
+// BeginRenderingViewFamily call) removes the render-thread race class of bug entirely: this hook
+// runs on whatever thread actually calls the predicate, so there is never a window where a
+// different thread can observe the original (non-primary) value for our forced-primary eye.
+//
+// Safety: only forces `true` for the known secondary StereoPass value (3); every other call
+// (including the left eye, pass 0/2, and any other code path that happens to call this same
+// function with an unrelated view) falls through to the original implementation unchanged.
+inline bool (*g_precise_shadow_fix_predicate_original)(void* stereo_device, sdk::FSceneView* view) = nullptr;
+
+inline bool precise_shadow_fix_predicate_hook(void* stereo_device, sdk::FSceneView* view) {
+    if (view != nullptr) {
+        const auto* p_pass = (const uint32_t*)((uintptr_t)view + 0xC90);
+        if (!IsBadReadPtr(p_pass, sizeof(uint32_t)) && *p_pass == 3) {
+            return true;
+        }
+    }
+
+    return g_precise_shadow_fix_predicate_original(stereo_device, view);
+}
+
+inline safetyhook::InlineHook& precise_shadow_fix_predicate_hook_storage() {
+    static safetyhook::InlineHook hook{};
+    return hook;
+}
+
+// PURE OBSERVATION hook (never changes behavior): calls the untouched original predicate for
+// every view and counts how many distinct views evaluate "true" (primary) per frame. Installed
+// independently of the raw +0xC90/+0x1A0 memory-patch fix so it can run WHILE that fix is active,
+// answering a specific hypothesis for the both-eyes flicker/CSM-transition-scale-gated symptom:
+// does our write cause the engine to see TWO "primary" views in the same frame (instead of the
+// expected one), which would make any once-per-frame CSM transition-scale/dither accumulation run
+// twice and desync - a mechanism that would affect BOTH eyes symmetrically, matching what was
+// observed (flicker in both eyes, independent of which eye is "ours").
+inline bool (*g_primary_view_observer_original)(void* stereo_device, sdk::FSceneView* view) = nullptr;
+
+inline bool primary_view_observer_hook(void* stereo_device, sdk::FSceneView* view) {
+    // DIAG: unconditional one-shot proof-of-call. If this never appears in the log, the hooked
+    // RVA is never invoked at all (e.g. ICF-folded to a different surviving instance, or this
+    // code path is simply not what gates shadow/CSM primary-view behavior), independent of
+    // whatever the periodic/multi-view logging below shows.
+    static bool s_logged_first_call = false;
+    if (!s_logged_first_call) {
+        s_logged_first_call = true;
+        SPDLOG_WARN("[VR][NSF-PRIMARY-PREDICATE-OBSERVE] FIRST CALL CONFIRMED: hook at this RVA is being invoked (frame={})", g_frame_count);
+    }
+
+    const bool result = g_primary_view_observer_original(stereo_device, view);
+
+    static uint32_t s_frame = 0xFFFFFFFF;
+    static uint32_t s_true_count = 0;
+    static uint32_t s_false_count = 0;
+    static void* s_true_views[4] = {};
+    static uint32_t s_true_views_count = 0;
+    static uint64_t s_total_calls = 0;
+
+    ++s_total_calls;
+
+    if (g_frame_count != s_frame) {
+        if (s_frame != 0xFFFFFFFF && (s_true_count > 1 || s_frame % 300 == 0)) {
+            std::string views_str{};
+            for (uint32_t i = 0; i < s_true_views_count; ++i) {
+                views_str += fmt::format("{:x} ", (uintptr_t)s_true_views[i]);
+            }
+            SPDLOG_WARN("[VR][NSF-PRIMARY-PREDICATE-OBSERVE] frame={} true_count={} false_count={} total_calls={} true_views=[{}]{}",
+                s_frame, s_true_count, s_false_count, s_total_calls, views_str,
+                s_true_count > 1 ? " <-- MULTIPLE PRIMARY VIEWS THIS FRAME" : "");
+        }
+        s_frame = g_frame_count;
+        s_true_count = 0;
+        s_false_count = 0;
+        s_true_views_count = 0;
+    }
+
+    if (result) {
+        ++s_true_count;
+        if (s_true_views_count < 4) {
+            s_true_views[s_true_views_count++] = (void*)view;
+        }
+    } else {
+        ++s_false_count;
+    }
+
+    return result;
+}
+
+
+inline safetyhook::InlineHook& primary_view_observer_hook_storage() {
+    static safetyhook::InlineHook hook{};
+    return hook;
+}
+
+// Installs the pure-observation hook once. Safe to run alongside the raw memory-patch precise fix
+// (this hook does not alter the return value), unlike install_precise_shadow_fix_predicate_hook
+// which is a behavior-changing alternative fix mode.
+inline bool install_primary_view_observer_hook() {
+    static int s_installed = -1;
+
+    if (s_installed != -1) {
+        return s_installed == 1;
+    }
+
+    s_installed = 0;
+
+    if (!validate_precise_shadow_fix_predicate_bytes()) {
+        return false;
+    }
+
+    const auto module_base = (uintptr_t)utility::get_executable();
+    if (module_base == 0) {
+        return false;
+    }
+
+    constexpr uintptr_t predicate_rva = 0x55CD2C0;
+    const auto predicate_addr = (void*)(module_base + predicate_rva);
+
+    auto& hook = primary_view_observer_hook_storage();
+    hook = safetyhook::create_inline(predicate_addr, (void*)&primary_view_observer_hook);
+
+    if (!hook) {
+        SPDLOG_ERROR("[VR][NSF-PRIMARY-PREDICATE-OBSERVE] failed to install observation hook at RVA {:x}", predicate_rva);
+        return false;
+    }
+
+    g_primary_view_observer_original = hook.original<decltype(g_primary_view_observer_original)>();
+    s_installed = 1;
+    SPDLOG_INFO("[VR][NSF-PRIMARY-PREDICATE-OBSERVE] installed pure-observation hook at RVA {:x}", predicate_rva);
+    return true;
+}
+
+// DIAG: the hardcoded RVA above (0x55CD2C0) was confirmed to byte-match the disassembled
+// predicate signature, but a full session produced ZERO calls to the observer hook installed
+// there - not even the guaranteed every-300-frames heartbeat log. That proves the hooked address
+// is never actually invoked by the running game, despite passing the byte-signature check. The
+// leading theory: this is a tiny (~10 byte) leaf function, exactly the kind the MSVC/UE linker
+// commonly folds via Identical Code Folding (ICF) - multiple distinct source functions that
+// compile to byte-identical machine code get merged into ONE physical copy, and only SOME of the
+// original call sites get their relocations repointed to it. Our RVA may be a genuine, correctly
+// byte-matching instance that nonetheless isn't the one any live call site currently points to.
+//
+// This scans the ENTIRE executable for every occurrence of the predicate's byte signature
+// (instead of trusting a single hardcoded RVA) and installs the same pure-observation hook on
+// EVERY match, each tagged with its own RVA in the log, so we can see which instance(s) (if any)
+// actually receive calls during real gameplay.
+inline std::vector<safetyhook::InlineHook>& primary_view_observer_all_hooks_storage() {
+    static std::vector<safetyhook::InlineHook> hooks{};
+    return hooks;
+}
+
+inline std::vector<bool (*)(void*, sdk::FSceneView*)>& primary_view_observer_all_originals_storage() {
+    static std::vector<bool (*)(void*, sdk::FSceneView*)> originals{};
+    return originals;
+}
+
+template <size_t Index>
+inline bool primary_view_observer_hook_n(void* stereo_device, sdk::FSceneView* view) {
+    auto& originals = primary_view_observer_all_originals_storage();
+    static bool s_logged_first_call = false;
+
+    if (!s_logged_first_call) {
+        s_logged_first_call = true;
+        SPDLOG_WARN("[VR][NSF-PRIMARY-PREDICATE-SCAN] FIRST CALL CONFIRMED on scanned instance #{} (frame={})", Index, g_frame_count);
+    }
+
+    static uint64_t s_calls = 0;
+    ++s_calls;
+
+    if (s_calls <= 3 || s_calls % 1000 == 0) {
+        SPDLOG_INFO("[VR][NSF-PRIMARY-PREDICATE-SCAN] instance #{} call #{} view={:x} frame={}", Index, s_calls, (uintptr_t)view, g_frame_count);
+    }
+
+    if (Index < originals.size() && originals[Index] != nullptr) {
+        return originals[Index](stereo_device, view);
+    }
+
+    return false;
+}
+
+// Table of up to 16 scanned-instance trampolines (template-instantiated so each has its own static
+// call counter/first-call flag) - more than enough for any plausible number of ICF-folded copies of
+// a function this small.
+inline bool install_primary_view_observer_all_instances() {
+    static int s_installed = -1;
+
+    if (s_installed != -1) {
+        return s_installed == 1;
+    }
+
+    s_installed = 0;
+
+    const auto module_base_opt = utility::get_executable();
+    if (module_base_opt == nullptr) {
+        return false;
+    }
+
+    const auto module_base = (uintptr_t)module_base_opt;
+    const auto module_size = utility::get_module_size(module_base_opt).value_or(0);
+
+    if (module_size == 0) {
+        return false;
+    }
+
+    // `test dword [reg+0xC90], 0xFFFFFFFD` - disp32 0xC90 (90 0C 00 00) followed by the 0xFFFFFFFD
+    // immediate. ModRM/REX byte before the disp32 varies by register, so wildcard it.
+    constexpr auto pattern = "F7 ? 90 0C 00 00 FD FF FF FF";
+
+    using HookFn = bool(*)(void*, sdk::FSceneView*);
+    constexpr HookFn thunks[] = {
+        &primary_view_observer_hook_n<0>, &primary_view_observer_hook_n<1>, &primary_view_observer_hook_n<2>, &primary_view_observer_hook_n<3>,
+        &primary_view_observer_hook_n<4>, &primary_view_observer_hook_n<5>, &primary_view_observer_hook_n<6>, &primary_view_observer_hook_n<7>,
+        &primary_view_observer_hook_n<8>, &primary_view_observer_hook_n<9>, &primary_view_observer_hook_n<10>, &primary_view_observer_hook_n<11>,
+        &primary_view_observer_hook_n<12>, &primary_view_observer_hook_n<13>, &primary_view_observer_hook_n<14>, &primary_view_observer_hook_n<15>,
+    };
+
+    auto& hooks = primary_view_observer_all_hooks_storage();
+    auto& originals = primary_view_observer_all_originals_storage();
+    originals.resize(16, nullptr);
+
+    size_t found = 0;
+    uintptr_t search_start = module_base;
+    const uintptr_t search_end = module_base + module_size;
+
+    while (found < 16) {
+        const auto match = utility::scan(search_start, (uint32_t)(search_end - search_start), pattern);
+        if (!match.has_value()) {
+            break;
+        }
+
+        // The pattern starts at the ModRM byte before disp32; back up 1 byte to the F7 opcode
+        // start is already included (pattern begins with F7 ?), so *match IS the function start
+        // for this leaf-function shape (test; sete al; ret begins right at F7).
+        const auto func_addr = (void*)*match;
+        const auto rva = *match - module_base;
+
+        auto& hook = hooks.emplace_back();
+        hook = safetyhook::create_inline(func_addr, (void*)thunks[found]);
+
+        if (!hook) {
+            SPDLOG_WARN("[VR][NSF-PRIMARY-PREDICATE-SCAN] failed to hook scanned instance #{} at RVA {:x}", found, rva);
+            hooks.pop_back();
+        } else {
+            originals[found] = hook.original<HookFn>();
+            SPDLOG_INFO("[VR][NSF-PRIMARY-PREDICATE-SCAN] hooked scanned instance #{} at RVA {:x}", found, rva);
+            ++found;
+        }
+
+        search_start = *match + 1;
+    }
+
+    SPDLOG_INFO("[VR][NSF-PRIMARY-PREDICATE-SCAN] total instances found and hooked: {}", found);
+    s_installed = found > 0 ? 1 : 0;
+    return s_installed == 1;
+}
+
+
+// Installs the predicate inline hook once. Returns true if the hook is installed and active
+// (whether just now or on a prior call). Re-validates the same byte signature as the memory-patch
+// fix before installing, since both rely on the same disassembled RVA being correct for this build.
+inline bool install_precise_shadow_fix_predicate_hook() {
+    static int s_installed = -1; // -1 = not yet attempted, 0 = failed, 1 = installed
+
+    if (s_installed != -1) {
+        return s_installed == 1;
+    }
+
+    s_installed = 0;
+
+    if (!validate_precise_shadow_fix_predicate_bytes()) {
+        return false;
+    }
+
+    const auto module_base = (uintptr_t)utility::get_executable();
+    if (module_base == 0) {
+        return false;
+    }
+
+    constexpr uintptr_t predicate_rva = 0x55CD2C0;
+    const auto predicate_addr = (void*)(module_base + predicate_rva);
+
+    auto& hook = precise_shadow_fix_predicate_hook_storage();
+    hook = safetyhook::create_inline(predicate_addr, (void*)&precise_shadow_fix_predicate_hook);
+
+    if (!hook) {
+        SPDLOG_ERROR("[VR][NSF-C90-PREDICATE-HOOK] failed to install inline hook at RVA {:x}", predicate_rva);
+        return false;
+    }
+
+    g_precise_shadow_fix_predicate_original = hook.original<decltype(g_precise_shadow_fix_predicate_original)>();
+    s_installed = 1;
+    SPDLOG_INFO("[VR][NSF-C90-PREDICATE-HOOK] installed inline hook at RVA {:x}", predicate_rva);
+    return true;
+}
+
+// Writes StereoPass (+0xC90) and its cached copy (+0x1A0) on `view` from 3 to 2 if (and only if)
+// both currently read exactly 3, returning the pair of (address, original value) writes performed
+// so the caller can restore them. Does nothing and returns an empty list if the live fields are not
+// in the expected state (defensive: never stomps on a value we don't recognize).
+//
+// `target_value` lets the caller choose which "primary-passing" value to write. The predicate
+// (`test dword [x+0xC90], 0xFFFFFFFD; sete al`) treats BOTH 0 (eSSP_FULL) and 2 (left eye's actual
+// value) as primary. Using 2 (mirroring the left eye exactly) was tried first and produced visible
+// flicker/darkening identical to the older heuristic fix - consistent with the right eye now
+// aliasing the SAME StereoPass value as the left eye within the same frame, causing the two views
+// to collide on whatever per-pass-value cache/slot this field keys (shadow depth cache, exposure,
+// TAA history, etc.). Using 0 instead keeps the predicate satisfied (still primary) while giving the
+// right eye a value distinct from the left eye's 2, avoiding that same-frame slot collision.
+inline std::vector<std::pair<uint32_t*, uint32_t>> apply_precise_shadow_fix(sdk::FSceneView* view, uint32_t target_value = 0) {
+    std::vector<std::pair<uint32_t*, uint32_t>> restore{};
+
+    if (view == nullptr || !validate_precise_shadow_fix_predicate_bytes()) {
+        return restore;
+    }
+
+    constexpr uint32_t stereo_pass_offset = 0xC90;
+    constexpr uint32_t stereo_pass_cache_offset = 0x1A0;
+
+    auto* p_pass = (uint32_t*)((uintptr_t)view + stereo_pass_offset);
+    auto* p_cache = (uint32_t*)((uintptr_t)view + stereo_pass_cache_offset);
+
+    if (IsBadReadPtr(p_pass, sizeof(uint32_t)) || IsBadWritePtr(p_pass, sizeof(uint32_t)) ||
+        IsBadReadPtr(p_cache, sizeof(uint32_t)) || IsBadWritePtr(p_cache, sizeof(uint32_t))) {
+        return restore;
+    }
+
+    // Only act if both fields hold exactly the expected secondary-eye value (3). If either has
+    // drifted to something else (future build, unexpected engine state), bail rather than guess.
+    if (*p_pass != 3 || *p_cache != 3) {
+        static uint64_t s_mismatch_samples = 0;
+        const auto sample = s_mismatch_samples++;
+        if (sample < 10 || sample % 300 == 0) {
+            SPDLOG_WARN("[VR][NSF-C90-PRECISE] skipped this call: fields not both ==3 (pass={} cache={}); "
+                "right eye will render with its UNMODIFIED StereoPass this frame (sample={})",
+                *p_pass, *p_cache, sample);
+        }
+        return restore;
+
+    }
+
+    restore.emplace_back(p_pass, *p_pass);
+    restore.emplace_back(p_cache, *p_cache);
+
+    *p_pass = target_value;
+    *p_cache = target_value;
+
+    return restore;
+}
+
+// DECISIVE DIAGNOSTIC: confirms or refutes the "array adjacency" hypothesis for why the shadow
+// fix produces direct/local shadows but not cascaded whole-scene shadows. Per UE4's
+// FSceneRenderer::AddViewDependentWholeSceneShadowsForView (ShadowSetup.cpp): CSM cascades are
+// built ONCE for the PRIMARY view, then "projected" onto the SECONDARY view purely by walking
+// forward through the SAME FSceneViewFamily::Views TArray from the primary's index
+// (FadeAlphaIndex = ViewIndex + 1) until it finds an IsASecondaryView() entry immediately after
+// it, or hits another primary (in which case it stops looking). This means our fix flipping the
+// right eye's StereoPass/predicate result is necessary but NOT sufficient for cascades - the right
+// eye's FSceneView* must ALSO sit in the SAME FSceneViewFamily::Views array, at a position
+// immediately following the left eye's entry, for the engine's own fade-alpha propagation to ever
+// find it. This logs exactly that: both eyes' owning FSceneViewFamily pointers (same family?),
+// the full Views array contents (count, each slot's pointer + live StereoPass value), and which
+// index each of our eyes occupies - giving a direct yes/no answer instead of inference.
+inline void log_cascade_adjacency_diagnostic(const char* tag, sdk::FSceneView* pass1_view, sdk::FSceneView* pass2_view) {
+    static uint64_t s_samples = 0;
+    const auto sample = s_samples++;
+    if (sample >= 20 && sample % 300 != 0) {
+        return;
+    }
+
+    if (pass1_view == nullptr || pass2_view == nullptr) {
+        SPDLOG_WARN("[VR][NSF-CASCADE-ADJACENCY] {} sample={}: null view(s) pass1={:x} pass2={:x}",
+            tag, sample, (uintptr_t)pass1_view, (uintptr_t)pass2_view);
+        return;
+    }
+
+    constexpr uint32_t stereo_pass_offset = 0xC90;
+
+    auto read_pass = [](sdk::FSceneView* v) -> int64_t {
+        auto* p = (const uint32_t*)((uintptr_t)v + stereo_pass_offset);
+        if (IsBadReadPtr(p, sizeof(uint32_t))) {
+            return -1;
+        }
+        return (int64_t)*p;
+    };
+
+    if (!live_view_family_offset) {
+        SPDLOG_WARN("[VR][NSF-CASCADE-ADJACENCY] {} sample={}: live_view_family_offset not yet resolved; "
+            "skipping (will retry on later frames)", tag, sample);
+        return;
+    }
+
+    auto read_family = [](sdk::FSceneView* v) -> sdk::FSceneViewFamily* {
+        auto* p = (sdk::FSceneViewFamily**)((uintptr_t)v + *live_view_family_offset);
+        if (IsBadReadPtr(p, sizeof(void*))) {
+            return nullptr;
+        }
+        return *p;
+    };
+
+    auto family1 = read_family(pass1_view);
+    auto family2 = read_family(pass2_view);
+    const bool same_family = family1 != nullptr && family1 == family2;
+
+    SPDLOG_WARN("[VR][NSF-CASCADE-ADJACENCY] {} sample={}: pass1_view={:x}(pass={}) pass2_view={:x}(pass={}) "
+        "family1={:x} family2={:x} same_family={}",
+        tag, sample, (uintptr_t)pass1_view, read_pass(pass1_view), (uintptr_t)pass2_view, read_pass(pass2_view),
+        (uintptr_t)family1, (uintptr_t)family2, same_family);
+
+    if (!same_family || family1 == nullptr) {
+        SPDLOG_WARN("[VR][NSF-CASCADE-ADJACENCY] {} sample={}: eyes do NOT share a FSceneViewFamily - "
+            "the engine's forward fade-alpha propagation (AddViewDependentWholeSceneShadowsForView) "
+            "can never find the secondary eye from the primary eye's array position, regardless of "
+            "StereoPass/predicate correctness. This alone would fully explain missing cascade shadows.",
+            tag, sample);
+        return;
+    }
+
+    auto* views = family1->get_views();
+    if (views == nullptr || views->data == nullptr || views->count <= 0 || views->count > 8) {
+        SPDLOG_WARN("[VR][NSF-CASCADE-ADJACENCY] {} sample={}: family Views array unavailable/implausible "
+            "(views={:x} count={})", tag, sample, (uintptr_t)views, views != nullptr ? views->count : -1);
+        return;
+    }
+
+    int32_t pass1_index = -1, pass2_index = -1;
+    std::string dump;
+    for (int32_t i = 0; i < views->count; ++i) {
+        auto* v = views->data[i];
+        const auto pass = read_pass(v);
+        if (v == pass1_view) pass1_index = i;
+        if (v == pass2_view) pass2_index = i;
+        dump += fmt::format(" [{}]={:x}(pass={})", i, (uintptr_t)v, pass);
+    }
+
+    const bool adjacent_forward = pass1_index >= 0 && pass2_index == pass1_index + 1;
+
+    SPDLOG_WARN("[VR][NSF-CASCADE-ADJACENCY] {} sample={}: Views.count={} contents:{} | pass1_index={} "
+        "pass2_index={} adjacent_forward(pass2==pass1+1)={}",
+        tag, sample, views->count, dump, pass1_index, pass2_index, adjacent_forward);
+
+    if (pass1_index < 0 || pass2_index < 0) {
+        SPDLOG_WARN("[VR][NSF-CASCADE-ADJACENCY] {} sample={}: one or both eyes are NOT present in their "
+            "own FSceneViewFamily's Views array at all - the engine's shadow-gathering loop iterates "
+            "Views directly, so a view absent from this array gets no shadow setup of any kind "
+            "(independent of StereoPass/predicate correctness).", tag, sample);
+    } else if (!adjacent_forward) {
+        SPDLOG_WARN("[VR][NSF-CASCADE-ADJACENCY] {} sample={}: eyes ARE both present but NOT forward-"
+            "adjacent (pass2_index != pass1_index+1) - AddViewDependentWholeSceneShadowsForView's "
+            "FadeAlphaIndex walk starts at pass1_index+1 and stops at the first encountered primary, "
+            "so it will never reach pass2 at this position. This is the most likely root cause if "
+            "same_family=true but cascades are still missing.", tag, sample);
+    } else {
+        SPDLOG_WARN("[VR][NSF-CASCADE-ADJACENCY] {} sample={}: structural layout is CORRECT for the "
+            "engine's cascade fade-alpha propagation (same family, forward-adjacent). If cascades are "
+            "still missing with this layout confirmed, the cause is NOT array adjacency - look at "
+            "IsAPrimaryView/IsASecondaryView's actual return value for pass2 at the moment "
+            "InitDynamicShadows runs, or DependentView/light-visibility-array sizing instead.", tag, sample);
+    }
+}
+
 } // namespace sceneview_xref
+
+void FFakeStereoRenderingHook::replay_trace_state() {
+    sceneview_xref::replay_resolved_state_to_trace();
+}
 
 bool FFakeStereoRenderingHook::is_in_viewport_client_draw() const {
     return m_in_viewport_client_draw && GameThreadWorker::get().is_same_thread();
@@ -7860,6 +9558,10 @@ sdk::FSceneView* FFakeStereoRenderingHook::sceneview_constructor(sdk::FSceneView
             sceneview_xref::feed(view, init_options, g_frame_count);
         }
 
+        if (w >= 256 && h >= 256) {
+            sceneview_xref::learn_raw_stereo_pass((uint32_t)(int32_t)init_options->get_stereo_pass());
+        }
+
         return result;
     }
 
@@ -7915,7 +9617,15 @@ sdk::FSceneView* FFakeStereoRenderingHook::sceneview_constructor(sdk::FSceneView
     // entirely instead of guessing an eye for them.
     bool is_confirmed_non_eye_pass = false;
 
-    if (sceneview_xref::live_stereo_pass_offset.has_value() && !vr->is_using_afr()) {
+    {
+        const int32_t eye_w = init_options->view_rect[2] - init_options->view_rect[0];
+        const int32_t eye_h = init_options->view_rect[3] - init_options->view_rect[1];
+        if (eye_w >= 256 && eye_h >= 256) {
+            sceneview_xref::learn_raw_stereo_pass((uint32_t)(int32_t)init_options->get_stereo_pass());
+        }
+    }
+
+    if ((sceneview_xref::live_stereo_pass_offset.has_value() || sceneview_xref::raw_stereo_pass_offset_resolved.has_value()) && !vr->is_using_afr()) {
         const auto raw_stereo_pass = (uint32_t)(int32_t)init_options->get_stereo_pass();
 
         // DIAG: init_options->get_stereo_pass() reads FSceneViewInitOptionsBase::s_stereo_pass_offset,
@@ -7929,7 +9639,7 @@ sdk::FSceneView* FFakeStereoRenderingHook::sceneview_constructor(sdk::FSceneView
         if (s_seen_raw_stereo_pass_values.insert(raw_stereo_pass).second) {
             SPDLOG_WARN("[VR][SVC-RAW-STEREO-PASS] new raw_stereo_pass value seen: {} (init_options_offset={:x}) vs sceneview_xref left={} right={} (live_offset={:x})",
                 raw_stereo_pass, sdk::FSceneViewInitOptionsBase::get_stereo_pass_offset().value_or(0xFFFFFFFF),
-                sceneview_xref::stereo_pass_left, sceneview_xref::stereo_pass_right, *sceneview_xref::live_stereo_pass_offset);
+                sceneview_xref::stereo_pass_left, sceneview_xref::stereo_pass_right, sceneview_xref::live_stereo_pass_offset.value_or(0xFFFFFFFF));
         }
 
         if (raw_stereo_pass == sceneview_xref::stereo_pass_left) {
@@ -7938,6 +9648,28 @@ sdk::FSceneView* FFakeStereoRenderingHook::sceneview_constructor(sdk::FSceneView
             true_index = 1;
         } else {
             is_confirmed_non_eye_pass = true;
+
+            // DIAG: SVC-NONEYE-PASS. SceneView Compatibility Mode (and SplitScreen Compatibility)
+            // intentionally skip the manual pose/projection write below for any FSceneView
+            // construction that isn't a confirmed left/right eye (see is_confirmed_non_eye_pass
+            // rationale above). That skipped view still renders through the normal (hooked) stereo
+            // vtable but never gets its camera pose re-synced to the live HMD pose, so if this is
+            // used to feed something visible (e.g. a UI/LGUI canvas capture), it will show up as a
+            // static/stale copy of the game scene. Log every distinct caller/view-family combo seen
+            // here (one-shot) so we can identify exactly which subsystem this is and whether it
+            // feeds a visible render target.
+            static std::unordered_set<uint64_t> s_seen_noneye_sigs{};
+            const auto noneye_view_family = init_options->get_view_family();
+            const auto noneye_sig = (uint64_t)retaddr ^ ((uint64_t)(uintptr_t)noneye_view_family << 1);
+            if (s_seen_noneye_sigs.insert(noneye_sig).second) {
+                const int32_t nw = init_options->view_rect[2] - init_options->view_rect[0];
+                const int32_t nh = init_options->view_rect[3] - init_options->view_rect[1];
+                SPDLOG_WARN("[VR][SVC-NONEYE-PASS] NEW raw_stereo_pass={} retaddr={:x} view_family={:x} "
+                    "view_rect=({},{})-({},{}) size={}x{} scene_state={:x} actor={:x} player_index={}",
+                    raw_stereo_pass, retaddr, (uintptr_t)noneye_view_family,
+                    init_options->view_rect[0], init_options->view_rect[1], init_options->view_rect[2], init_options->view_rect[3],
+                    nw, nh, (uintptr_t)init_options->get_scene_state(), (uintptr_t)init_options->actor, init_options->player_index);
+            }
         }
     }
 
@@ -8256,12 +9988,120 @@ sdk::FSceneView* FFakeStereoRenderingHook::sceneview_constructor(sdk::FSceneView
 
     auto result = g_hook->m_sceneview_data.constructor_hook.unsafe_call<sdk::FSceneView*>(view, init_options, a3, a4);
 
+    // DIAG: NSF-FOV-ORIGIN. The engine (or this hook's own StereoPass/same-pass manipulation above)
+    // hands back a constructed FSceneView with a per-eye FOV-like scalar at +0x2d0/+0x2d4 (confirmed
+    // mirrored at +0xca4/+0xca8), observed as a stable 75.0 (left) vs 90.0 (right) split that predates
+    // the shadow fix entirely (A/B tested with the fix OFF - same split present). Log this value
+    // IMMEDIATELY after the real engine constructor call returns, before anything else in this
+    // process touches the view, so we know whether the engine itself ever produced this split or
+    // whether it only appears later (e.g. from our own same-pass/force-primary init_options mutation
+    // above, which could plausibly make the engine compute the "wrong" eye's FOV for this view).
+    if (!is_confirmed_non_eye_pass && result != nullptr && vr->is_diag_log_eye_frustum_diff_enabled()) {
+        constexpr uint32_t fov_probe_offset = 0x2d0;
+        if (!IsBadReadPtr((const void*)((uintptr_t)result + fov_probe_offset), sizeof(float) * 2)) {
+            const auto fov_x = *(const float*)((uintptr_t)result + fov_probe_offset);
+            const auto fov_y = *(const float*)((uintptr_t)result + fov_probe_offset + 4);
+            SPDLOG_WARN("[VR][NSF-FOV-ORIGIN] frame={} true_index={} result_view={:x} post-ctor +2d0={:.3f} +2d4={:.3f} same_pass_force_primary={} stereo_pass_final={}",
+                g_frame_count, true_index, (uintptr_t)result, fov_x, fov_y,
+                vr->is_native_stereo_fix_same_pass_force_primary_enabled(), (int32_t)init_options->get_stereo_pass());
+        }
+
+        // DIAG: NSF-C90-ORIGIN. The working (but artifact-laden) right-eye shadow fix overwrites
+        // +0xC90 on pass2_view with pass1_view's live value, well after both views are constructed
+        // and already rendering. This only proves the two eyes end up with different values there;
+        // it doesn't tell us what the ENGINE itself originally computed for each eye, or what
+        // upstream state (light/shadow setup, CSM data, cached per-view flags) drove that divergence.
+        // Log the raw +0xC90 value (and a small window around it) immediately after the real
+        // constructor call returns, per-eye, so we can correlate the engine's own stock values
+        // against true_index/stereo_pass instead of just diffing post-hoc after our own writes.
+        constexpr uint32_t c90_probe_offset = 0xC90;
+        constexpr uint32_t c90_window_start = 0xC80;
+        constexpr uint32_t c90_window_size = 0x28;
+        if (!IsBadReadPtr((const void*)((uintptr_t)result + c90_window_start), c90_window_size)) {
+            const auto c90_value = *(const uint32_t*)((uintptr_t)result + c90_probe_offset);
+            std::string window_dump;
+            for (uint32_t offset = c90_window_start; offset < c90_window_start + c90_window_size; offset += 4) {
+                const auto value = *(const uint32_t*)((uintptr_t)result + offset);
+                window_dump += fmt::format(" {:03x}={:08x}", offset, value);
+            }
+            SPDLOG_WARN("[VR][NSF-C90-ORIGIN] frame={} true_index={} result_view={:x} stereo_pass_final={} post-ctor c90={}(0x{:x}){}",
+                g_frame_count, true_index, (uintptr_t)result, (int32_t)init_options->get_stereo_pass(),
+                c90_value, c90_value, window_dump);
+        }
+    }
+
     // FALLBACK: cache this eye's constructed FSceneView* so calculate_stereo_projection_matrix's
     // dual-write fallback can find the OTHER eye's view when the engine only calls
     // CalculateStereoProjectionMatrix once per frame. Only cache confirmed real stereo eyes.
     if (!is_confirmed_non_eye_pass && result != nullptr && true_index < 2) {
         g_hook->m_sceneview_data.cached_view_for_eye[true_index] = result;
         g_hook->m_sceneview_data.cached_view_frame_count[true_index] = g_frame_count;
+    }
+
+    // Mirror Primary Eye FOV/LOD Into Secondary Eye: moved to run IMMEDIATELY after the real
+    // engine constructor call returns for EACH eye, instead of once, late in the frame, inside
+    // begin_render_viewfamily_real. [NSF-FOV-TRANSITION] proved the engine resets +0x2d0 back to
+    // its own stock per-eye default (90.0 for the secondary/right eye) every time it constructs a
+    // new FSceneView for that eye - which happens every frame, since views are not persistent
+    // across frames. The old late-frame-only mirror therefore only won a race against this
+    // reset, intermittently - whichever ran last for a given frame determined whether the right
+    // eye's FOV/LOD was correct or not by the time shadow-caster LOD selection / CSM cascade
+    // distance math (see ShadowSetup.cpp's use of InCurrentView.LODDistanceFactor) actually read
+    // it. Capturing the left eye's values the instant ITS view is constructed, then applying them
+    // to the right eye's view the instant IT is constructed (both well before any render/shadow
+    // work starts for either eye that frame), removes this race entirely: by the time anything
+    // downstream reads these fields, they are already correct and never contested again this
+    // frame, regardless of what other stereo/shadow fixes also touch the view afterward.
+    if (!is_confirmed_non_eye_pass && result != nullptr && vr->is_native_stereo_fix_mirror_fov_enabled()) {
+        constexpr uint32_t fov_offset_a = 0x2d0;
+        constexpr uint32_t fov_offset_b = 0x2d4;
+        constexpr uint32_t fov_cache_offset_a = 0xca4;
+        constexpr uint32_t fov_cache_offset_b = 0xca8;
+        constexpr uint32_t lod_offset = 0xfd8;
+        constexpr uint32_t lod_cache_offset = 0x2b8;
+        constexpr uint32_t fields[] = {fov_offset_a, fov_offset_b, fov_cache_offset_a, fov_cache_offset_b, lod_offset, lod_cache_offset};
+
+        static std::array<uint32_t, std::size(fields)> s_left_eye_fov_lod_values{};
+        static uint64_t s_left_eye_fov_lod_frame = ~0ull;
+        static bool s_left_eye_fov_lod_valid = false;
+
+        if (true_index == 0) {
+            // Left/primary eye just constructed: snapshot its values for this frame.
+            bool all_readable = true;
+            std::array<uint32_t, std::size(fields)> captured{};
+            for (size_t i = 0; i < std::size(fields); ++i) {
+                auto* p = (const uint32_t*)((uintptr_t)result + fields[i]);
+                if (IsBadReadPtr(p, sizeof(uint32_t))) {
+                    all_readable = false;
+                    break;
+                }
+                captured[i] = *p;
+            }
+
+            if (all_readable) {
+                s_left_eye_fov_lod_values = captured;
+                s_left_eye_fov_lod_frame = g_frame_count;
+                s_left_eye_fov_lod_valid = true;
+            }
+        } else if (true_index == 1 && s_left_eye_fov_lod_valid && s_left_eye_fov_lod_frame == g_frame_count) {
+            // Right/secondary eye just constructed this SAME frame: immediately overwrite its
+            // FOV/LOD fields with the left eye's just-captured values, before anything else runs.
+            for (size_t i = 0; i < std::size(fields); ++i) {
+                auto* p = (uint32_t*)((uintptr_t)result + fields[i]);
+                if (IsBadWritePtr(p, sizeof(uint32_t))) {
+                    continue;
+                }
+                *p = s_left_eye_fov_lod_values[i];
+            }
+
+            static uint64_t s_early_mirror_samples = 0;
+            const auto sample = s_early_mirror_samples++;
+            if (sample < 10 || sample % 300 == 0) {
+                SPDLOG_INFO("[VR][NSF-MIRROR-FOV-EARLY] frame={} right_view={:x} +2d0={:.3f} +fd8={:.3f}",
+                    g_frame_count, (uintptr_t)result,
+                    *(const float*)((uintptr_t)result + fov_offset_a), *(const float*)((uintptr_t)result + lod_offset));
+            }
+        }
     }
 
     if (vr->is_native_stereo_fix_same_pass_force_primary_enabled()) {
@@ -8408,6 +10248,39 @@ void FFakeStereoRenderingHook::begin_render_viewfamily_real(
         return;
     }
 
+    // DIAG: NSF-FOV-ENTRY. Earliest possible read of +0x2d0 inside begin_render_viewfamily_real,
+    // taken on EVERY call (not just on value-change) so it can be timestamp-correlated against
+    // NSF-FOV-ORIGIN (logged immediately after sceneview_constructor returns, for the SAME frame).
+    // If this already shows the 54.432/90.000 split while NSF-FOV-ORIGIN showed 90/90 for both eyes
+    // this frame, the write happened somewhere between the two constructor calls finishing and this
+    // function being invoked (engine-side, before we get control back) - narrowing the search window
+    // without needing to hook every candidate function up front.
+    if (auto vr_entry = VR::get(); vr_entry != nullptr && vr_entry->is_diag_log_eye_frustum_diff_enabled() &&
+        view_family_candidate != nullptr && !IsBadReadPtr(view_family_candidate, sizeof(void*))) {
+        constexpr uint32_t fov_probe_offset = 0x2d0;
+        auto entry_views = view_family_candidate->get_views();
+        if (entry_views != nullptr && entry_views->count > 0 && entry_views->data[0] != nullptr) {
+            static uint64_t s_entry_samples = 0;
+            const auto sample = s_entry_samples++;
+            if (sample < 60) {
+                for (uint32_t i = 0; i < std::min<uint32_t>(entry_views->count, 2); ++i) {
+                    auto* v = entry_views->data[i];
+                    if (v == nullptr || IsBadReadPtr((const void*)((uintptr_t)v + fov_probe_offset), sizeof(float))) {
+                        continue;
+                    }
+                    const auto fov = *(const float*)((uintptr_t)v + fov_probe_offset);
+                    int32_t stereo_pass_entry = -1;
+                    if (sceneview_xref::live_stereo_pass_offset.has_value() &&
+                        !IsBadReadPtr((const void*)((uintptr_t)v + *sceneview_xref::live_stereo_pass_offset), sizeof(uint32_t))) {
+                        stereo_pass_entry = (int32_t)*(const uint32_t*)((uintptr_t)v + *sceneview_xref::live_stereo_pass_offset);
+                    }
+                    SPDLOG_WARN("[VR][NSF-FOV-ENTRY] sample={} frame={} slot_idx={} view={:x} +2d0={:.3f} stereo_pass={}",
+                        sample, g_frame_count, i, (uintptr_t)v, fov, stereo_pass_entry);
+                }
+            }
+        }
+    }
+
     // Advance the boot-phase frame-pacing tracker exactly once per real frame.
     update_boot_phase_tracking();
 
@@ -8474,6 +10347,16 @@ void FFakeStereoRenderingHook::begin_render_viewfamily_real(
             }
         }
 
+        // WuWa far-lighting eye mismatch fix: arm a one-frame refill pulse the moment the world
+        // settles after a transition (boot/loading-screen/teleport), i.e. the same falling edge that
+        // resumes Native Stereo Fix. The Cascade Lighting Volume rebuilds at exactly these moments,
+        // and only whichever eye renders first gets its far region filled otherwise.
+        if (vr->is_match_far_lighting_between_eyes_enabled() &&
+            g_hook->should_arm_far_lighting_refill_pulse(should_suspend)) {
+            g_hook->arm_far_lighting_refill_pulse();
+            SPDLOG_INFO("[VR][FAR-LIGHTING-FIX] World settled after transition, arming one-frame CLV refill pulse");
+        }
+
         if (should_suspend != vr->is_native_stereo_fix_suspended()) {
             if (vr->is_diag_verbose_logging_enabled()) {
                 SPDLOG_INFO("[VR] begin_render_viewfamily_real: {} Native Stereo Fix (tick_stalled={} no_player_controller={} no_local_pawn={} boot_phase={} world_stale={})",
@@ -8487,7 +10370,118 @@ void FFakeStereoRenderingHook::begin_render_viewfamily_real(
         }
     }
 
+    // WuWa far-lighting eye mismatch fix: consume a pending pulse (armed above on transition
+    // settle, or manually via request_far_lighting_refill()) and force r.GPUScene.UploadEveryFrame
+    // on for exactly this one frame, then restore it to 0 afterward. Leaving it on permanently
+    // freezes rendering (confirmed via testing), so it must only ever be active for a single frame.
+    {
+        static bool s_far_lighting_cvar_forced_on = false;
+
+        const bool manual_refill = vr->consume_far_lighting_refill_request();
+        if (manual_refill && vr->is_match_far_lighting_between_eyes_enabled()) {
+            g_hook->arm_far_lighting_refill_pulse();
+            SPDLOG_INFO("[VR][FAR-LIGHTING-FIX] Manual refill requested, arming one-frame CLV refill pulse");
+        }
+
+        if (vr->is_match_far_lighting_between_eyes_enabled() && g_hook->consume_far_lighting_refill_pulse()) {
+            sdk::set_cvar_int(L"Engine", L"r.GPUScene.UploadEveryFrame", 1);
+            s_far_lighting_cvar_forced_on = true;
+            SPDLOG_INFO("[VR][FAR-LIGHTING-FIX] Forcing r.GPUScene.UploadEveryFrame=1 for this frame");
+        } else if (s_far_lighting_cvar_forced_on) {
+            sdk::set_cvar_int(L"Engine", L"r.GPUScene.UploadEveryFrame", 0);
+            s_far_lighting_cvar_forced_on = false;
+            SPDLOG_INFO("[VR][FAR-LIGHTING-FIX] Restoring r.GPUScene.UploadEveryFrame=0");
+        }
+    }
+
+    // DIAG (A/B tests): while the right-eye shadow fix is active, optionally force eye-adaptation
+    // and/or TAA off, to test whether the flicker/right-eye-darkening side effect comes from per-eye
+    // history buffers (exposure or temporal AA) being accessed under the swapped view identity during
+    // Pass2. Both are independent opt-in toggles so they can be tested separately or together; each
+    // restores its cvar back to its prior forced value once the shadow fix (or the toggle) is turned
+    // off, mirroring the far-lighting pulse pattern above.
+    {
+        static bool s_eye_adaptation_forced_off = false;
+        const bool shadow_fix_active = vr->is_native_stereo_fix_right_eye_shadows_enabled();
+
+        if (vr->is_diag_disable_eye_adaptation_during_shadow_fix_enabled() && shadow_fix_active) {
+            if (!s_eye_adaptation_forced_off) {
+                sdk::set_cvar_int(L"Engine", L"r.EyeAdaptationQuality", 0);
+                s_eye_adaptation_forced_off = true;
+                SPDLOG_INFO("[VR][DIAG-AB] Forcing r.EyeAdaptationQuality=0 while shadow fix is active");
+            }
+        } else if (s_eye_adaptation_forced_off) {
+            sdk::set_cvar_int(L"Engine", L"r.EyeAdaptationQuality", 2);
+            s_eye_adaptation_forced_off = false;
+            SPDLOG_INFO("[VR][DIAG-AB] Restoring r.EyeAdaptationQuality=2");
+        }
+
+        static bool s_taa_forced_off = false;
+        if (vr->is_diag_disable_taa_during_shadow_fix_enabled() && shadow_fix_active) {
+            if (!s_taa_forced_off) {
+                sdk::set_cvar_int(L"Engine", L"r.PostProcessAAQuality", 0);
+                s_taa_forced_off = true;
+                SPDLOG_INFO("[VR][DIAG-AB] Forcing r.PostProcessAAQuality=0 while shadow fix is active");
+            }
+        } else if (s_taa_forced_off) {
+            sdk::set_cvar_int(L"Engine", L"r.PostProcessAAQuality", 4);
+            s_taa_forced_off = false;
+            SPDLOG_INFO("[VR][DIAG-AB] Restoring r.PostProcessAAQuality=4");
+        }
+    }
+
     if (!vr->is_hmd_active() || !vr->is_native_stereo_fix_enabled() || vr->should_mirror_right_eye_this_frame()) {
+        // sceneview_xref::resolve_live()/feed() are what correct FSceneViewInitOptionsBase's global
+        // family/state/stereo_pass offsets away from the (wrong, for this game) static heuristic -
+        // every other consumer of init_options->get_stereo_pass() (sceneview_constructor's eye
+        // classification, SVC-RAW-STEREO-PASS, SVC-NONEYE-PASS, etc.) depends on this having run.
+        // Previously this only happened below, after the NSF-enabled check, so SceneView/SplitScreen
+        // Compatibility used alone (NSF off) permanently read StereoPass from the wrong offset and
+        // always saw raw_stereo_pass=0 - starving eye classification and leaving the manual pose
+        // write unable to distinguish real eyes from non-eye passes. Do the same read-only
+        // family/view decode here (no scene-capture/actor side effects) so this resolves regardless
+        // of NSF state.
+        if (!sceneview_xref::resolved) {
+            struct TArrayViewViewFamilyPeek {
+                sdk::FSceneViewFamily** data;
+                uint32_t count;
+            };
+
+            try {
+                if (view_family_candidate != nullptr && !IsBadReadPtr(view_family_candidate, sizeof(void*))) {
+                    const auto peek_uses_tarrayview = sdk::FSceneViewFamily::has_vtable() && *(void**)view_family_candidate != sdk::FSceneViewFamily::get_vtable_ptr();
+                    const auto peek_ue5_view_family_array = (TArrayViewViewFamilyPeek*)view_family_candidate;
+
+                    if (!peek_uses_tarrayview ||
+                        (!IsBadReadPtr(peek_ue5_view_family_array, sizeof(TArrayViewViewFamilyPeek)) && peek_ue5_view_family_array->data != nullptr)) {
+                        sdk::FSceneViewFamily* peek_view_family = peek_uses_tarrayview ? peek_ue5_view_family_array->data[0] : view_family_candidate;
+
+                        if (peek_view_family != nullptr && !IsBadReadPtr(peek_view_family, sizeof(void*)) &&
+                            peek_view_family->get_scene_interface() != nullptr) {
+                            auto peek_views_ptr = peek_view_family->get_views();
+
+                            if (peek_views_ptr != nullptr && !IsBadReadPtr(peek_views_ptr, sizeof(*peek_views_ptr)) && peek_views_ptr->size() >= 2) {
+                                auto& peek_views = *peek_views_ptr;
+                                auto peek_view_0 = peek_views.data[0];
+                                auto peek_view_1 = peek_views.data[1];
+
+                                if (peek_view_0 != nullptr && peek_view_1 != nullptr &&
+                                    !IsBadReadPtr(peek_view_0, sizeof(void*)) && !IsBadReadPtr(peek_view_1, sizeof(void*))) {
+                                    sceneview_xref::resolve_live(peek_view_family, peek_view_0, peek_view_1);
+                                    sceneview_xref::refresh_eye_fields(peek_view_0, peek_view_1);
+                                    if (VR::get() != nullptr && VR::get()->is_diag_log_eye_frustum_diff_enabled()) {
+                                        sceneview_xref::scan_eye_matrix_regions(peek_view_0, peek_view_1);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (...) {
+                SPDLOG_WARNING_EVERY_N_SEC(2, "[VR] begin_render_viewfamily_real: exception while peeking view family for sceneview_xref resolution (NSF off)");
+            }
+        }
+
         // Mirror mode intentionally takes the same no-scene-capture path as native stereo fix
         // being disabled: no actor is spawned, and the right eye falls back to the existing
         // "mirror the left/game texture" compositing already present in D3D11Component/D3D12Component.
@@ -8538,6 +10532,17 @@ void FFakeStereoRenderingHook::begin_render_viewfamily_real(
         g_last_real_stereo_view_family.store(view_family, std::memory_order_relaxed);
     }
     const auto prev_count = views.count;
+
+    // DIAG (ISR-REENABLE): With vr.InstancedStereo left ON, log what the engine naturally hands
+    // us here BEFORE any of the manual views.count=1 splitting below runs. If ISR is actually
+    // active, we'd expect to see views.count>=2 with both views.data[0]/[1] valid simultaneously
+    // on every frame, in a single FSceneRenderer::Render() call - i.e. the engine already giving
+    // us true native dual-eye rendering for free, with no need for the two-pass serialization.
+    SPDLOG_INFO_EVERY_N_SEC(2,
+        "[VR][NSF-ISR-DIAG] begin_render_viewfamily_real pre-split: views.count={} view0={:x} view1={:x}",
+        views.count,
+        views.count >= 1 ? (uintptr_t)views.data[0] : 0,
+        views.count >= 2 ? (uintptr_t)views.data[1] : 0);
 
     const auto rt = rtm->get_scene_capture_utexture();
     const auto rtrsrc = rt != nullptr ? (sdk::FTextureRenderTargetResource*)rt->get_resource() : nullptr;
@@ -8704,6 +10709,11 @@ void FFakeStereoRenderingHook::begin_render_viewfamily_real(
         // The initial eye_fields snapshot above can go stale once real gameplay starts (see comment
         // on refresh_eye_fields); keep it in sync with live gameplay views on a throttled cadence.
         sceneview_xref::refresh_eye_fields(view_0, view_1);
+
+        if (vr->is_diag_log_eye_frustum_diff_enabled()) {
+            sceneview_xref::scan_eye_matrix_regions(view_0, view_1);
+            sceneview_xref::scan_culling_region_raw(view_0, view_1, (uint32_t)g_frame_count);
+        }
 
         if (vr->diag_nsf_eye_view_dump()) {
             constexpr size_t VIEW_DUMP_SIZE = 0x1000;
@@ -8882,7 +10892,16 @@ void FFakeStereoRenderingHook::begin_render_viewfamily_real(
             }
         }
     }
+
+    if (vr->is_diag_log_shadow_pathway_identity_enabled() && views.data[0] != nullptr && views.data[1] != nullptr) {
+        sceneview_xref::log_shadow_pathway_identity("before-pass1-submit", views.data[0], views.data[1]);
+        sceneview_xref::log_kuro_shadow_subsystem_state("before-pass1-submit");
+    }
     g_hook->m_render_module_begin_render_viewfamily_hook.unsafe_call<void>(render_module, canvas, view_family_candidate);
+    if (vr->is_diag_log_shadow_pathway_identity_enabled() && views.data[0] != nullptr && views.data[1] != nullptr) {
+        sceneview_xref::log_shadow_pathway_identity("after-pass1-submit", views.data[0], views.data[1]);
+        sceneview_xref::log_kuro_shadow_subsystem_state("after-pass1-submit");
+    }
 
     if (wants_swap) {
         // Swap out the existing render target for our custom one
@@ -8890,6 +10909,11 @@ void FFakeStereoRenderingHook::begin_render_viewfamily_real(
         // instead of "just" re-using the existing one is that doing that causes a 90% FPS drop
         // because the engine is still working on the old render target
         const auto original_target = view_family_target;
+
+        if (vr->is_diag_nsf_pass2_pipeline_trace_enabled()) {
+            SPDLOG_INFO("[VR][DIAG][NSF-PIPELINE] frame={} render_target swap: original={:x} -> new={:x}",
+                g_frame_count, (uintptr_t)original_target, (uintptr_t)rtfrt);
+        }
 
         view_family->set_render_target(rtfrt);
 
@@ -8932,6 +10956,12 @@ void FFakeStereoRenderingHook::begin_render_viewfamily_real(
                 scene->decrement_frame_count();
                 break;
             }
+            if (vr->is_diag_nsf_pass2_pipeline_trace_enabled()) {
+                static const char* const pipeline_mode_names[] = {"Decrement", "None", "Increment"};
+                const auto pipeline_mode_name = (mutation_mode >= 0 && mutation_mode <= 2) ? pipeline_mode_names[mutation_mode] : "Unknown";
+                SPDLOG_INFO("[VR][DIAG][NSF-PIPELINE] frame={} scene frame_count mutation: mode={} pre={} post={}",
+                    g_frame_count, pipeline_mode_name, pre_mutation_frame_count, scene->get_frame_count());
+            }
             if (vr->is_diag_sync_pose_verbose_logging_enabled()) {
                 static const char* const mode_names[] = {"Decrement", "None", "Increment"};
                 const auto mode_name = (mutation_mode >= 0 && mutation_mode <= 2) ? mode_names[mutation_mode] : "Unknown";
@@ -8942,6 +10972,11 @@ void FFakeStereoRenderingHook::begin_render_viewfamily_real(
                     "[NSF-ANIM-DIAG] Pass2 scene frame_count mutation: mode={} pre={} post={} g_frame_count={} t_us={}", mode_name,
                     pre_mutation_frame_count, scene->get_frame_count(), g_frame_count, now_us);
             }
+        }
+
+        if (vr->is_diag_nsf_pass2_pipeline_trace_enabled()) {
+            SPDLOG_INFO("[VR][DIAG][NSF-PIPELINE] frame={} views swap: views[0]={:x} <-> views[1]={:x}",
+                g_frame_count, (uintptr_t)views[0], (uintptr_t)views[1]);
         }
 
         std::swap(views[0], views[1]);
@@ -8966,6 +11001,45 @@ void FFakeStereoRenderingHook::begin_render_viewfamily_real(
             }
         }
 
+        // DIAG: NSF-FOV-TRANSITION. +0x2d0 is 90.0 for BOTH eyes immediately after construction
+        // (confirmed via NSF-FOV-ORIGIN), yet later observed as 75.0/90.0 split by frame-diff
+        // sampling. Since nothing in this codebase currently writes +0x2d0/+0xca4 (that attempt was
+        // reverted), the 75.0 must come from an ENGINE call that updates one eye's view post-
+        // construction but not the other's - most likely the per-frame camera/FMinimalViewInfo FOV
+        // push for the one real ULocalPlayer view, which this NSF duplicate-view setup never mirrors
+        // to the second eye. Track +0x2d0 per view POINTER across calls and log the exact transition
+        // (which pointer, which eye slot, old->new) the first few times it happens, to find which
+        // frame/call this update lands on relative to our own hooks.
+        if (vr->is_diag_log_eye_frustum_diff_enabled()) {
+            constexpr uint32_t fov_probe_offset = 0x2d0;
+            static std::unordered_map<void*, float> s_last_fov_by_view;
+            static uint64_t s_fov_transition_samples = 0;
+
+            auto check_fov_transition = [&](sdk::FSceneView* v, const char* slot) {
+                if (v == nullptr || IsBadReadPtr((const void*)((uintptr_t)v + fov_probe_offset), sizeof(float))) {
+                    return;
+                }
+                const auto current = *(const float*)((uintptr_t)v + fov_probe_offset);
+                auto it = s_last_fov_by_view.find((void*)v);
+                if (it != s_last_fov_by_view.end() && it->second != current) {
+                    const auto sample = s_fov_transition_samples++;
+                    if (sample < 40) {
+                        int32_t stereo_pass_at_transition = -1;
+                        if (sceneview_xref::live_stereo_pass_offset.has_value() &&
+                            !IsBadReadPtr((const void*)((uintptr_t)v + *sceneview_xref::live_stereo_pass_offset), sizeof(uint32_t))) {
+                            stereo_pass_at_transition = (int32_t)*(const uint32_t*)((uintptr_t)v + *sceneview_xref::live_stereo_pass_offset);
+                        }
+                        SPDLOG_WARN("[VR][NSF-FOV-TRANSITION] sample={} frame={} slot={} view={:x} +2d0 {:.3f} -> {:.3f} stereo_pass={}",
+                            sample, g_frame_count, slot, (uintptr_t)v, it->second, current, stereo_pass_at_transition);
+                    }
+                }
+                s_last_fov_by_view[(void*)v] = current;
+            };
+
+            check_fov_transition(views.data[0], "pass2_right_pre_swap");
+            check_fov_transition(views.data[1], "pass1_left");
+        }
+
         // Call it again
         // Right Eye Shadow Fix: the right-eye view was constructed as the SECONDARY eye. Whole-scene
         // shadow setup only runs for the shadow-owning (primary) view; secondaries are expected to
@@ -8976,11 +11050,143 @@ void FFakeStereoRenderingHook::begin_render_viewfamily_real(
         // and its cached copy must be flipped for the engine to honor it.
         auto pass2_view = views.data[0];
         auto pass1_view = views.data[1];
+
+        // DIAG: NSF-ADDR-REUSE. FSceneView objects are transient and reallocated by the engine's own
+        // allocator; if a freed FSceneView's address gets reused for the OPPOSITE eye role within a
+        // small number of frames, a late/deferred restore write targeting the old role could land on
+        // the new view instead - a candidate mechanism for the reported left/right alternating
+        // darkness flicker (as opposed to a persistently-dark single eye). Track the last-seen eye
+        // role (0=pass1/left, 1=pass2/right) for each recently-seen view address and flag the first
+        // N frames where an address flips role, so this can be correlated against the flicker without
+        // yet proving causality.
+        if (vr->is_diag_verbose_logging_enabled() && pass1_view != nullptr && pass2_view != nullptr) {
+            static std::unordered_map<void*, std::pair<int, uint64_t>> s_last_role_by_addr; // addr -> (role, frame)
+            static uint64_t s_addr_reuse_flip_samples = 0;
+            constexpr uint64_t addr_reuse_recent_frame_window = 120;
+
+            auto check_role_flip = [&](sdk::FSceneView* v, int role, const char* slot) {
+                if (v == nullptr) {
+                    return;
+                }
+                auto it = s_last_role_by_addr.find((void*)v);
+                if (it != s_last_role_by_addr.end()) {
+                    const auto& [last_role, last_frame] = it->second;
+                    if (last_role != role && (g_frame_count - last_frame) <= addr_reuse_recent_frame_window) {
+                        const auto sample = s_addr_reuse_flip_samples++;
+                        if (sample < 40 || sample % 200 == 0) {
+                            SPDLOG_WARN("[VR][DIAG][NSF-ADDR-REUSE] sample={} frame={} slot={} view={:x} role flipped {}->{} within {} frames (last_frame={})",
+                                sample, g_frame_count, slot, (uintptr_t)v, last_role, role, g_frame_count - last_frame, last_frame);
+                        }
+                    }
+                }
+                s_last_role_by_addr[(void*)v] = {role, g_frame_count};
+            };
+
+            check_role_flip(pass1_view, 0, "pass1_left");
+            check_role_flip(pass2_view, 1, "pass2_right");
+
+            // Bound the map so it doesn't grow unboundedly over a long session.
+            if (s_last_role_by_addr.size() > 4096) {
+                s_last_role_by_addr.clear();
+            }
+        }
+
+        // DIAG: NSF-VIEWSTATE-IDENTITY. The shadow fix flips StereoPass-identity fields on the
+        // right (pass2) view so the engine treats it as belonging to the same "shadow owning"
+        // group as the left (pass1) view, but each FSceneView also carries its own
+        // scene_view_state pointer (FSceneViewStateInterface*), which is what Unreal keys
+        // per-view auto-exposure/eye-adaptation and TAA/temporal history off of. If pass1 and
+        // pass2 have DIFFERENT scene_view_state pointers, each eye computes/accumulates its own
+        // independent exposure history even after the StereoPass identity fields are flipped,
+        // which would explain the right eye staying darker (menu: via the NSF scene-capture's own
+        // view state; gameplay: via the native secondary view's own state) despite the shadow fix
+        // otherwise working. Logged once per transition (pointer-pair change) to avoid spam.
+        {
+            static std::pair<void*, void*> s_last_viewstate_pair{};
+            if (pass1_view != nullptr && pass2_view != nullptr) {
+                auto init_options_pass1_vs = (sdk::FSceneViewInitOptions*)((uintptr_t)pass1_view + INIT_OPTIONS_OFFSET);
+                auto init_options_pass2_vs = (sdk::FSceneViewInitOptions*)((uintptr_t)pass2_view + INIT_OPTIONS_OFFSET);
+                const auto pass1_state = (void*)init_options_pass1_vs->scene_view_state;
+                const auto pass2_state = (void*)init_options_pass2_vs->scene_view_state;
+                const auto current_pair = std::make_pair(pass1_state, pass2_state);
+
+                if (current_pair != s_last_viewstate_pair) {
+                    SPDLOG_INFO("[VR][DIAG][NSF-VIEWSTATE-IDENTITY] frame={} pass1_view={:x} pass1_scene_view_state={:x} | pass2_view={:x} pass2_scene_view_state={:x} SAME_STATE={}",
+                        g_frame_count, (uintptr_t)pass1_view, (uintptr_t)pass1_state,
+                        (uintptr_t)pass2_view, (uintptr_t)pass2_state, pass1_state == pass2_state);
+                    s_last_viewstate_pair = current_pair;
+                }
+            }
+        }
+
         std::vector<std::pair<uint32_t*, uint32_t>> pass2_restore{};
         uint32_t* traced_eye_field = nullptr;
         uint32_t* traced_stereo_pass = nullptr;
         uint32_t traced_eye_field_original_value = 0;
         uint32_t traced_eye_field_replacement_value = 0;
+
+        // DIAG (widened watchpoint scope): previously these watchpoints were armed only around the
+        // single nested Pass2 BeginRenderViewFamily call, and found exactly one write (not a read)
+        // to +0xC90 at a fixed call site, every frame, with the field unchanged across the call.
+        // That rules out anything reading +0xC90 DURING that narrow window, but not elsewhere in the
+        // frame (e.g. before Pass2 starts, during Pass1, or after Pass2 returns but before present).
+        // Widen the window to span from here (right after pass2_view is resolved) through the end of
+        // this whole NSF right-eye-shadow-fix block, covering our own write, the nested render call,
+        // and our restore. Also watch +0x164 (the "view index / eye identity" field logged alongside
+        // StereoPass in SHADOW-PATHWAY-IDENTITY) in a second slot, since that may be what exposure/
+        // post-process systems actually key off instead of the raw StereoPass enum.
+        std::optional<sceneview_xref::ScopedWatchpointTracer> c90_tracer_wide{};
+        std::optional<sceneview_xref::ScopedWatchpointTracer> field164_tracer_wide{};
+        if (vr->is_diag_watchpoint_trace_c90_enabled() && pass2_view != nullptr) {
+            c90_tracer_wide.emplace((void*)((uintptr_t)pass2_view + 0xC90), 0, "WIDE-StereoPass+0xC90");
+            field164_tracer_wide.emplace((void*)((uintptr_t)pass2_view + 0x164), 1, "WIDE-Field+0x164");
+        }
+
+        // DIAG: before/after window snapshot around our own shadow-fix write loop. The write loop
+        // only ever touches the specific dwords named by sceneview_xref::eye_fields, but the right
+        // eye still renders visibly darker/flickery after the StereoPass identity swap even with
+        // +0xCA4 left untouched (confirmed by direct A/B test - reverting +0xCA4 made no difference
+        // to the darkening). Since we have no static-analysis tooling (no Ghidra) available, capture
+        // the raw +0xC00-+0xE00 window immediately before and after our own writes execute, for both
+        // eyes, so any OTHER field the engine (or our own code elsewhere) updates as a side effect of
+        // seeing the changed StereoPass/primary-view identity - not just the fields we explicitly
+        // wrote - shows up here for the next log capture.
+        constexpr uint32_t sidefx_window_start = 0xC00;
+        constexpr uint32_t sidefx_window_size = 0x200;
+        constexpr size_t sidefx_window_dwords = sidefx_window_size / sizeof(uint32_t);
+        std::array<uint32_t, sidefx_window_dwords> sidefx_pre_left{};
+        std::array<uint32_t, sidefx_window_dwords> sidefx_pre_right{};
+        bool sidefx_window_readable = false;
+
+        if (vr->is_native_stereo_fix_right_eye_shadows_enabled() && pass2_view != nullptr && pass1_view != nullptr && nsf_pass2_hacks_safe_this_frame) {
+            if (!IsBadReadPtr((void*)((uintptr_t)pass1_view + sidefx_window_start), sidefx_window_size) &&
+                !IsBadReadPtr((void*)((uintptr_t)pass2_view + sidefx_window_start), sidefx_window_size)) {
+                memcpy(sidefx_pre_left.data(), (void*)((uintptr_t)pass1_view + sidefx_window_start), sidefx_window_size);
+                memcpy(sidefx_pre_right.data(), (void*)((uintptr_t)pass2_view + sidefx_window_start), sidefx_window_size);
+                sidefx_window_readable = true;
+            }
+        }
+
+        // DIAG: burst-capture the live field state BEFORE this frame's write loop runs, i.e.
+        // exactly as the engine (or last frame's restore) left it. The capture further below only
+        // showed the state immediately AFTER our own write - which trivially always matches what
+        // we just wrote and says nothing about whether the restore from the previous frame actually
+        // took hold, or whether the engine itself already changed the value before we got here.
+        if (vr->diag_nsf_flicker_burst_capture() && pass1_view != nullptr && pass2_view != nullptr &&
+            !IsBadReadPtr(pass1_view, 0x1000) && !IsBadReadPtr(pass2_view, 0x1000)) {
+            std::string fields_str{};
+            for (const auto& f : sceneview_xref::eye_fields) {
+                auto* p_left = (const uint32_t*)((uintptr_t)pass1_view + f.offset);
+                auto* p_right = (const uint32_t*)((uintptr_t)pass2_view + f.offset);
+                uint32_t live_left = 0, live_right = 0;
+                if (!IsBadReadPtr(p_left, sizeof(uint32_t)) && !IsBadReadPtr(p_right, sizeof(uint32_t))) {
+                    live_left = *p_left;
+                    live_right = *p_right;
+                }
+                fields_str += fmt::format("F{}={:x}:{}->{} ", f.id, f.offset, live_left, live_right);
+            }
+            SPDLOG_INFO("[VR][DIAG][NSF-FLICKER-BURST-PRE] frame={} live_fields(pre-write): {}", g_frame_count, fields_str);
+        }
 
         if (vr->is_native_stereo_fix_right_eye_shadows_enabled() && pass2_view != nullptr && pass1_view != nullptr && nsf_pass2_hacks_safe_this_frame) {
             const auto& fields = sceneview_xref::eye_fields;
@@ -9009,8 +11215,9 @@ void FFakeStereoRenderingHook::begin_render_viewfamily_real(
                     auto p_right = (uint32_t*)((uintptr_t)pass2_view + f.offset);
                     auto p_left = (uint32_t*)((uintptr_t)pass1_view + f.offset);
                     if (f.offset + sizeof(uint32_t) > 0x1000 ||
-                        IsBadReadPtr(p_right, sizeof(uint32_t)) || IsBadReadPtr(p_left, sizeof(uint32_t))) {
-                        SPDLOG_WARN("[VR] NSF right-eye shadow fix: skipping unreadable eye field F{} at +{:x}", f.id, f.offset);
+                        IsBadReadPtr(p_right, sizeof(uint32_t)) || IsBadReadPtr(p_left, sizeof(uint32_t)) ||
+                        IsBadWritePtr(p_right, sizeof(uint32_t))) {
+                        SPDLOG_WARN("[VR] NSF right-eye shadow fix: skipping unreadable/unwritable eye field F{} at +{:x}", f.id, f.offset);
                         continue;
                     }
                     if ((f.offset % 8) == 0 &&
@@ -9095,10 +11302,60 @@ void FFakeStereoRenderingHook::begin_render_viewfamily_real(
                     }
                 }
 
+                // REVERTED: a +0xCA4 FOV-like write (left=75.0 -> right) was tried here to address
+                // right-eye darkening/flicker alongside the F6 StereoPass fix, but it correlated with
+                // a crash during level load (null deref inside nvwgf2umx.dll while heavy scene-capture
+                // churn/throttling was occurring). +0xCA4 is very likely a real FOV scalar consumed by
+                // the projection/culling matrix build; writing it without also recomputing the
+                // dependent projection matrix can leave the view in an inconsistent state. Do not
+                // re-add this without also locating and syncing whatever derived matrix/state depends
+                // on it.
+
                 SPDLOG_INFO_EVERY_N_SEC(2, "[VR] NSF right-eye shadow fix: view={:x} flipped {}/{} eye fields live from pass1={:x} (mask={:x})",
                     (uintptr_t)pass2_view, pass2_restore.size(), fields.size(), (uintptr_t)pass1_view, mask);
             } else {
                 SPDLOG_INFO_EVERY_N_SEC(2, "[VR] NSF right-eye shadow fix: eye fields not yet resolved by sceneview_xref (view={:x})", (uintptr_t)pass2_view);
+            }
+        }
+
+        // DIAG: after our write loop above, diff the same +0xC00-+0xE00 window to find anything that
+        // moved that we did NOT explicitly write (pass2_restore only records what WE wrote - this
+        // catches engine-side reactions to the identity swap, e.g. something recomputed off
+        // StereoPass/IsPrimaryView within the same tick). Logged sparsely since it only needs a
+        // handful of samples to be useful.
+        if (sidefx_window_readable) {
+            static uint64_t sidefx_samples = 0;
+            if (!IsBadReadPtr((void*)((uintptr_t)pass1_view + sidefx_window_start), sidefx_window_size) &&
+                !IsBadReadPtr((void*)((uintptr_t)pass2_view + sidefx_window_start), sidefx_window_size)) {
+                std::array<uint32_t, sidefx_window_dwords> post_left{};
+                std::array<uint32_t, sidefx_window_dwords> post_right{};
+                memcpy(post_left.data(), (void*)((uintptr_t)pass1_view + sidefx_window_start), sidefx_window_size);
+                memcpy(post_right.data(), (void*)((uintptr_t)pass2_view + sidefx_window_start), sidefx_window_size);
+
+                std::unordered_set<uint32_t> written_offsets{};
+                for (const auto& [p, v] : pass2_restore) {
+                    written_offsets.insert((uint32_t)((uintptr_t)p - (uintptr_t)pass2_view));
+                }
+
+                std::string unexpected_left{};
+                std::string unexpected_right{};
+                for (size_t i = 0; i < sidefx_window_dwords; ++i) {
+                    const auto offset = sidefx_window_start + (uint32_t)(i * sizeof(uint32_t));
+                    if (post_left[i] != sidefx_pre_left[i] && written_offsets.find(offset) == written_offsets.end()) {
+                        unexpected_left += fmt::format(" {:03x}:{:08x}->{:08x}", offset, sidefx_pre_left[i], post_left[i]);
+                    }
+                    if (post_right[i] != sidefx_pre_right[i] && written_offsets.find(offset) == written_offsets.end()) {
+                        unexpected_right += fmt::format(" {:03x}:{:08x}->{:08x}", offset, sidefx_pre_right[i], post_right[i]);
+                    }
+                }
+
+                if (!unexpected_left.empty() || !unexpected_right.empty()) {
+                    const auto sample = sidefx_samples++;
+                    if (sample < 30 || sample % 90 == 0) {
+                        SPDLOG_INFO("[VR][NSF-SHADOWFIX-SIDEFX] sample={} frame={} unexpected changes NOT written by us - L:{} R:{}",
+                            sample, g_frame_count, unexpected_left.empty() ? " none" : unexpected_left, unexpected_right.empty() ? " none" : unexpected_right);
+                    }
+                }
             }
         }
 
@@ -9124,6 +11381,11 @@ void FFakeStereoRenderingHook::begin_render_viewfamily_real(
                 pass2_state_saved = *pass2_state_slot;
                 *pass2_state_slot = nullptr;
 
+                if (vr->is_diag_nsf_pass2_pipeline_trace_enabled()) {
+                    SPDLOG_INFO("[VR][DIAG][NSF-PIPELINE] frame={} pass2 view_state nulled: slot={:x} saved={:x} forced_reset={}",
+                        g_frame_count, (uintptr_t)pass2_state_slot, (uintptr_t)pass2_state_saved, nsf_force_reset_pass2_state_this_frame);
+                }
+
                 if (nsf_force_reset_pass2_state_this_frame) {
                     SPDLOG_INFO("[VR] NSF: forcing Pass2 view state reset this frame due to detected camera cut/refocus");
                 }
@@ -9148,6 +11410,7 @@ void FFakeStereoRenderingHook::begin_render_viewfamily_real(
                 std::array<uint32_t, VIEW_SPAN> prev_left{}, prev_right{};
                 std::array<uint32_t, FAMILY_SPAN> prev_family{};
                 std::array<uint32_t, VIEW_SPAN> view_changes{}, view_eye_equal{};
+                std::array<uint32_t, VIEW_SPAN> left_changes{}, right_changes{};
                 std::array<uint32_t, FAMILY_SPAN> family_changes{};
             };
             static std::unique_ptr<Diff> d{};
@@ -9160,6 +11423,8 @@ void FFakeStereoRenderingHook::begin_render_viewfamily_real(
             if (d->frames > 0) {
                 for (size_t i = 0; i < VIEW_SPAN; ++i) {
                     if (left[i] != d->prev_left[i] && right[i] != d->prev_right[i]) d->view_changes[i]++;
+                    if (left[i] != d->prev_left[i]) d->left_changes[i]++;
+                    if (right[i] != d->prev_right[i]) d->right_changes[i]++;
                     if (left[i] == right[i]) d->view_eye_equal[i]++;
                 }
                 for (size_t i = 0; i < FAMILY_SPAN; ++i) {
@@ -9201,9 +11466,70 @@ void FFakeStereoRenderingHook::begin_render_viewfamily_real(
                     }
                 }
 
+                // DIAG: 3.7 added On-character Lighting Templates + Environmental Settings (time,
+                // weather, atmosphere density, foliage wind). These are plausible candidates for NEW
+                // per-view lighting/shadow config fields that didn't exist (or weren't yet populated
+                // this early) in the version the shadow fix was originally tuned against. Unlike
+                // matrices (change every frame, differ per eye) and the StereoPass-style enums already
+                // tracked in eye_fields (rarely vary at all), a per-eye LIGHTING config value should be
+                // STABLE across frames (same scene = same lighting setup) while still consistently
+                // DIFFERENT between left/right - exactly the gap the existing two NSF-DIFF categories
+                // don't cover. Report candidates here: changed in <10% of frames (stable) for BOTH
+                // eyes individually, yet disagree between eyes on the most recent sample.
+                SPDLOG_INFO("[NSF-DIFF] FSceneView dwords STABLE per-eye (rarely change) but DIFFERENT between eyes right now (candidates for per-eye lighting/shadow config, e.g. 3.7 lighting templates):");
+                for (size_t i = 0; i < VIEW_SPAN; ++i) {
+                    if (d->left_changes[i] <= n / 10 && d->right_changes[i] <= n / 10 && left[i] != right[i]) {
+                        SPDLOG_INFO("[NSF-DIFF]   view+{:04x}: L u32={} f32={:.6f}  R u32={} f32={:.6f}  (L_changes={} R_changes={}/{})",
+                            i * 4, left[i], *(const float*)&left[i], right[i], *(const float*)&right[i], d->left_changes[i], d->right_changes[i], n);
+                    }
+                }
+
                 SPDLOG_INFO("[NSF-DIFF] ---- done ----");
                 d.reset();
                 vr->diag_nsf_frame_diff_logger() = false;
+            }
+        }
+
+        // Mirror Primary Eye FOV/LOD Into Secondary Eye - SAFETY NET pass. The primary application
+        // of this fix now happens immediately after each eye's FSceneView constructor returns (see
+        // the early mirror block in sceneview_constructor, logged as [NSF-MIRROR-FOV-EARLY]), which
+        // closes the race where the engine's own per-construction default (90.0 FOV / 1.0 LOD for
+        // the secondary eye) would otherwise stomp a late, once-per-frame mirror before shadow-
+        // caster LOD selection / CSM cascade-distance math ever read it. This late-frame pass is
+        // kept as a defensive re-assert in case anything between construction and submission (same-
+        // pass manipulation, another fix, an engine callback) touches these fields again; it should
+        // normally be a no-op confirming the early mirror already stuck.
+        if (vr->is_native_stereo_fix_mirror_fov_enabled() && pass2_view != nullptr && pass1_view != nullptr && nsf_pass2_hacks_safe_this_frame) {
+            constexpr uint32_t fov_offset_a = 0x2d0;
+            constexpr uint32_t fov_offset_b = 0x2d4;
+            constexpr uint32_t fov_cache_offset_a = 0xca4;
+            constexpr uint32_t fov_cache_offset_b = 0xca8;
+            constexpr uint32_t lod_offset = 0xfd8;
+            constexpr uint32_t lod_cache_offset = 0x2b8;
+
+            auto mirror_dword = [&](uint32_t offset) {
+                auto src = (uint32_t*)((uintptr_t)pass1_view + offset);
+                auto dst = (uint32_t*)((uintptr_t)pass2_view + offset);
+                if (IsBadReadPtr(src, sizeof(uint32_t)) || IsBadWritePtr(dst, sizeof(uint32_t))) {
+                    SPDLOG_WARN("[VR] NSF mirror-FOV: skipping unreadable/unwritable field at +{:x}", offset);
+                    return;
+                }
+                *dst = *src;
+            };
+
+            mirror_dword(fov_offset_a);
+            mirror_dword(fov_offset_b);
+            mirror_dword(fov_cache_offset_a);
+            mirror_dword(fov_cache_offset_b);
+            mirror_dword(lod_offset);
+            mirror_dword(lod_cache_offset);
+
+            static uint64_t s_mirror_fov_samples = 0;
+            const auto sample = s_mirror_fov_samples++;
+            if (sample < 10 || sample % 300 == 0) {
+                SPDLOG_INFO("[VR][NSF-MIRROR-FOV-LATE] frame={} pass1_view={:x} pass2_view={:x} +2d0={:.3f} +fd8={:.3f}",
+                    g_frame_count, (uintptr_t)pass1_view, (uintptr_t)pass2_view,
+                    *(const float*)((uintptr_t)pass1_view + fov_offset_a), *(const float*)((uintptr_t)pass1_view + lod_offset));
             }
         }
 
@@ -9215,8 +11541,171 @@ void FFakeStereoRenderingHook::begin_render_viewfamily_real(
         // clears once per-frame cost normalizes. Logged only when notably slower than a rolling
         // baseline to avoid spamming on ordinary frame-to-frame jitter.
         const auto pass2_render_start = std::chrono::steady_clock::now();
+        if (vr->is_diag_log_shadow_pathway_identity_enabled() && pass1_view != nullptr && pass2_view != nullptr) {
+            sceneview_xref::log_shadow_pathway_identity("before-pass2-submit", pass1_view, pass2_view);
+            sceneview_xref::log_kuro_shadow_subsystem_state("before-pass2-submit");
+        }
+
+        // Precise right-eye shadow fix: scoped strictly around this single render call, restored
+        // immediately after. See sceneview_xref::apply_precise_shadow_fix for details/safety checks.
+        //
+        // DIAGNOSTIC (per-friend hypothesis: flicker/darkness if the write isn't applied EVERY
+        // frame, or only one of the two fields changes): count and periodically log how often this
+        // path is (a) gated off entirely by the safety guard, (b) attempted but silently bailed out
+        // inside apply_precise_shadow_fix (fields not == 3, predicate bytes invalid, bad ptr, etc.),
+        // or (c) actually applied (both fields written). If (a) or (b) happen on a non-trivial
+        // fraction of frames, the right eye is flickering between its real StereoPass (3, "half-
+        // primary") and our forced value every time the write is skipped - which matches the
+        // described symptom exactly.
+        static uint64_t s_precise_fix_attempted = 0, s_precise_fix_applied = 0, s_precise_fix_gated = 0;
+        std::vector<std::pair<uint32_t*, uint32_t>> precise_shadow_fix_restore{};
+        if (vr->is_native_stereo_fix_right_eye_shadows_precise_enabled() && pass2_view != nullptr) {
+            if (!nsf_pass2_hacks_safe_this_frame) {
+                ++s_precise_fix_gated;
+            } else {
+                ++s_precise_fix_attempted;
+                const uint32_t target_value = vr->is_native_stereo_fix_right_eye_shadows_precise_mirror_left_enabled() ? 2 : 0;
+                precise_shadow_fix_restore = sceneview_xref::apply_precise_shadow_fix(pass2_view, target_value);
+                if (precise_shadow_fix_restore.size() == 2) {
+                    ++s_precise_fix_applied;
+                }
+            }
+
+            SPDLOG_INFO_EVERY_N_SEC(5, "[VR][NSF-C90-PRECISE] frame accounting: attempted={} applied={} gated_unsafe={} "
+                "(applied-rate={:.1f}% of attempted)", s_precise_fix_attempted, s_precise_fix_applied, s_precise_fix_gated,
+                s_precise_fix_attempted > 0 ? (100.0 * s_precise_fix_applied / s_precise_fix_attempted) : 0.0);
+
+            // Decisive structural check: is pass2_view even in the same FSceneViewFamily::Views
+            // array as pass1_view, and if so, is it forward-adjacent? This directly answers whether
+            // the engine's own CSM fade-alpha propagation can ever reach the right eye at all,
+            // independent of whether our StereoPass/predicate value is correct.
+            if (vr->is_diag_log_shadow_pathway_identity_enabled()) {
+                sceneview_xref::log_cascade_adjacency_diagnostic("after-precise-fix-applied", pass1_view, pass2_view);
+            }
+
+            // Pure-observation install: counts how many views the engine's REAL primary-view
+            // predicate evaluates true for per frame while our raw +0xC90/+0x1A0 write is active.
+            // CONFIRMED: CSM Transition Scale has ZERO effect on the flicker, and the flicker does
+            // NOT occur with the shadow fix off - so this is not CSM-transition-dither accumulation
+            // specifically, but the fix (forcing pass2 "primary") is still the proven trigger. This
+            // hook answers the more general question first: does our write cause the engine to see
+            // TWO primary views in the same frame at all? If yes, that's still the likely root
+            // mechanism (some other once/frame primary-gated system - exposure metering, volumetrics,
+            // post-process, etc. - just not CSM specifically) and narrows where to look next. If no,
+            // the cause is something else entirely (e.g. render-thread timing) and this rules out the
+            // whole "double primary view" theory in one shot.
+            if (!vr->is_native_stereo_fix_right_eye_shadows_predicate_hook_enabled()) {
+                sceneview_xref::install_primary_view_observer_hook();
+                // DIAG: the single-RVA observer above produced zero calls in a full session -
+                // the hooked address is byte-signature-valid but never actually invoked (likely
+                // ICF-folded away from the real call site). Scan the whole module for every
+                // byte-identical instance and hook them all so we can see which one(s), if any,
+                // actually get called.
+                sceneview_xref::install_primary_view_observer_all_instances();
+            }
+        }
+
+
+        // around this game-thread-only call and restoring after, hook the primary-view predicate
+        // function itself (see sceneview_xref::install_precise_shadow_fix_predicate_hook) so it
+        // answers true for the right eye's real StereoPass (3) on whichever thread calls it. This
+        // never touches the view's memory at all, so there is no restore and no race window.
+        // Mutually exclusive with the memory-patch precise fix above - enable one or the other.
+        if (vr->is_native_stereo_fix_right_eye_shadows_predicate_hook_enabled()) {
+            sceneview_xref::install_precise_shadow_fix_predicate_hook();
+        }
+
+
+        // DIAG (read-site logging): capture the live +0xC90/+0x1A0 values on pass2_view
+        // immediately before and after the actual nested engine render call, to see whether the
+        // engine itself mutates these fields during the call (as opposed to only our own
+        // write/restore pair around it). If the post-call value differs from what we just wrote
+        // (target_value), the engine - not our restore - is the one changing it mid-render, which
+        // would explain flicker even though our write/restore bookkeeping looks consistent.
+        uint32_t pass2_c90_before = 0, pass2_1a0_before = 0, pass2_c90_after = 0, pass2_1a0_after = 0;
+        bool pass2_fields_readable = false;
+        if (pass2_view != nullptr) {
+            auto* p_pass = (const uint32_t*)((uintptr_t)pass2_view + 0xC90);
+            auto* p_cache = (const uint32_t*)((uintptr_t)pass2_view + 0x1A0);
+            if (!IsBadReadPtr(p_pass, sizeof(*p_pass)) && !IsBadReadPtr(p_cache, sizeof(*p_cache))) {
+                pass2_fields_readable = true;
+                pass2_c90_before = *p_pass;
+                pass2_1a0_before = *p_cache;
+            }
+        }
+
         g_hook->m_render_module_begin_render_viewfamily_hook.unsafe_call<void>(render_module, canvas, view_family_candidate);
         const auto pass2_render_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - pass2_render_start).count();
+
+        if (pass2_fields_readable && pass2_view != nullptr) {
+            auto* p_pass = (const uint32_t*)((uintptr_t)pass2_view + 0xC90);
+            auto* p_cache = (const uint32_t*)((uintptr_t)pass2_view + 0x1A0);
+            if (!IsBadReadPtr(p_pass, sizeof(*p_pass)) && !IsBadReadPtr(p_cache, sizeof(*p_cache))) {
+                pass2_c90_after = *p_pass;
+                pass2_1a0_after = *p_cache;
+
+                static uint64_t s_readsite_samples = 0;
+                const auto sample = s_readsite_samples++;
+                const bool changed_during_call = pass2_c90_before != pass2_c90_after || pass2_1a0_before != pass2_1a0_after;
+                if (sample < 20 || sample % 300 == 0 || changed_during_call) {
+                    SPDLOG_INFO("[VR][NSF-C90-READSITE] frame={} pass2_view={:x} c90 before={} after={} | 1a0 before={} after={}{}",
+                        g_frame_count, (uintptr_t)pass2_view, pass2_c90_before, pass2_c90_after, pass2_1a0_before, pass2_1a0_after,
+                        changed_during_call ? " <-- ENGINE CHANGED FIELD(S) DURING RENDER CALL" : "");
+                }
+            } else {
+                SPDLOG_WARN("[VR][NSF-C90-READSITE] frame={} pass2_view={:x} became unreadable during render call", g_frame_count, (uintptr_t)pass2_view);
+            }
+        }
+
+        // DIAG: hotkey-triggered per-frame burst capture (see diag_nsf_flicker_burst_capture()).
+        // The normal NSF-C90-READSITE sampling above only logs every ~300-600 frames, which is too
+        // coarse to see a fast rhythmic flicker - this logs EVERY frame for ~15 seconds (900 frames
+        // @ 60fps) once triggered, covering c90/1a0, every live eye_fields value, and both eyes'
+        // StereoPass, so the exact frame-by-frame behavior during an observed flicker/darkening
+        // collapse (which stereo4.txt showed can take 7-10+ seconds to fully settle) can be seen.
+        if (vr->diag_nsf_flicker_burst_capture()) {
+            static uint32_t s_burst_frames_remaining = 0;
+            if (s_burst_frames_remaining == 0) {
+                s_burst_frames_remaining = 900;
+            }
+
+            if (pass1_view != nullptr && pass2_view != nullptr &&
+                !IsBadReadPtr(pass1_view, 0x1000) && !IsBadReadPtr(pass2_view, 0x1000)) {
+                std::string fields_str{};
+                for (const auto& f : sceneview_xref::eye_fields) {
+                    auto* p_left = (const uint32_t*)((uintptr_t)pass1_view + f.offset);
+                    auto* p_right = (const uint32_t*)((uintptr_t)pass2_view + f.offset);
+                    uint32_t live_left = 0, live_right = 0;
+                    if (!IsBadReadPtr(p_left, sizeof(uint32_t)) && !IsBadReadPtr(p_right, sizeof(uint32_t))) {
+                        live_left = *p_left;
+                        live_right = *p_right;
+                    }
+                    fields_str += fmt::format("F{}={:x}:{}->{} ", f.id, f.offset, live_left, live_right);
+                }
+
+                SPDLOG_INFO("[VR][DIAG][NSF-FLICKER-BURST] frame={} c90 before={} after={} | 1a0 before={} after={} | live_fields: {}",
+                    g_frame_count, pass2_c90_before, pass2_c90_after, pass2_1a0_before, pass2_1a0_after, fields_str);
+            }
+
+            if (--s_burst_frames_remaining == 0) {
+                vr->diag_nsf_flicker_burst_capture() = false;
+                SPDLOG_INFO("[VR][DIAG] NSF flicker burst capture complete");
+            }
+        }
+
+        // DIAG (render-thread race hypothesis): BeginRenderingViewFamily enqueues work to the render
+        // thread and can return before (or well after) that thread actually consumes StereoPass. If
+        // restoring the original value the instant this game-thread call returns lets the render
+        // thread observe either value depending on scheduling jitter, that's a plausible source of
+        // per-frame flicker/darkening. Skipping the restore here relies on the known every-frame
+        // constructor re-stamp of pooled views (NSF-FOV-TRANSITION already proved views are re-
+        // written per slot per frame) to naturally reset the field before its next use.
+        if (!vr->is_native_stereo_fix_right_eye_shadows_precise_no_restore_enabled()) {
+            for (auto& [p, v] : precise_shadow_fix_restore) {
+                *p = v;
+            }
+        }
+
 
         if (traced_eye_field != nullptr) {
             if (!IsBadReadPtr(traced_eye_field, sizeof(*traced_eye_field))) {
@@ -9255,11 +11744,49 @@ void FFakeStereoRenderingHook::begin_render_viewfamily_real(
         }
 
         if (pass2_state_slot != nullptr) {
-            *pass2_state_slot = pass2_state_saved;
+            // SAFETY: see pass2_restore loop below - pass2_view can be invalidated by a concurrent
+            // level transition while Pass2 was rendering, so re-validate this write target too.
+            if (!IsBadWritePtr(pass2_state_slot, sizeof(*pass2_state_slot))) {
+                if (vr->is_diag_nsf_pass2_pipeline_trace_enabled()) {
+                    SPDLOG_INFO("[VR][DIAG][NSF-PIPELINE] frame={} pass2 view_state restored: slot={:x} restored={:x}",
+                        g_frame_count, (uintptr_t)pass2_state_slot, (uintptr_t)pass2_state_saved);
+                }
+                *pass2_state_slot = pass2_state_saved;
+            } else {
+                SPDLOG_WARN("[VR] NSF right-eye shadow fix: skipping pass2 scene-state restore, slot no longer writable (view likely destroyed mid-pass)");
+            }
         }
 
-        for (auto& [p, v] : pass2_restore) {
-            *p = v;
+        // Restore view order & original target
+        std::swap(views[0], views[1]);
+        if (vr->is_diag_nsf_pass2_pipeline_trace_enabled()) {
+            SPDLOG_INFO("[VR][DIAG][NSF-PIPELINE] frame={} render_target restored: target={:x}", g_frame_count, (uintptr_t)original_target);
+        }
+        view_family->set_render_target(original_target);
+
+        // DIAG: see is_native_stereo_fix_right_eye_eye_fields_no_restore_enabled() for rationale -
+        // normally this unconditionally reverts every eye_fields write made above, every frame,
+        // which combined with next frame's write is a continuous write->revert->write cycle and a
+        // direct candidate for a persistent "fighting" flicker. Allow skipping it for A/B testing.
+        if (!vr->is_native_stereo_fix_right_eye_eye_fields_no_restore_enabled()) {
+            for (auto& [p, v] : pass2_restore) {
+                // SAFETY: pass2_view (and therefore these raw field pointers into it) can be destroyed
+                // by the engine during a level/world transition that happens to occur while Pass2 was
+                // still rendering (e.g. NSF resuming right as a map load reaches ~75%). Re-validate each
+                // pointer is still writable immediately before the deferred restore write, instead of
+                // trusting it unconditionally - a stale pointer here is a write-AV with no UEVR frames in
+                // the stack, since it's just a raw `*p = v` into memory the engine may have already freed.
+                if (IsBadWritePtr(p, sizeof(*p))) {
+                    SPDLOG_WARN("[VR] NSF right-eye shadow fix: skipping restore of now-unwritable eye field ptr={:x} (view likely destroyed mid-pass)", (uintptr_t)p);
+                    continue;
+                }
+                *p = v;
+            }
+        }
+
+        if (vr->is_diag_log_shadow_pathway_identity_enabled() && pass1_view != nullptr && pass2_view != nullptr) {
+            sceneview_xref::log_shadow_pathway_identity("after-pass2-restore", pass1_view, pass2_view);
+            sceneview_xref::log_kuro_shadow_subsystem_state("after-pass2-restore");
         }
 
         if (traced_eye_field != nullptr) {
@@ -9523,6 +12050,68 @@ void FFakeStereoRenderingHook::pre_render_viewfamily_renderthread(ISceneViewExte
 
     if (vr->is_stereo_emulation_enabled()) {
         return;
+    }
+
+    // DIAG: one-shot watchpoint on the live backing float of r.Shadow.CSM.TransitionScale.
+    // Unlike the Begin_RenderViewFamily (game-thread) arming attempted previously - which saw 0 hits
+    // because hardware breakpoints (Dr0-Dr3) are per-thread and that call only enqueues render-thread
+    // work without the render thread itself ever executing while armed - this function
+    // (pre_render_viewfamily_renderthread) genuinely executes ON the render thread (it manipulates
+    // the live RHI command list/root and enqueues RHI-thread work).
+    // IMPORTANT: even on the correct thread, scoping the tracer to just THIS call's lifetime also saw
+    // 0 hits, because this view-extension callback only enqueues/sets up the frame - the actual
+    // scene/shadow-depth render (where CSM.TransitionScale is actually consumed) happens LATER in the
+    // same render thread's frame execution, outside this function's call stack and therefore after we
+    // had already disarmed. Fix: arm once (persisting across calls/frames via a static) instead of
+    // disarming at the end of this call, so the breakpoint stays live for the rest of whatever this
+    // thread does for the remainder of the frame. See is_diag_watchpoint_trace_csm_transition_scale_enabled()
+    // for rationale. Uses slot 3 to avoid overlap with the +0xC90/+0x164 tracers (slots 0-1).
+    {
+        static sdk::TConsoleVariableData<float>* s_csm_transition_scale_data_rt = nullptr;
+        static std::optional<sceneview_xref::ScopedWatchpointTracer> s_csm_transition_scale_renderthread_tracer{};
+        // TConsoleVariableData<float> stores TWO floats: values[0] (set by the game thread via set())
+        // and values[1] (the render-thread-visible copy used by GetValueOnRenderThread()/GetValueOnAnyThread()).
+        // A single 4-byte hardware watchpoint on values[0] can never see a read/write of values[1], which is
+        // almost certainly what the actual shadow/CSM render-thread code consumes - this is why the previous
+        // single-watchpoint trace reported 0 hits despite being armed on the correct thread for 9+ minutes.
+        // Arm a second watchpoint (slot 2) on values[1] alongside the existing slot-3 watchpoint on values[0].
+        static std::optional<sceneview_xref::ScopedWatchpointTracer> s_csm_transition_scale_renderthread_tracer_v1{};
+
+        if (vr->is_diag_watchpoint_trace_csm_transition_scale_enabled()) {
+            if (s_csm_transition_scale_data_rt == nullptr) {
+                auto wrapper = sdk::find_cvar_data_cached(L"Engine", L"r.Shadow.CSM.TransitionScale");
+
+                if (wrapper.has_value()) {
+                    s_csm_transition_scale_data_rt = wrapper->get<float>();
+                }
+
+                if (s_csm_transition_scale_data_rt != nullptr) {
+                    SPDLOG_INFO("[VR][DIAG][CSM-TRANSITION-SCALE-RT] resolved backing float at {:x} (values[1] at {:x}), current value[0]={}, value[1]={}",
+                        (uintptr_t)s_csm_transition_scale_data_rt, (uintptr_t)s_csm_transition_scale_data_rt + sizeof(float),
+                        s_csm_transition_scale_data_rt->get(0), s_csm_transition_scale_data_rt->get(1));
+                } else {
+                    SPDLOG_WARN("[VR][DIAG][CSM-TRANSITION-SCALE-RT] failed to resolve r.Shadow.CSM.TransitionScale cvar data");
+                }
+            }
+
+            if (s_csm_transition_scale_data_rt != nullptr && !s_csm_transition_scale_renderthread_tracer.has_value()) {
+                s_csm_transition_scale_renderthread_tracer.emplace((void*)s_csm_transition_scale_data_rt, 3, "RT-CSM.TransitionScale[0]");
+            }
+
+            if (s_csm_transition_scale_data_rt != nullptr && !s_csm_transition_scale_renderthread_tracer_v1.has_value()) {
+                s_csm_transition_scale_renderthread_tracer_v1.emplace((void*)((uintptr_t)s_csm_transition_scale_data_rt + sizeof(float)), 2, "RT-CSM.TransitionScale[1]");
+            }
+        } else {
+            // Toggle turned back off: disarm and log whatever was captured since it was armed, instead
+            // of leaving the hardware breakpoints installed indefinitely on this thread.
+            if (s_csm_transition_scale_renderthread_tracer.has_value()) {
+                s_csm_transition_scale_renderthread_tracer.reset();
+            }
+
+            if (s_csm_transition_scale_renderthread_tracer_v1.has_value()) {
+                s_csm_transition_scale_renderthread_tracer_v1.reset();
+            }
+        }
     }
 
     diag_dump_engine_view_extensions(view_family);
@@ -11358,6 +13947,25 @@ bool FFakeStereoRenderingHook::is_stereo_enabled(FFakeStereoRendering* stereo) {
     return result;
 }
 
+// UNIFIED EYE IDENTITY: see declaration in FFakeStereoRenderingHook.hpp for the rationale. This
+// single function now owns the index_starts_from_one/index_was_ever_two state that used to be
+// duplicated independently inside adjust_view_rect, calculate_stereo_view_offset, and
+// calculate_stereo_projection_matrix, so all three can never drift out of phase with each other
+// for the same raw view_index stream.
+uint32_t FFakeStereoRenderingHook::classify_true_index(int32_t index) {
+    static bool index_starts_from_one = true;
+    static bool index_was_ever_two = false;
+
+    if (index == 2) {
+        index_starts_from_one = true;
+        index_was_ever_two = true;
+    } else if (index == 0 && !index_was_ever_two) {
+        index_starts_from_one = false;
+    }
+
+    return index_starts_from_one ? ((uint32_t)(index + 1) % 2) : ((uint32_t)index % 2);
+}
+
 void FFakeStereoRenderingHook::adjust_view_rect(FFakeStereoRendering* stereo, int32_t index, int* x, int* y, uint32_t* w, uint32_t* h) {
 #ifdef FFAKE_STEREO_RENDERING_LOG_ALL_CALLS
     SPDLOG_INFO("adjust view rect called! {}", index);
@@ -11369,14 +13977,6 @@ void FFakeStereoRenderingHook::adjust_view_rect(FFakeStereoRendering* stereo, in
 
     if (!g_framework->is_game_data_intialized()) {
         return;
-    }
-
-    static bool index_starts_from_one = true;
-
-    if (index == 2) {
-        index_starts_from_one = true;
-    } else if (index == 0) {
-        index_starts_from_one = false;
     }
 
     // The purpose of this is to prevent the game from crashing in IDirect3D12CommandList::Close
@@ -11410,7 +14010,7 @@ void FFakeStereoRenderingHook::adjust_view_rect(FFakeStereoRendering* stereo, in
 
     *w = *w / 2;
 
-    auto true_index = index_starts_from_one ? ((index + 1) % 2) : (index % 2);
+    auto true_index = classify_true_index(index);
 
     // NOTE: In AFR mode this game calls AdjustViewRect with the SAME raw `index` value (e.g.
     // always 2) for both eye passes, since AFR reuses the same view slot across frames instead of
@@ -11489,8 +14089,8 @@ void FFakeStereoRenderingHook::adjust_view_rect(FFakeStereoRendering* stereo, in
         auto vr = VR::get();
 
         if (LGUI_DIAG_STEADY_STATE && (diag_adjust_view_rect_count <= 20 || diag_adjust_view_rect_count % 301 == 1)) {
-            SPDLOG_INFO("[DIAG] AdjustViewRect (#{}): index={} true_index={} index_starts_from_one={} x={} y={} w={} h={} native_stereo_fix={} vr_frame_count={} vr_left_interval={} vr_right_interval={} is_using_afr={}",
-                diag_adjust_view_rect_count, index, true_index, index_starts_from_one, *x, *y, *w, *h,
+            SPDLOG_INFO("[DIAG] AdjustViewRect (#{}): index={} true_index={} x={} y={} w={} h={} native_stereo_fix={} vr_frame_count={} vr_left_interval={} vr_right_interval={} is_using_afr={}",
+                diag_adjust_view_rect_count, index, true_index, *x, *y, *w, *h,
                 vr->is_native_stereo_fix_enabled(), vr->m_render_frame_count, vr->m_left_eye_interval, vr->m_right_eye_interval, vr->is_using_afr());
         }
     }
@@ -11624,7 +14224,6 @@ __forceinline void FFakeStereoRenderingHook::calculate_stereo_view_offset(
 
     //std::scoped_lock _{vr->get_vr_mutex()};
 
-    static bool index_starts_from_one = true;
     static bool index_was_ever_two = false;
     static bool index_was_ever_negative = false;
 
@@ -11679,13 +14278,8 @@ __forceinline void FFakeStereoRenderingHook::calculate_stereo_view_offset(
     // state) only for real engine-issued calls.
     const bool is_manual_call = g_hook->m_inside_manual_view_offset;
 
-    if (!is_manual_call) {
-        if (view_index == 2) {
-            index_starts_from_one = true;
-            index_was_ever_two = true;
-        } else if (view_index == 0 && !index_was_ever_two) {
-            index_starts_from_one = false;
-        }
+    if (!is_manual_call && view_index == 2) {
+        index_was_ever_two = true;
     }
 
     const auto is_full_pass = !is_manual_call && view_index == 0 && !index_was_ever_two && !index_was_ever_negative;
@@ -11694,8 +14288,7 @@ __forceinline void FFakeStereoRenderingHook::calculate_stereo_view_offset(
     // unambiguous view_index = true_index + 1 - decode it directly instead of running it through
     // the heuristic meant only for classifying the engine's own raw per-eye calls (see is_manual_call
     // above for why sharing that heuristic silently inverted eye identity for manual calls).
-    auto true_index = is_manual_call ? (uint32_t)(view_index - 1) :
-        (index_starts_from_one ? ((view_index + 1) % 2) : (view_index % 2));
+    auto true_index = is_manual_call ? (uint32_t)(view_index - 1) : classify_true_index(view_index);
     const auto has_double_precision = g_hook->m_has_double_precision;
     const auto rot_d = (Rotator<double>*)view_rotation;
 
@@ -11711,9 +14304,8 @@ __forceinline void FFakeStereoRenderingHook::calculate_stereo_view_offset(
 
         if (now - s_last_logged[idx_for_throttle] >= std::chrono::seconds(2)) {
             s_last_logged[idx_for_throttle] = now;
-            SPDLOG_INFO("[VR][SVC-MANUAL-CALL] manual calculate_stereo_view_offset: view_index={} decoded true_index={} (heuristic index_starts_from_one={} index_was_ever_two={} would have given {})",
-                view_index, true_index, index_starts_from_one, index_was_ever_two,
-                index_starts_from_one ? ((view_index + 1) % 2) : (view_index % 2));
+            SPDLOG_INFO("[VR][SVC-MANUAL-CALL] manual calculate_stereo_view_offset: view_index={} decoded true_index={}",
+                view_index, true_index);
         }
     }
 
@@ -11783,9 +14375,8 @@ __forceinline void FFakeStereoRenderingHook::calculate_stereo_view_offset(
         if (s_last_frame_for_true_index[true_index] == (uint64_t)g_frame_count &&
             s_last_view_index_for_true_index[true_index] != -999 &&
             s_last_view_index_for_true_index[true_index] != view_index) {
-            SPDLOG_WARN("[VR][NSF-TRUE-INDEX-ALIAS] frame={} true_index={} view_index={} ALIASES with prior view_index={} in the SAME frame (index_starts_from_one={} index_was_ever_two={})",
-                g_frame_count, true_index, view_index, s_last_view_index_for_true_index[true_index],
-                index_starts_from_one, index_was_ever_two);
+            SPDLOG_WARN("[VR][NSF-TRUE-INDEX-ALIAS] frame={} true_index={} view_index={} ALIASES with prior view_index={} in the SAME frame",
+                g_frame_count, true_index, view_index, s_last_view_index_for_true_index[true_index]);
         }
 
         s_last_view_index_for_true_index[true_index] = view_index;
@@ -11806,8 +14397,8 @@ __forceinline void FFakeStereoRenderingHook::calculate_stereo_view_offset(
         const auto clamped_index = std::clamp(view_index, 0, kMaxTrackedViewIndex);
         s_raw_view_index_call_count[clamped_index]++;
 
-        SPDLOG_WARN("[VR][NSF-RAW-VIEW-INDEX] frame={} view_index={} true_index={} is_full_pass={} is_using_afr={} index_starts_from_one={} index_was_ever_two={} call_count_for_this_index={} frames_since_last_seen={}",
-            g_frame_count, view_index, true_index, is_full_pass, vr->is_using_afr(), index_starts_from_one, index_was_ever_two,
+        SPDLOG_WARN("[VR][NSF-RAW-VIEW-INDEX] frame={} view_index={} true_index={} is_full_pass={} is_using_afr={} index_was_ever_two={} call_count_for_this_index={} frames_since_last_seen={}",
+            g_frame_count, view_index, true_index, is_full_pass, vr->is_using_afr(), index_was_ever_two,
             s_raw_view_index_call_count[clamped_index],
             s_raw_view_index_last_frame[clamped_index] == 0 ? 0 : (uint64_t)g_frame_count - s_raw_view_index_last_frame[clamped_index]);
 
@@ -11860,56 +14451,45 @@ __forceinline void FFakeStereoRenderingHook::calculate_stereo_view_offset(
         }
     }
 
-    // NSF (non-AFR Native Stereo Fix) eye-desync mitigation: unlike AFR above, NSF renders both eyes
-    // within the SAME engine frame (two calls into this function per frame, Pass1=left then Pass2=
-    // right, see begin_render_viewfamily_real's wants_swap path), and had no cross-eye pose caching at
-    // all. During a camera-transition animation (cutscene blend, dash, ability camera shift) the live
-    // animated camera pose can change between these two calls, so the two eyes get built from two
-    // different poses for what should be one synchronized stereo frame - producing a momentary
-    // left/right desync that resolves once the camera holds still. Mirror the AFR rotation-cache
-    // pattern here: cache Pass1 (left)'s rotation/location for this frame, then force Pass2 (right) to
-    // reuse it. Gated to NSF (native_stereo_fix_enabled && !is_using_afr) and behind its own toggle so
-    // it never affects AFR (which already has its own mechanism above) or normal head tracking on
-    // frames where NSF isn't swapping passes.
+    // NSF (non-AFR Native Stereo Fix) UNIFIED per-frame pose: redesigned to remove eye privilege.
+    // NSF renders both eyes (and an auxiliary shadow/culling-driving view, view_index=1, see
+    // NSF-RAW-VIEW-INDEX/NSF-STACKWALK-INDEX1) within the SAME engine frame via multiple calls into
+    // this function. The OLD design unconditionally treated true_index==0 (Pass1/left) as ground
+    // truth every frame, cached ONLY its pose, and force-snapped/blended every other call that frame
+    // toward it. That made the right eye (and the auxiliary view) structurally always "the follower"
+    // of a value captured moments earlier in the same frame - reading as a persistent right-eye lag/
+    // blur during motion, and leaving the auxiliary view's shadow/culling/LOD state keyed off a
+    // left-biased pose even when the exclude-from-cache + apply-synced-pose DIAG toggles were used,
+    // since that was still just reading the same left-sourced value.
     //
-    // REVERTED: an earlier attempt restricted this cache to a "main stereo pass" view_index range
-    // derived from index_starts_from_one, based on a hypothesis that an extra secondary view (e.g. a
-    // VFX/portal capture) was polluting the cache. In-headset testing DISPROVED this: blocking that
-    // "extra" view instead caused it to stick rigidly to the HMD with no eye offset applied at all -
-    // proving it is actually a REAL eye call, not a secondary view, and the view_index classification
-    // above was wrong for this game. That restriction also caused a permanent low-level doubled-image
-    // regression by extension in the projection-matrix path. Both restrictions are reverted here; the
-    // cache is unconditional again (gated only on NSF/enabled/toggle) matching original behavior.
+    // FIXED: no call is privileged. Whichever call (real eye OR the auxiliary view) is the FIRST one
+    // seen for a new g_frame_count captures its own raw (pre-IPD-offset) rotation/position as "this
+    // frame's canonical pose" - it is not assumed to be the left eye, it is just whichever arrives
+    // first. Every subsequent call within that same g_frame_count (any true_index, any view_index) is
+    // then hard-overwritten with that identical pose, so all of them - both real eyes and the
+    // auxiliary view - always render from one shared, frame-locked transform. No blending/snapping
+    // asymmetry remains because every non-first call receives the exact same value, not a lagging
+    // approximation of it. The per-eye IPD/eye-offset math further below (keyed by true_index) is
+    // applied AFTER this block and is untouched, so stereo depth/parallax between the two eyes is
+    // fully preserved - only the shared base transform they offset from is now unbiased.
     //
-    // FIX: user confirmed via the DiagSuppressExtraView test (fully early-returning view_index=1,
-    // BEFORE any pose caching/rendering) that view_index=1 does NOT correspond to a visible rendered
-    // eye this session - no stuck/frozen/blank eye resulted, unlike an earlier session where blocking
-    // an assumed "extra view" DID stick to the HMD (that was almost certainly a different, since-
-    // invalidated raw index guess, from before 2=left/3=right was established). view_index=1 fires at
-    // a CONSTANT ~4x rate relative to 2/3 regardless of glitch timing (see NSF-RAW-VIEW-INDEX), and it
-    // aliases onto true_index=0 alongside the real view_index=3 eye call (NSF-TRUE-INDEX-ALIAS) - a
-    // race where whichever of the two writes last wins, which plausibly explains why the reported
-    // glitch has switched eyes (L/R) across sessions. Exclude view_index=1 specifically from the
-    // sync-pose cache (NOT a full render skip) so it can never again overwrite/race with the real
-    // eye's cached pose, while leaving actual rendering of it untouched in case some other subsystem
-    // depends on it. Toggle-gated so it can be instantly reverted if further testing disagrees.
-    const bool diag_exclude_from_sync_cache = vr->is_diag_exclude_view_index_from_sync_cache_enabled() &&
-        view_index == vr->get_diag_exclude_view_index_from_sync_cache();
-
+    // This also makes the old separate "exclude view_index from cache" / "apply synced pose to
+    // excluded view index" DIAG toggles unnecessary for this mechanism: every non-manual, non-full-
+    // pass call (regardless of view_index) now participates in the SAME unified cache, so the
+    // auxiliary view gets the identical frame pose as the real eyes automatically.
+    //
     // FIX: manual calls (Scene View Extension / SplitScreen compatibility, is_manual_call above)
     // already carry a fresh, independently-resolved, correct pose for their specific eye - they do
-    // NOT go through NSF's real two-pass-per-frame render, so they lack the synchronous back-to-
-    // back Pass1/Pass2 timing this cache/blend mechanism relies on (see the have_left consumption
-    // below). Letting them feed into/be blended by this cache when both NSF sync-pose AND Scene
-    // View compatibility are enabled together caused the manual path's already-correct per-eye pose
-    // to be blended toward a stale/mistimed cached pose, reading as blur/lag - the opposite of what
-    // sync-pose is meant to fix. Skip this entire block for manual calls; they never needed it.
-    if (!is_manual_call && !diag_exclude_from_sync_cache && vr->is_native_stereo_fix_enabled() && !vr->is_using_afr() && vr->is_native_stereo_fix_sync_pose_enabled() && !is_full_pass) {
+    // NOT go through NSF's real multi-call-per-frame render, so they lack the synchronous back-to-
+    // back call timing this cache relies on. Skip this entire block for manual calls; they never
+    // needed it.
+    if (!is_manual_call && vr->is_native_stereo_fix_enabled() && !vr->is_using_afr() && vr->is_native_stereo_fix_sync_pose_enabled() && !is_full_pass) {
         auto& hook_data = *g_hook;
         const auto local_view_d = (Vector3d*)view_location;
 
-        if (true_index == 0) {
-            // Pass1 (left eye): cache this frame's pose for Pass2 to reuse below.
+        if (hook_data.m_nsf_sync_pose_frame_count != g_frame_count || !hook_data.m_nsf_sync_pose_captured_this_frame) {
+            // First call (of any kind - real eye or auxiliary view) seen for this new engine frame:
+            // capture its raw pose as the frame's single canonical reference. No eye is assumed here.
             if (has_double_precision) {
                 hook_data.m_nsf_sync_pose_rotation_double = *rot_d;
                 hook_data.m_nsf_sync_pose_location_double = *local_view_d;
@@ -11919,193 +14499,48 @@ __forceinline void FFakeStereoRenderingHook::calculate_stereo_view_offset(
             }
 
             hook_data.m_nsf_sync_pose_frame_count = g_frame_count;
-            hook_data.m_nsf_sync_pose_have_left = true;
+            hook_data.m_nsf_sync_pose_captured_this_frame = true;
 
-            SPDLOG_INFO_EVERY_N_SEC(2, "[VR] NSF sync-pose: cached Pass1 (left) pose for frame {}", g_frame_count);
-        } else if (true_index == 1 && !hook_data.m_nsf_sync_pose_have_left) {
-            // DIAG: Pass2 (right eye) reached, but no Pass1 pose was cached this pass (have_left is
-            // false) - meaning sync is NOT applied for this Pass2 call. Previously this branch also
-            // required g_frame_count to match the cached Pass1 frame, but g_frame_count is sourced from
-            // the HMD runtime's internal_frame_count (see line ~2598), which increments once PER EYE
-            // SUBMISSION - so it always advances by ~2 between the Pass1 and Pass2 calls within the SAME
-            // engine render frame. That made the old frame_count equality check permanently false, so
-            // sync-pose silently never applied. Fixed below to rely on have_left alone.
-            if (VR::get()->is_diag_sync_pose_verbose_logging_enabled()) {
-                SPDLOG_WARNING_EVERY_N_SEC(1, "[VR][NSF-POSE-DIVERGE-SKIP] Pass2 frame={} has no cached Pass1 pose (have_left=false), sync NOT applied",
-                    g_frame_count);
-            }
-        } else if (hook_data.m_nsf_sync_pose_have_left) {
-            // Pass2 (right eye): Pass1 and Pass2 run back-to-back synchronously within the same
-            // begin_render_viewfamily_real call (see the immediate std::swap(views[0], views[1]) and
-            // re-invocation of the render module there), so no frame-count match is needed - have_left
-            // alone is sufficient. Consume and clear it immediately so a stale Pass1 pose can never be
-            // reused by some later, unrelated Pass2-only call.
-            hook_data.m_nsf_sync_pose_have_left = false;
-
-            // Force ROTATION to match to prevent orientation-based eye desync during animation/camera-
-            // transition frames. Do NOT touch view_location/local_view_d here - that holds the per-eye
-            // stereo position offset (IPD), which legitimately differs between the left and right eye.
-            // Overwriting it with Pass1's location collapses the right eye onto the left eye's position,
-            // eliminating positional parallax/depth between the two eyes for that frame. This was
-            // previously done unconditionally and with no delta logging, which produced a near-zero-
-            // disparity "flat"/double-vision-like frame that was misattributed to view_rect/composite
-            // scaling instead.
+            SPDLOG_INFO_EVERY_N_SEC(2, "[VR] NSF unified-pose: captured canonical pose for frame {} (true_index={} view_index={}, first call this frame)",
+                g_frame_count, true_index, view_index);
+        } else {
+            // Every subsequent call this frame (any true_index/view_index) gets the IDENTICAL
+            // canonical pose captured above - no blending, no "follower" lag, since this is a
+            // same-frame value, not a stale cross-frame one.
             if (has_double_precision) {
                 const auto rot_delta = glm::length(glm::dvec3{
                     rot_d->yaw - hook_data.m_nsf_sync_pose_rotation_double.yaw,
                     rot_d->pitch - hook_data.m_nsf_sync_pose_rotation_double.pitch,
                     rot_d->roll - hook_data.m_nsf_sync_pose_rotation_double.roll});
 
-                // DIAG: NSF-POSE-DIVERGE. We only force ROTATION here; POSITION is intentionally left
-                // alone (see comment above) because it legitimately carries the per-eye IPD offset.
-                // But if the underlying camera/actor location itself moves a large amount between the
-                // Pass1 (left) call and the Pass2 (right) call within the SAME engine frame - which can
-                // happen during a fast skill/ability/cutscene camera translation, as opposed to a pure
-                // rotation - then Pass2 still renders from a different WORLD position than Pass1, which
-                // would look exactly like a residual left/right positional desync ("double vision")
-                // that the rotation-only sync cannot fix. Log the raw position delta (not applied) so a
-                // captured log can prove/disprove whether large POSITION deltas (not just rotation
-                // deltas) are occurring during the reported glitch window.
+                // DIAG: NSF-POSE-DIVERGE. Kept purely as telemetry: logs how much this call's own raw
+                // pose would have differed from the unified frame pose, had unification not been
+                // applied. Useful to confirm how large the old per-eye divergence actually was.
                 const auto pos_delta = glm::length(glm::dvec3{*local_view_d} - glm::dvec3{hook_data.m_nsf_sync_pose_location_double});
 
-                // DIAG: unconditional (throttled) trace to prove this branch is actually reached and
-                // to see the real delta magnitudes even when they stay under the warn threshold below.
-                // Gated behind is_diag_sync_pose_verbose_logging_enabled() - fires every Pass2 call and
-                // is only meant to be enabled briefly while reproducing/tuning, not left on constantly.
+                // DIAG: unconditional (throttled) trace + divergence warning, kept purely as telemetry
+                // now (no longer gates behavior - every non-first call is unconditionally hard-set to
+                // the unified frame pose below, regardless of how large this delta is).
                 if (vr->is_diag_sync_pose_verbose_logging_enabled()) {
-                    SPDLOG_INFO_EVERY_N_SEC(1, "[VR][NSF-POSE-DIVERGE-TRACE] Pass2 reached, frame={} rot_delta_deg={:.4f} pos_delta={:.4f}",
-                        g_frame_count, rot_delta, pos_delta);
+                    SPDLOG_INFO_EVERY_N_SEC(1, "[VR][NSF-POSE-DIVERGE-TRACE] frame={} true_index={} view_index={} rot_delta_deg={:.4f} pos_delta={:.4f} (unified pose applied unconditionally)",
+                        g_frame_count, true_index, view_index, rot_delta, pos_delta);
 
                     if (rot_delta > 0.001 || pos_delta > 0.01) {
-                        SPDLOG_WARN("[VR][NSF-POSE-DIVERGE] frame={} rot_delta_deg={:.4f} pos_delta={:.4f} pass1_pos=({:.2f},{:.2f},{:.2f}) pass2_pos=({:.2f},{:.2f},{:.2f})",
-                            g_frame_count, rot_delta, pos_delta,
+                        SPDLOG_WARN("[VR][NSF-POSE-DIVERGE] frame={} true_index={} view_index={} rot_delta_deg={:.4f} pos_delta={:.4f} canonical_pos=({:.2f},{:.2f},{:.2f}) raw_pos=({:.2f},{:.2f},{:.2f})",
+                            g_frame_count, true_index, view_index, rot_delta, pos_delta,
                             hook_data.m_nsf_sync_pose_location_double.x, hook_data.m_nsf_sync_pose_location_double.y, hook_data.m_nsf_sync_pose_location_double.z,
                             local_view_d->x, local_view_d->y, local_view_d->z);
                     }
                 }
 
-                // BLEND (not a hard snap): alpha==1.0 fully overwrites Pass2's rotation with Pass1's
-                // (old behavior - eliminates desync but makes the right eye feel completely frozen/
-                // lagging relative to the live animated camera for that frame, which reads as
-                // disorienting one-sided lag). A lower alpha lets Pass2 keep some of its own live
-                // rotation, splitting the residual error across both eyes instead of concentrating the
-                // full correction (and the perceptual "lag") onto the right eye alone.
-                //
-                // HARD-CUT OVERRIDE: mirrors the approach used by the existing Lua UI-fix script for
-                // cutscene camera-actor changes (ResetCutSceneCamOffset), which forces an INSTANT/full
-                // reset when the cutscene camera actor's view changes abruptly - treating a genuine
-                // camera CUT differently from continuous small drift. Blending across a real cut would
-                // render a visibly wrong intermediate pose in one eye for that frame (a brief
-                // double-image at the cut itself), which is worse than a one-frame freeze; only small,
-                // continuous per-frame divergence (VFX/skill camera motion) benefits from a partial
-                // blend. Unlike the Lua script (which only evaluates this while the view target is an
-                // actual CineCameraActor, i.e. never during normal player input), this runs every frame
-                // regardless of what's driving the camera, so a flat magnitude threshold alone was too
-                // sensitive to fast thumbstick turns. is_nsf_sync_pose_hard_cut() instead requires an
-                // abrupt SPIKE relative to the recent rolling baseline AND a raised absolute floor.
-                // DIAG: post-hard-cut sensitivity boost. See is_within_post_hard_cut_window() and
-                // is_diag_post_hard_cut_sensitivity_boost_enabled() for full rationale - temporarily
-                // lowers the spike-detector's multiplier for a short window after a hard cut fires, so
-                // smaller residual jitter later in the SAME skill/dash animation also gets fully
-                // corrected, not just the single frame that originally crossed the threshold.
-                const bool use_sensitivity_boost = vr->is_diag_post_hard_cut_sensitivity_boost_enabled() &&
-                    hook_data.is_within_post_hard_cut_window(vr->get_diag_post_hard_cut_sensitivity_boost_window_ms());
-                const bool is_hard_cut = hook_data.is_nsf_sync_pose_hard_cut((float)rot_delta, (float)pos_delta,
-                    use_sensitivity_boost ? vr->get_diag_post_hard_cut_sensitivity_boost_multiplier() : 0.0f);
+                // UNIFIED: hard-assign this call's rotation (and, unless disabled, position) to the
+                // single canonical pose captured for this frame. No blend/snap distinction remains -
+                // every non-first call this frame always matches the first call exactly, so neither
+                // eye (nor the auxiliary view) is ever a "follower" lagging behind the other.
+                *rot_d = hook_data.m_nsf_sync_pose_rotation_double;
 
-                // TRIGGER: only report a pose-divergence event (which feeds the auto-mirror-on-motion
-                // fallback) on an actual hard-cut-grade spike, NOT on the near-zero logging threshold
-                // above. That threshold (0.001deg/0.01 units) is essentially noise-floor and fires on
-                // ordinary thumbstick turning/camera smoothing every single frame while moving, which
-                // kept re-extending the mirror's 250ms activity window for as long as - and for a
-                // while after - the player was actively turning. Because the mirror path shows an
-                // identical (non-stereo) image in both eyes, that read as a long-lived "static/frozen"
-                // right eye rather than a brief one-frame correction. Gating on the same spike detector
-                // used for the hard-cut snap ensures the mirror only engages for genuine abrupt
-                // animation/VFX camera discontinuities, not continuous player-driven motion.
-                if (is_hard_cut) {
-                    g_hook->report_pose_divergence_event();
-                }
-
-                // DIAG: is_native_stereo_fix_sync_pose_force_full_enabled() forces the full 1.0 snap
-                // unconditionally, bypassing the hard-cut spike detector entirely, so we can confirm
-                // with certainty that the sync path engages on every single Pass2 call during a
-                // reported multi-frame glitch window (e.g. UI menu open), not just on detected spikes.
-                const bool force_full = vr->is_native_stereo_fix_sync_pose_force_full_enabled();
-
-                // DIAG: gradual hard-cut convergence test - see get_nsf_gradual_convergence_alpha() for
-                // rationale. Replaces the instant blend_alpha=1.0 snap with a ramp from 0->1 over
-                // get_diag_gradual_hard_cut_convergence_duration_ms() so both eyes ease into agreement
-                // instead of one eye teleporting into place.
-                const bool use_gradual_convergence = vr->is_diag_gradual_hard_cut_convergence_enabled();
-
-                const auto blend_alpha = use_gradual_convergence
-                    ? (double)hook_data.get_nsf_gradual_convergence_alpha(is_hard_cut || force_full, vr->get_diag_gradual_hard_cut_convergence_duration_ms())
-                    : (is_hard_cut || force_full)
-                        ? 1.0
-                        : (double)vr->get_native_stereo_fix_sync_pose_blend_alpha();
-
-                if (force_full && vr->is_diag_sync_pose_verbose_logging_enabled()) {
-                    SPDLOG_WARN("[VR][NSF-SYNC-FORCE-FULL] frame={} rot_delta_deg={:.4f} pos_delta={:.4f} applying FULL snap (is_hard_cut={})",
-                        g_frame_count, rot_delta, pos_delta, is_hard_cut);
-                }
-
-                // DIAG: dash-blur numeric capture. See request_dash_capture()/request_dash_capture_mark()
-                // in VR.hpp - logs every relevant value for this Pass2 evaluation, unthrottled, while a
-                // capture window is active (armed via NumPad1), and tags the exact frame NumPad2 was
-                // pressed on so the perceived-blur moment can be correlated against the surrounding data.
-                if (bool marked = false; auto seq = vr->consume_dash_capture_frame(marked)) {
-                    SPDLOG_WARN("[VR][DASH-CAPTURE]{} seq={} frame={} rot_delta_deg={:.4f} pos_delta={:.4f} "
-                                "rot_ema={:.4f} pos_ema={:.4f} is_hard_cut={} force_full={} blend_alpha={:.3f} "
-                                "pass1_rot=({:.3f},{:.3f},{:.3f}) pass2_rot_before=({:.3f},{:.3f},{:.3f})",
-                        marked ? " [MARK]" : "", *seq, g_frame_count, rot_delta, pos_delta,
-                        hook_data.m_nsf_pose_delta_rot_ema, hook_data.m_nsf_pose_delta_pos_ema,
-                        is_hard_cut, force_full, blend_alpha,
-                        hook_data.m_nsf_sync_pose_rotation_double.pitch, hook_data.m_nsf_sync_pose_rotation_double.yaw, hook_data.m_nsf_sync_pose_rotation_double.roll,
-                        rot_d->pitch, rot_d->yaw, rot_d->roll);
-                }
-
-                if (blend_alpha >= 1.0) {
-                    *rot_d = hook_data.m_nsf_sync_pose_rotation_double;
-                } else if (blend_alpha > 0.0) {
-                    rot_d->yaw = std::lerp(rot_d->yaw, hook_data.m_nsf_sync_pose_rotation_double.yaw, blend_alpha);
-                    rot_d->pitch = std::lerp(rot_d->pitch, hook_data.m_nsf_sync_pose_rotation_double.pitch, blend_alpha);
-                    rot_d->roll = std::lerp(rot_d->roll, hook_data.m_nsf_sync_pose_rotation_double.roll, blend_alpha);
-                }
-
-                // Sync the raw (pre-IPD) camera POSITION too, if enabled. This runs BEFORE the
-                // eye_separation/IPD offset math further down in this function (which reads *view_d /
-                // *view_location and subtracts a per-eye offset derived from true_index), so overwriting
-                // the raw position here does NOT collapse stereo parallax - each eye still gets its own
-                // IPD offset applied afterward on top of this now-synced base position. Same blend-
-                // alpha applies here as for rotation above.
-                //
-                // DIAG: FIX ATTEMPT #1/#2 for dash/fast-turn blur (see DiagRotationGatedPositionSync/
-                // DiagSustainedMotionPositionSyncSuppression in VR.hpp). Real capture data proved the
-                // dash blur frames have rot_delta_deg==0.0000 (no genuine rotational mismatch) while
-                // pos_delta stays moderately elevated every frame purely from continuous motion, and
-                // the unconditional position snap below fights that normal per-eye parallax. Gate the
-                // POSITION portion only (rotation sync above is unaffected) behind these two optional,
-                // independently toggleable tests. BOTH also require pos_delta to be under the shared
-                // ceiling - some hard cuts are purely positional (huge pos_delta, near-zero rotation)
-                // and must never be suppressed just because rotation looks dash-like.
-                const bool is_low_rotation = (float)rot_delta < vr->get_diag_rotation_gated_position_sync_threshold_deg();
-                const bool is_low_position = (float)pos_delta < vr->get_diag_position_sync_suppression_pos_delta_ceiling();
-                const bool is_dash_like = is_low_rotation && is_low_position;
-                const bool suppress_by_sustained_motion = hook_data.update_and_check_sustained_motion_suppression(
-                    is_dash_like, vr->get_diag_sustained_motion_position_sync_suppression_frames())
-                    && vr->is_diag_sustained_motion_position_sync_suppression_enabled();
-                const bool suppress_by_rotation_gate = vr->is_diag_rotation_gated_position_sync_enabled() && is_dash_like;
-                const bool suppress_position_sync = suppress_by_rotation_gate || suppress_by_sustained_motion;
-
-                if (vr->is_native_stereo_fix_sync_pose_position_enabled() && !suppress_position_sync) {
-                    if (blend_alpha >= 1.0) {
-                        *local_view_d = hook_data.m_nsf_sync_pose_location_double;
-                    } else if (blend_alpha > 0.0) {
-                        local_view_d->x = std::lerp(local_view_d->x, hook_data.m_nsf_sync_pose_location_double.x, blend_alpha);
-                        local_view_d->y = std::lerp(local_view_d->y, hook_data.m_nsf_sync_pose_location_double.y, blend_alpha);
-                        local_view_d->z = std::lerp(local_view_d->z, hook_data.m_nsf_sync_pose_location_double.z, blend_alpha);
-                    }
+                if (vr->is_native_stereo_fix_sync_pose_position_enabled()) {
+                    *local_view_d = hook_data.m_nsf_sync_pose_location_double;
                 }
             } else {
                 const auto rot_delta = glm::length(glm::vec3{
@@ -12114,142 +14549,34 @@ __forceinline void FFakeStereoRenderingHook::calculate_stereo_view_offset(
                     view_rotation->roll - hook_data.m_nsf_sync_pose_rotation.roll});
 
                 // DIAG: NSF-POSE-DIVERGE (single-precision path). See double-precision branch above for
-                // full rationale - logs the un-applied Pass1 vs Pass2 position delta for the same frame.
+                // full rationale - logs the un-applied vs unified-frame-pose delta for telemetry only.
                 const auto pos_delta = glm::length(*view_location - hook_data.m_nsf_sync_pose_location);
 
-                // DIAG: unconditional (throttled) trace to prove this branch is actually reached and
-                // to see the real delta magnitudes even when they stay under the warn threshold below.
-                // Gated behind is_diag_sync_pose_verbose_logging_enabled() - fires every Pass2 call and
-                // is only meant to be enabled briefly while reproducing/tuning, not left on constantly.
+                // DIAG: unconditional (throttled) trace + divergence warning, kept purely as telemetry
+                // now (no longer gates behavior - every non-first call is unconditionally hard-set to
+                // the unified frame pose below, regardless of how large this delta is).
                 if (vr->is_diag_sync_pose_verbose_logging_enabled()) {
-                    SPDLOG_INFO_EVERY_N_SEC(1, "[VR][NSF-POSE-DIVERGE-TRACE] Pass2 reached, frame={} rot_delta_deg={:.4f} pos_delta={:.4f}",
-                        g_frame_count, rot_delta, pos_delta);
+                    SPDLOG_INFO_EVERY_N_SEC(1, "[VR][NSF-POSE-DIVERGE-TRACE] frame={} true_index={} view_index={} rot_delta_deg={:.4f} pos_delta={:.4f} (unified pose applied unconditionally)",
+                        g_frame_count, true_index, view_index, rot_delta, pos_delta);
 
                     if (rot_delta > 0.001f || pos_delta > 0.01f) {
-                        SPDLOG_WARN("[VR][NSF-POSE-DIVERGE] frame={} rot_delta_deg={:.4f} pos_delta={:.4f} pass1_pos=({:.2f},{:.2f},{:.2f}) pass2_pos=({:.2f},{:.2f},{:.2f})",
-                            g_frame_count, rot_delta, pos_delta,
+                        SPDLOG_WARN("[VR][NSF-POSE-DIVERGE] frame={} true_index={} view_index={} rot_delta_deg={:.4f} pos_delta={:.4f} canonical_pos=({:.2f},{:.2f},{:.2f}) raw_pos=({:.2f},{:.2f},{:.2f})",
+                            g_frame_count, true_index, view_index, rot_delta, pos_delta,
                             hook_data.m_nsf_sync_pose_location.x, hook_data.m_nsf_sync_pose_location.y, hook_data.m_nsf_sync_pose_location.z,
                             view_location->x, view_location->y, view_location->z);
                     }
                 }
 
-                // HARD-CUT OVERRIDE: see double-precision branch above for full rationale. Uses spike-
-                // relative-to-baseline + absolute-floor detection instead of a flat threshold, since a
-                // flat threshold alone misfires on fast thumbstick turns (this runs every frame
-                // regardless of what's driving the camera, unlike the Lua script's CineCameraActor gate).
-                const bool use_sensitivity_boost = vr->is_diag_post_hard_cut_sensitivity_boost_enabled() &&
-                    hook_data.is_within_post_hard_cut_window(vr->get_diag_post_hard_cut_sensitivity_boost_window_ms());
-                const bool is_hard_cut = hook_data.is_nsf_sync_pose_hard_cut(rot_delta, pos_delta,
-                    use_sensitivity_boost ? vr->get_diag_post_hard_cut_sensitivity_boost_multiplier() : 0.0f);
+                // UNIFIED: hard-assign this call's rotation (and, unless disabled, position) to the
+                // single canonical pose captured for this frame. No blend/snap distinction remains -
+                // every non-first call this frame always matches the first call exactly, so neither
+                // eye (nor the auxiliary view) is ever a "follower" lagging behind the other.
+                *view_rotation = hook_data.m_nsf_sync_pose_rotation;
 
-                // TRIGGER: see double-precision branch above for full rationale - only report on an
-                // actual hard-cut-grade spike, not the near-zero logging threshold, so the auto-mirror
-                // fallback doesn't stay engaged (showing a flat non-stereo image) for the entire
-                // duration of ordinary thumbstick-driven camera turning.
-                if (is_hard_cut) {
-                    g_hook->report_pose_divergence_event();
-                }
-
-                // DIAG: see the matching double-precision branch above for full rationale.
-                const bool force_full = vr->is_native_stereo_fix_sync_pose_force_full_enabled();
-
-                const bool use_gradual_convergence = vr->is_diag_gradual_hard_cut_convergence_enabled();
-
-                const auto blend_alpha_f = use_gradual_convergence
-                    ? hook_data.get_nsf_gradual_convergence_alpha(is_hard_cut || force_full, vr->get_diag_gradual_hard_cut_convergence_duration_ms())
-                    : (is_hard_cut || force_full)
-                        ? 1.0f
-                        : vr->get_native_stereo_fix_sync_pose_blend_alpha();
-
-                if (force_full && vr->is_diag_sync_pose_verbose_logging_enabled()) {
-                    SPDLOG_WARN("[VR][NSF-SYNC-FORCE-FULL] frame={} rot_delta_deg={:.4f} pos_delta={:.4f} applying FULL snap (is_hard_cut={})",
-                        g_frame_count, rot_delta, pos_delta, is_hard_cut);
-                }
-
-                // DIAG: see the matching double-precision branch above for full rationale.
-                if (bool marked = false; auto seq = vr->consume_dash_capture_frame(marked)) {
-                    SPDLOG_WARN("[VR][DASH-CAPTURE]{} seq={} frame={} rot_delta_deg={:.4f} pos_delta={:.4f} "
-                                "rot_ema={:.4f} pos_ema={:.4f} is_hard_cut={} force_full={} blend_alpha={:.3f} "
-                                "pass1_rot=({:.3f},{:.3f},{:.3f}) pass2_rot_before=({:.3f},{:.3f},{:.3f})",
-                        marked ? " [MARK]" : "", *seq, g_frame_count, rot_delta, pos_delta,
-                        hook_data.m_nsf_pose_delta_rot_ema, hook_data.m_nsf_pose_delta_pos_ema,
-                        is_hard_cut, force_full, blend_alpha_f,
-                        hook_data.m_nsf_sync_pose_rotation.pitch, hook_data.m_nsf_sync_pose_rotation.yaw, hook_data.m_nsf_sync_pose_rotation.roll,
-                        view_rotation->pitch, view_rotation->yaw, view_rotation->roll);
-                }
-
-                if (blend_alpha_f >= 1.0f) {
-                    *view_rotation = hook_data.m_nsf_sync_pose_rotation;
-                } else if (blend_alpha_f > 0.0f) {
-                    view_rotation->yaw = std::lerp(view_rotation->yaw, hook_data.m_nsf_sync_pose_rotation.yaw, blend_alpha_f);
-                    view_rotation->pitch = std::lerp(view_rotation->pitch, hook_data.m_nsf_sync_pose_rotation.pitch, blend_alpha_f);
-                    view_rotation->roll = std::lerp(view_rotation->roll, hook_data.m_nsf_sync_pose_rotation.roll, blend_alpha_f);
-                }
-
-                // See double-precision branch above for rationale: this runs before the later per-eye
-                // eye_separation/IPD offset is applied to *view_location, so parallax is preserved.
-                //
-                // DIAG: see the matching double-precision branch above for full rationale on the
-                // rotation-gate/sustained-motion position-sync suppression tests. Both also require
-                // pos_delta to be under the shared ceiling so purely-positional hard cuts (huge
-                // pos_delta, near-zero rotation) are never suppressed.
-                const bool is_low_rotation = rot_delta < vr->get_diag_rotation_gated_position_sync_threshold_deg();
-                const bool is_low_position = pos_delta < vr->get_diag_position_sync_suppression_pos_delta_ceiling();
-                const bool is_dash_like = is_low_rotation && is_low_position;
-                const bool suppress_by_sustained_motion = hook_data.update_and_check_sustained_motion_suppression(
-                    is_dash_like, vr->get_diag_sustained_motion_position_sync_suppression_frames())
-                    && vr->is_diag_sustained_motion_position_sync_suppression_enabled();
-                const bool suppress_by_rotation_gate = vr->is_diag_rotation_gated_position_sync_enabled() && is_dash_like;
-                const bool suppress_position_sync = suppress_by_rotation_gate || suppress_by_sustained_motion;
-
-                if (vr->is_native_stereo_fix_sync_pose_position_enabled() && !suppress_position_sync) {
-                    if (blend_alpha_f >= 1.0f) {
-                        *view_location = hook_data.m_nsf_sync_pose_location;
-                    } else if (blend_alpha_f > 0.0f) {
-                        view_location->x = std::lerp(view_location->x, hook_data.m_nsf_sync_pose_location.x, blend_alpha_f);
-                        view_location->y = std::lerp(view_location->y, hook_data.m_nsf_sync_pose_location.y, blend_alpha_f);
-                        view_location->z = std::lerp(view_location->z, hook_data.m_nsf_sync_pose_location.z, blend_alpha_f);
-                    }
+                if (vr->is_native_stereo_fix_sync_pose_position_enabled()) {
+                    *view_location = hook_data.m_nsf_sync_pose_location;
                 }
             }
-        }
-    }
-
-    // DIAG: DiagApplySyncedPoseToExcludedViewIndex. view_index=1 was excluded above from ever
-    // writing to/consuming the NSF sync-pose cache (it races with the real eye and isn't a
-    // renderable eye - see NSF-VIEWINDEX-IDENTITY: it never gets its own FSceneView, and fires a
-    // variable number of times per frame, consistent with a shadow-cascade/occlusion sub-view pass
-    // rather than a second eye). That exclusion fixed the eye blur/desync, but left this index's own
-    // pose completely untouched, so whatever shadow/culling subsystem consumes it keeps seeing
-    // whatever raw (possibly stale/mid-transition) pose the engine handed it - plausibly explaining
-    // inconsistent foliage-sway culling/shadow behavior independent of the eye-blur fix.
-    //
-    // This applies the SAME fully-converged pose the real eyes settle on (read-only: does not set
-    // have_left, does not write m_nsf_sync_pose_*) to the excluded index, so its frustum/pose stays
-    // coherent with the actual HMD pose without re-introducing the cache race. Gated so it can be
-    // disabled independently if it turns out to break/flicker culling instead of fixing it.
-    if (!is_manual_call && diag_exclude_from_sync_cache && vr->is_diag_apply_synced_pose_to_excluded_view_index_enabled() &&
-        vr->is_native_stereo_fix_enabled() && !vr->is_using_afr() && vr->is_native_stereo_fix_sync_pose_enabled() && !is_full_pass) {
-        auto& hook_data = *g_hook;
-
-        if (has_double_precision) {
-            *rot_d = hook_data.m_nsf_sync_pose_rotation_double;
-
-            if (vr->is_native_stereo_fix_sync_pose_position_enabled()) {
-                auto* local_view_d = (Vector3d*)view_location;
-                *local_view_d = hook_data.m_nsf_sync_pose_location_double;
-            }
-        } else {
-            *view_rotation = hook_data.m_nsf_sync_pose_rotation;
-
-            if (vr->is_native_stereo_fix_sync_pose_position_enabled()) {
-                *view_location = hook_data.m_nsf_sync_pose_location;
-            }
-        }
-
-        if (vr->is_diag_sync_pose_verbose_logging_enabled()) {
-            SPDLOG_INFO_EVERY_N_SEC(2, "[VR][NSF-EXCLUDED-INDEX-SYNCED] view_index={} frame={} applied cached synced pose (read-only)",
-                view_index, g_frame_count);
         }
     }
 
@@ -12309,8 +14636,8 @@ __forceinline void FFakeStereoRenderingHook::calculate_stereo_view_offset(
         }
 
         if (vr->is_diag_verbose_logging_enabled() && (diag_stereo_offset_count <= 20 || diag_stereo_offset_count % 301 == 1)) {
-            SPDLOG_INFO("[DIAG] calculate_stereo_view_offset (#{}): view_index={} true_index={} is_full_pass={} is_using_afr={} g_frame_count={} index_starts_from_one={} vr_frame_count={} vr_left_interval={} vr_right_interval={} left_calls={} right_calls={} last_left_call=#{} last_right_call=#{}",
-                diag_stereo_offset_count, view_index, true_index, is_full_pass, vr->is_using_afr(), g_frame_count, index_starts_from_one,
+            SPDLOG_INFO("[DIAG] calculate_stereo_view_offset (#{}): view_index={} true_index={} is_full_pass={} is_using_afr={} g_frame_count={} vr_frame_count={} vr_left_interval={} vr_right_interval={} left_calls={} right_calls={} last_left_call=#{} last_right_call=#{}",
+                diag_stereo_offset_count, view_index, true_index, is_full_pass, vr->is_using_afr(), g_frame_count,
                 vr->m_render_frame_count, vr->m_left_eye_interval, vr->m_right_eye_interval,
                 diag_left_calls, diag_right_calls, diag_last_left_call_index, diag_last_right_call_index);
         }
@@ -12688,22 +15015,12 @@ __forceinline Matrix4x4f* FFakeStereoRenderingHook::calculate_stereo_projection_
         return out;
     }
 
-    static bool index_starts_from_one = true;
-    static bool index_was_ever_two = false;
-
     // This is eSSP_FULL, we don't care. It will cause the view to become monoscopic if we do anything.
     // or maybe we should, this could be used for WorldToScreen.
-    /*if (index_was_ever_two && view_index == 0) {
+    /*if (view_index == 0) {
         SPDLOG_INFO_ONCE("Index was ever two, and now it's zero. This is eSSP_FULL, we don't care. It will cause the view to become monoscopic if we do anything.");
         return out;
     }*/
-
-    if (view_index == 2) {
-        index_starts_from_one = true;
-        index_was_ever_two = true;
-    } else if (view_index == 0) {
-        index_starts_from_one = false;
-    }
 
     // Can happen if we hooked this differently.
     if (g_hook->m_calculate_stereo_projection_matrix_hook) {
@@ -12719,7 +15036,7 @@ __forceinline Matrix4x4f* FFakeStereoRenderingHook::calculate_stereo_projection_
     if (VR::get()->is_using_2d_screen()) {
         if (vr->is_glitch_eye_diag_window_active()) {
             SPDLOG_WARN("[VR][NSF-PROJ-BYPASS] is_using_2d_screen==true, VR projection override SKIPPED view_index={} true_index_guess={} g_frame_count={}",
-                view_index, index_starts_from_one ? ((view_index + 1) % 2) : (view_index % 2), g_frame_count);
+                view_index, classify_true_index(view_index), g_frame_count);
         }
 
         float fov = 90.0f; // todo, get from FMinimalViewInfo
@@ -12753,7 +15070,7 @@ __forceinline Matrix4x4f* FFakeStereoRenderingHook::calculate_stereo_projection_
     // SPDLOG_INFO("NearZ: {}", old_znear);
 
     if (out != nullptr) {
-        auto true_index = index_starts_from_one ? ((view_index + 1) % 2) : (view_index % 2);
+        auto true_index = classify_true_index(view_index);
 
         // REVERTED: an earlier attempt restricted the update_matrices()+projection-override block
         // below to a "main stereo pass" view_index range, based on a hypothesis that an extra
@@ -12861,62 +15178,18 @@ __forceinline Matrix4x4f* FFakeStereoRenderingHook::calculate_stereo_projection_
             double_matrix = fmat;
         }
 
-        // FALLBACK: this title only ever calls CalculateStereoProjectionMatrix ONCE per frame (it
-        // is natively a 2D game; forcing vr.InstancedStereo=0 did not change this - confirmed via
-        // runtime STEREO-SETUP logs still showing proj_calls=0 for the un-called eye on every
-        // frame). Since the engine will never call this function a second time for the other eye
-        // this frame, directly patch that eye's cached FSceneView's ViewProjectionMatrix ourselves,
-        // using the byte offset of `out` relative to THIS eye's cached FSceneView* (found via
-        // sceneview_constructor) applied to the OTHER eye's cached FSceneView*. This avoids needing
-        // init_canvas()'s offset scan, which never runs in this title.
-        if (!vr->is_using_afr() && vr->is_native_stereo_fix_dual_write_projection_enabled()) {
-            const auto other_index = 1 - true_index;
-
-            auto& sceneview_data = g_hook->m_sceneview_data;
-            auto* this_eye_view = sceneview_data.cached_view_for_eye[true_index];
-            auto* other_eye_view = sceneview_data.cached_view_for_eye[other_index];
-
-            const bool views_fresh =
-                this_eye_view != nullptr && other_eye_view != nullptr &&
-                sceneview_data.cached_view_frame_count[true_index] == g_frame_count &&
-                sceneview_data.cached_view_frame_count[other_index] == g_frame_count;
-
-            if (views_fresh) {
-                const auto this_eye_view_addr = (uintptr_t)this_eye_view;
-                const auto out_addr = (uintptr_t)out;
-
-                // Sanity: `out` must actually live inside this eye's FSceneView, and the computed
-                // offset must be small/plausible, otherwise bail rather than write to a wild address.
-                constexpr uintptr_t max_plausible_offset = 0x2000;
-
-                if (out_addr >= this_eye_view_addr && (out_addr - this_eye_view_addr) < max_plausible_offset) {
-                    const auto matrix_offset = out_addr - this_eye_view_addr;
-                    auto* other_out = (Matrix4x4f*)((uintptr_t)other_eye_view + matrix_offset);
-
-                    if (!IsBadWritePtr(other_out, g_hook->m_has_double_precision ? sizeof(Matrix4x4d) : sizeof(Matrix4x4f))) {
-                        if (!g_hook->m_has_double_precision) {
-                            *other_out = VR::get()->get_projection_matrix((VRRuntime::Eye)(other_index));
-                        } else {
-                            auto& other_double_matrix = *(Matrix4x4d*)other_out;
-                            const auto other_fmat = VR::get()->get_projection_matrix((VRRuntime::Eye)(other_index));
-                            other_double_matrix = other_fmat;
-                        }
-
-                        SPDLOG_INFO_EVERY_N_SEC(2, "[VR][NSF-PROJ-DUAL-WRITE] frame={} wrote other_index={} at offset={:x} (this_view={:x} other_view={:x})",
-                            g_frame_count, other_index, matrix_offset, (uintptr_t)this_eye_view, (uintptr_t)other_eye_view);
-                    } else {
-                        SPDLOG_WARNING_EVERY_N_SEC(2, "[VR][NSF-PROJ-DUAL-WRITE] frame={} SKIPPED: computed other_out address {:x} failed write-access check",
-                            g_frame_count, (uintptr_t)other_out);
-                    }
-                } else {
-                    SPDLOG_WARNING_EVERY_N_SEC(2, "[VR][NSF-PROJ-DUAL-WRITE] frame={} SKIPPED: implausible offset (out={:x} this_view={:x})",
-                        g_frame_count, out_addr, this_eye_view_addr);
-                }
-            } else {
-                SPDLOG_WARNING_EVERY_N_SEC(2, "[VR][NSF-PROJ-DUAL-WRITE] frame={} SKIPPED: cached views not fresh (this_view={:x} other_view={:x})",
-                    g_frame_count, (uintptr_t)this_eye_view, (uintptr_t)other_eye_view);
-            }
-        }
+        // REVERTED: the "dual-write" fallback (NativeStereoFixDualWriteProjection) attempted to
+        // write the other eye's projection matrix into either (a) an FSceneView-relative offset of
+        // `out`, or (b) a cached `out` pointer from a PRIOR frame. Runtime evidence disproved both:
+        // `out` is not a stable per-eye FSceneView member (attempt (a) always hit implausible
+        // offsets), and it is NOT safe to reuse across frame boundaries either - attempt (b) wrote
+        // into a stale `out` address from a previous frame (other_fresh=false) and immediately
+        // crashed the game with EXCEPTION_ACCESS_VIOLATION writing address 0x50, proving `out` is a
+        // transient/short-lived destination (e.g. stack or pooled scratch memory) that must only
+        // ever be written to synchronously, during the single call that provided it. There is no
+        // safe way to synthesize the missing eye's projection matrix via this function's `out`
+        // pointer; do not resurrect this approach without a different anchor (e.g. a real, long-
+        // lived per-eye render target/view struct) to write into instead.
 
         // DIAG: NSF-PROJ-VALUE. Capture the FINAL (post-override) per-eye projection FOV terms so
         // we can directly compare, frame-by-frame across the reported "one eye zooms back" window,
@@ -15032,18 +17305,70 @@ bool VRRenderTargetManager_Base::is_scene_capture_world_stale() const {
 }
 
 void VRRenderTargetManager_Base::destroy_scene_capture() try {
+    // Only bump the generation counter if there is actually something to tear down. destroy_scene_capture()
+    // is also called routinely as a no-op "is there anything to clean up" check (observed firing every
+    // few milliseconds even with nothing allocated), and unconditionally bumping on every call there would
+    // invalidate a newly-enqueued creation job's captured generation before its async render/RHI/game-thread
+    // handoff chain can ever complete, permanently preventing the scene capture from ever finishing.
+    const bool has_something_to_tear_down = this->scene_capture_actor != nullptr || this->in_flight_target != nullptr ||
+        this->scene_capture_target.valid() || this->scene_capture_target_rhi_thread.valid();
+
+    if (has_something_to_tear_down) {
+        // Invalidate any in-flight async scene-capture creation jobs (render/RHI/game-thread) BEFORE doing
+        // anything else, so they can bail out on their next generation check instead of racing this
+        // teardown and dereferencing a target we are about to drop our reference to.
+        this->scene_capture_generation.fetch_add(1, std::memory_order_relaxed);
+    }
+
     const auto current_generation = g_hook != nullptr ? g_hook->get_view_target_generation() : 0;
     SPDLOG_INFO("[DIAG] destroy_scene_capture() called (generation={}): scene_capture_actor={:x} in_flight_target={:x} scene_capture_target_valid={}",
         current_generation, (uintptr_t)(sdk::AActor*)this->scene_capture_actor, (uintptr_t)this->in_flight_target, this->scene_capture_target.valid());
 
     if (this->scene_capture_actor != nullptr && this->in_flight_target == nullptr) {
-        SPDLOG_INFO("Destroying scene capture!");
+        // IMPORTANT: destroy_actor() forces an IMMEDIATE, synchronous teardown of the scene capture
+        // actor/render-target resource. wait_for_scene_capture_copies() below only flushes OUR OWN
+        // compositor copy commands against that resource - it has no visibility into the game
+        // engine's own in-flight RHI/RenderThread command lists that may still be referencing the
+        // exact same render target during a real level transition (e.g. menu -> game world at ~31%
+        // load). Forcing destroy_actor() in that window has been confirmed (in-headset testing) to
+        // race the engine's own ResourceBarrier calls and crash purely inside
+        // nvwgf2umx.dll/D3D12Core.dll with no UEVR frames in the stack, even with the GPU-copy wait
+        // in place. That forced teardown is only actually necessary very early at startup, to unblock
+        // the very first scene-capture creation before any real engine rendering has had a chance to
+        // begin (i.e. before the game has ever reached its running state). Once the game has run
+        // normally at least once, prefer the safe path: drop our references and let the actor/
+        // component be collected naturally by their owning world's own GC pass (they are
+        // intentionally never rooted - see create_scene_capture()), instead of forcing a synchronous
+        // destroy that can race the engine's teardown of the same world.
+        const bool game_has_run_before = g_framework != nullptr && g_framework->is_game_data_intialized();
 
-        if (this->scene_capture_actor.valid()) {
-            // Actor/component are intentionally never rooted (see create_scene_capture()), so no
-            // remove_from_root() call is needed here - they're free to be collected normally by
-            // their owning world's GC pass if we don't get here first.
-            this->scene_capture_actor->destroy_actor();
+        if (!game_has_run_before) {
+            SPDLOG_INFO("Destroying scene capture! (pre-startup hard path)");
+
+            // SAFETY: the GPU can still have in-flight command lists referencing this scene capture's
+            // render target resource (e.g. a queued but not-yet-retired ResourceBarrier/copy from the
+            // compositor) at the exact moment the engine tears this actor/component down underneath us.
+            // Destroying the actor releases the engine's owning reference to the render target
+            // resource, and if the GPU is still mid-flight against it when that happens, the resource's
+            // underlying D3D12 object can be freed while still enqueued for use. Flush outstanding
+            // scene-capture-related GPU work first so the resource is not released while the GPU might
+            // still be using it.
+            if (g_framework != nullptr && !g_framework->is_dx11()) {
+                try {
+                    VR::get()->d3d12().wait_for_scene_capture_copies();
+                } catch (...) {
+                    SPDLOG_WARN("[VRRenderTargetManager] Exception while waiting for scene capture GPU copies before actor destruction, proceeding anyway");
+                }
+            }
+
+            if (this->scene_capture_actor.valid()) {
+                // Actor/component are intentionally never rooted (see create_scene_capture()), so no
+                // remove_from_root() call is needed here - they're free to be collected normally by
+                // their owning world's GC pass if we don't get here first.
+                this->scene_capture_actor->destroy_actor();
+            }
+        } else {
+            SPDLOG_INFO("Destroying scene capture! (post-startup soft path, deferring to engine GC - not forcing destroy_actor())");
         }
     }
 
@@ -15350,6 +17675,112 @@ bool VRRenderTargetManager_Base::create_scene_capture() try {
 
     this->scene_capture_component->set_texture_target(tgt);
 
+    // FIX: USceneCaptureComponent2D defaults its CaptureSource to SCS_SceneColorHDR, which
+    // captures the scene's pre-tonemap/pre-exposure linear HDR color, NOT the final
+    // post-processed image the main viewport actually displays (that requires
+    // SCS_FinalColorLDR). This was never set, so the right eye (scene capture) has always been
+    // rendering a fundamentally different, darker, un-tonemapped/un-exposed image than the left
+    // eye (main view's own backbuffer) - this is the root cause of the right eye appearing
+    // consistently darker/different than the left eye, confirmed via pixel sampling showing the
+    // scene_capture_tex source itself (before our compositor ever touches it) already differs
+    // from game_tex by a large luminance gap. SCS_FinalColorLDR = 2, matches the final tonemapped/
+    // exposed/color-graded LDR output the primary view presents, so left/right eyes should now
+    // be using the same color pipeline.
+    if (auto capture_source = scene_capture_c->find_property(L"CaptureSource"); capture_source != nullptr) {
+        constexpr uint8_t SCS_FinalColorLDR = 2;
+        auto capture_source_data = capture_source->get_data<uint8_t>(this->scene_capture_component);
+        const auto before_value = capture_source_data != nullptr ? *capture_source_data : (uint8_t)0xFF;
+        if (capture_source_data != nullptr) {
+            *capture_source_data = SCS_FinalColorLDR;
+        }
+        const auto after_value = capture_source_data != nullptr ? *capture_source_data : (uint8_t)0xFF;
+        SPDLOG_INFO("[VRRenderTargetManager][DIAG] CaptureSource property found at offset={} data_ptr={:x} before={} after={} (expected={})",
+            capture_source->get_offset(), (uintptr_t)capture_source_data, before_value, after_value, SCS_FinalColorLDR);
+    } else {
+        SPDLOG_WARN("[VRRenderTargetManager] CaptureSource property not found on USceneCaptureComponent2D - "
+                    "right eye may render in the wrong (pre-tonemap HDR) color space");
+    }
+
+    // DIAG: dump the capture component's OWN PostProcessSettings/blend-weight at creation time.
+    // Even with CaptureSource now forcing a tonemapped/exposed LDR output, the capture component
+    // has its own independent PostProcessSettings struct/BlendWeight (separate from the main
+    // camera's), which defaults to engine defaults rather than inheriting/matching the main
+    // camera's auto-exposure bias, color grading, or tonemapper curve. If PostProcessBlendWeight
+    // is 0, the capture's own (possibly default/neutral) post-process has NO influence and the
+    // capture purely inherits whatever the renderer applies globally for CaptureSource - so a
+    // low/zero blend weight here would point AWAY from "capture's own PP settings" as the cause.
+    // A nonzero blend weight with different settings than the main camera would point TOWARD it.
+    {
+        auto pp_blend_weight = this->scene_capture_component->get_post_process_blend_weight();
+        auto pp_settings = this->scene_capture_component->get_post_process_settings();
+        SPDLOG_INFO("[VRRenderTargetManager][DIAG] Scene capture PostProcessBlendWeight={:.3f} PostProcessSettings_ptr={:x}",
+            pp_blend_weight != nullptr ? *pp_blend_weight : -1.0f, (uintptr_t)pp_settings);
+
+        auto capture_source_readback = scene_capture_c->find_property(L"CaptureSource");
+        if (capture_source_readback != nullptr) {
+            auto data = capture_source_readback->get_data<uint8_t>(this->scene_capture_component);
+            SPDLOG_INFO("[VRRenderTargetManager][DIAG] CaptureSource immediate re-read after set: value={}", data != nullptr ? *data : (uint8_t)0xFF);
+        }
+
+        // FIX: The scene capture's OWN PostProcessSettings runs its own independent
+        // auto-exposure (eye adaptation), separate from and unsynchronized with the main
+        // camera's. Pixel sampling showed this causes the right eye to be a FIXED ~0.87x
+        // darker than the left at the (brightly, statically lit) main menu, but a much more
+        // severe and DRIFTING ~0.14-0.6x darker during actual (dynamically lit) gameplay -
+        // the classic signature of two independently-adapting exposure histories diverging
+        // over time, which also presents as right-eye flicker as they drift in and out of
+        // sync.
+        //
+        // ATTEMPT 1 (reverted): forcing AutoExposureMethod=Manual with default/unset
+        // ISO/aperture/shutter speed stopped the drift (confirming the independent-exposure
+        // hypothesis - the right eye became rock-stable frame-to-frame), but Manual mode
+        // computes its own exposure from those separate camera settings, which don't match
+        // the main camera's either, so the static mismatch just flipped direction/magnitude
+        // (right eye went from darker to ~2.3x BRIGHTER than left) instead of being fixed.
+        //
+        // ATTEMPT 2: instead of switching exposure METHOD, collapse the auto-exposure
+        // compensation curve to a single fixed point by overriding AutoExposureMinBrightness
+        // and AutoExposureMaxBrightness to the same neutral value (1.0 EV, i.e. "no
+        // compensation"). This keeps whatever AutoExposureMethod the capture already uses
+        // (matching the main camera's default engine/project setting instead of guessing),
+        // but removes its ability to adapt/drift over time or settle on a different fixed
+        // point than the main view, since min==max pins the output at a single, stable value
+        // regardless of scene content.
+        if (pp_settings != nullptr) {
+            static const auto pp_struct = sdk::find_uobject<sdk::UScriptStruct>(L"ScriptStruct /Script/Engine.PostProcessSettings");
+
+            if (pp_struct != nullptr) {
+                auto apply_override = [&](const wchar_t* override_name, const wchar_t* value_name, auto value) {
+                    using ValueType = decltype(value);
+
+                    if (auto override_prop = pp_struct->find_property(override_name); override_prop != nullptr) {
+                        if (auto override_data = override_prop->get_data<bool>(pp_settings); override_data != nullptr) {
+                            *override_data = true;
+                        }
+                    }
+
+                    if (auto value_prop = pp_struct->find_property(value_name); value_prop != nullptr) {
+                        if (auto value_data = value_prop->get_data<ValueType>(pp_settings); value_data != nullptr) {
+                            *value_data = value;
+                            return true;
+                        }
+                    }
+
+                    return false;
+                };
+
+                const auto bias_ok = apply_override(L"bOverride_AutoExposureBias", L"AutoExposureBias", 0.0f);
+                const auto min_ok = apply_override(L"bOverride_AutoExposureMinBrightness", L"AutoExposureMinBrightness", 1.0f);
+                const auto max_ok = apply_override(L"bOverride_AutoExposureMaxBrightness", L"AutoExposureMaxBrightness", 1.0f);
+
+                SPDLOG_INFO("[VRRenderTargetManager][DIAG] Scene capture fixed-exposure fix applied: AutoExposureBias={} AutoExposureMinBrightness={} AutoExposureMaxBrightness={}",
+                    bias_ok, min_ok, max_ok);
+            } else {
+                SPDLOG_WARN("[VRRenderTargetManager] PostProcessSettings ScriptStruct not found - cannot force fixed exposure on scene capture");
+            }
+        }
+    }
+
     // We don't actually want this to tick.
     // We are just using the property as a convenient way to keep the texture alive without crashing.
     this->scene_capture_component->set_visibility(false);
@@ -15364,8 +17795,17 @@ bool VRRenderTargetManager_Base::create_scene_capture() try {
     // causing wind-animated foliage to appear static and shadows/LOD to be left-eye-dominated in
     // the right eye. bAlwaysPersistRenderingState tells the engine to keep that per-view state
     // updated/persisted across captures even though the component itself isn't auto-ticking.
+    // DIAG A/B: see VR::is_diag_nsf_persist_rendering_state_disabled(). Lets us test whether forcing
+    // this persisted-state flag (vs. leaving the engine default) is itself contributing to the
+    // NSF-only bilateral dark overlay/flicker, without touching the rest of the capture setup.
+    const bool diag_disable_persist = VR::get() != nullptr && VR::get()->is_diag_nsf_persist_rendering_state_disabled();
+
     if (auto always_persist = scene_capture_c->find_property(L"bAlwaysPersistRenderingState"); always_persist != nullptr) {
-        *always_persist->get_data<bool>(this->scene_capture_component) = true;
+        *always_persist->get_data<bool>(this->scene_capture_component) = !diag_disable_persist;
+
+        if (diag_disable_persist) {
+            SPDLOG_INFO("[DIAG] bAlwaysPersistRenderingState forced to false on scene capture (diag_nsf_disable_persist_rendering_state=true)");
+        }
     } else {
         SPDLOG_WARN("[VRRenderTargetManager] bAlwaysPersistRenderingState property not found on USceneCaptureComponent2D - "
                     "wind/shadow/LOD desync between eyes may persist");
@@ -15428,10 +17868,19 @@ bool VRRenderTargetManager_Base::create_scene_capture() try {
     // Enqueue offset lookup on the render thread because that's when the resource is actually created.
     if (!already_updated) {
         this->in_flight_target = tgt;
+        const auto captured_generation = this->scene_capture_generation.load(std::memory_order_relaxed);
 
         // Repeats every render loop for 5 seconds, times out if the texture is not created.
-        RenderThreadWorker::ConditionalJobFunc render_thread_conditional_task = [this, tgt]() -> bool {
+        RenderThreadWorker::ConditionalJobFunc render_thread_conditional_task = [this, tgt, captured_generation]() -> bool {
             try {
+                // Bail out immediately if destroy_scene_capture() ran since this job was enqueued, even
+                // if tgt.valid() hasn't caught up yet - see scene_capture_generation's declaration for why
+                // this is necessary on top of the tgt.valid() check below.
+                if (this->scene_capture_generation.load(std::memory_order_relaxed) != captured_generation) {
+                    SPDLOG_WARN("Scene capture generation changed, aborting stale offset-lookup job!");
+                    return true;
+                }
+
                 if (!tgt.valid()) {
                     SPDLOG_ERROR("Scene capture target was destroyed between threads!");
                     GameThreadWorker::get().enqueue([this]() -> void {
@@ -15440,7 +17889,7 @@ bool VRRenderTargetManager_Base::create_scene_capture() try {
                     });
                     return true;
                 }
-    
+
                 if (sdk::UTexture::update_render_resource_offset_texture2d(tgt)) {
                     SPDLOG_INFO("Successfully updated render resource offset for scene capture target!");
     
@@ -15457,9 +17906,9 @@ bool VRRenderTargetManager_Base::create_scene_capture() try {
                             }
     
                             hook_frt(frt);
-    
-                            RHIThreadWorker::get().enqueue([this, tgt]() -> void {
-                                if (!tgt.valid()) {
+
+                            RHIThreadWorker::get().enqueue([this, tgt, captured_generation]() -> void {
+                                if (this->scene_capture_generation.load(std::memory_order_relaxed) != captured_generation || !tgt.valid()) {
                                     SPDLOG_ERROR("Scene capture target was destroyed between threads!");
                                     this->scene_capture_target_rhi_thread = nullptr;
                                     return;
@@ -15467,9 +17916,9 @@ bool VRRenderTargetManager_Base::create_scene_capture() try {
 
                                 this->scene_capture_target_rhi_thread = tgt;
                             });
-                            
-                            GameThreadWorker::get().enqueue([this, tgt]() -> void {
-                                if (!tgt.valid()) {
+
+                            GameThreadWorker::get().enqueue([this, tgt, captured_generation]() -> void {
+                                if (this->scene_capture_generation.load(std::memory_order_relaxed) != captured_generation || !tgt.valid()) {
                                     SPDLOG_ERROR("Scene capture target was destroyed between threads!");
                                     this->in_flight_target = nullptr;
                                     destroy_scene_capture();
@@ -15533,33 +17982,42 @@ bool VRRenderTargetManager_Base::create_scene_capture() try {
         SPDLOG_INFO("Waiting for scene capture texture to be created...");
     } else {
         this->in_flight_target = tgt;
+        const auto captured_generation = this->scene_capture_generation.load(std::memory_order_relaxed);
 
-        RenderThreadWorker::ConditionalJobFunc render_thread_conditional_task = [this, tgt]() -> bool {
+        RenderThreadWorker::ConditionalJobFunc render_thread_conditional_task = [this, tgt, captured_generation]() -> bool {
             try {
+                // Bail out immediately if destroy_scene_capture() ran since this job was enqueued, even
+                // if tgt.valid() hasn't caught up yet - critical here because this branch runs when the
+                // offset is already cached and therefore skips FTexture/UTexture's own SEH-guarded scan.
+                if (this->scene_capture_generation.load(std::memory_order_relaxed) != captured_generation) {
+                    SPDLOG_WARN("Scene capture generation changed, aborting stale offset-lookup job!");
+                    return true;
+                }
+
                 if (!tgt.valid()) {
                     SPDLOG_ERROR("Scene capture target was destroyed between threads!");
                     GameThreadWorker::get().enqueue([this]() -> void {
                         this->in_flight_target = nullptr;
                         destroy_scene_capture();
                     });
-    
+
                     return true;
                 }
-    
+
                 auto rsrc = (sdk::FTextureRenderTargetResource*)tgt->get_resource();
                 auto frt = rsrc != nullptr ? rsrc->as_render_target() : nullptr;
                 auto frttex = frt != nullptr ? frt->get_render_target_texture() : nullptr;
-    
+
                 // Wait until FRenderTarget is not null.
                 if (frt == nullptr || frttex == nullptr || *frttex == nullptr) {
                     SPDLOG_WARN("Waiting for render target to be valid...");
                     return false;
                 }
-    
+
                 hook_frt(frt);
-    
-                RHIThreadWorker::get().enqueue([this, tgt]() -> void {
-                    if (!tgt.valid()) {
+
+                RHIThreadWorker::get().enqueue([this, tgt, captured_generation]() -> void {
+                    if (this->scene_capture_generation.load(std::memory_order_relaxed) != captured_generation || !tgt.valid()) {
                         SPDLOG_ERROR("Scene capture target was destroyed between threads!");
                         this->scene_capture_target_rhi_thread = nullptr;
                         return;
@@ -15567,15 +18025,15 @@ bool VRRenderTargetManager_Base::create_scene_capture() try {
 
                     this->scene_capture_target_rhi_thread = tgt;
                 });
-    
-                GameThreadWorker::get().enqueue([this, tgt]() -> void {
-                    if (!tgt.valid()) {
+
+                GameThreadWorker::get().enqueue([this, tgt, captured_generation]() -> void {
+                    if (this->scene_capture_generation.load(std::memory_order_relaxed) != captured_generation || !tgt.valid()) {
                         SPDLOG_ERROR("Scene capture target was destroyed between threads!");
                         this->in_flight_target = nullptr;
                         destroy_scene_capture();
                         return;
                     }
-    
+
                     this->in_flight_target = nullptr;
                     this->scene_capture_target = tgt;
                     this->scene_capture_ready_time = std::chrono::steady_clock::now();

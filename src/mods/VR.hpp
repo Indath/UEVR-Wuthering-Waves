@@ -19,6 +19,7 @@
 #include "vr/FFakeStereoRenderingHook.hpp"
 #include "vr/RenderTargetPoolHook.hpp"
 #include "vr/CVarManager.hpp"
+#include "vr/TraceWriter.hpp"
 
 #include "Mod.hpp"
 
@@ -303,6 +304,10 @@ public:
 
     bool& diag_nsf_frame_diff_logger() {
         return m_diag_nsf_frame_diff_logger;
+    }
+
+    bool& diag_nsf_flicker_burst_capture() {
+        return m_diag_nsf_flicker_burst_capture;
     }
 
     bool& diag_nsf_eye_view_dump() {
@@ -709,12 +714,143 @@ public:
         return m_native_stereo_fix_same_pass_force_primary->value();
     }
 
+    // See m_native_stereo_fix_mirror_fov declaration for rationale. Headset-confirmed fix for the
+    // FOV/LOD mismatch between eyes; persisted via the config toggle list like the other Native
+    // Stereo Fix options.
+    bool is_native_stereo_fix_mirror_fov_enabled() const {
+        return m_native_stereo_fix_mirror_fov->value();
+    }
+
+    // DIAG: character shadows appear only in the right eye while environment/world shadows appear
+    // only in the left eye. Per UE4.26 source (ShadowSetup.cpp), whole-scene/environment shadows are
+    // gated by IStereoRendering::IsAPrimaryView(View) (rendered once, for the primary/left eye, then
+    // projected into both), while per-object (character) shadows go through a separate code path
+    // (CreatePerObjectProjectedShadow) with its own primary/secondary eye resolution. If NSF's
+    // eye-identity hacks make these two checks disagree about which eye is "primary" for a given
+    // view, exactly this kind of category-split (env shadows stick to one eye, character shadows
+    // stick to the other) would result. This toggle enables a dedicated diagnostic that logs the
+    // known eye-identity fields (StereoPass + 0x164/0x1a0/0x2ec/0xc90) for both views at each of the
+    // four key moments: before Pass1 submit, after Pass1 submit/before swap, before Pass2 submit,
+    // and after Pass2 restore - to pin down exactly when/where the two passes' identity disagree.
+    bool is_diag_log_shadow_pathway_identity_enabled() const {
+        return m_diag_log_shadow_pathway_identity->value();
+    }
+
     bool is_stereopass_diagnostics() const {
         return m_enable_stereopass_diagnostics->value(); 
     }
 
     bool is_native_stereo_fix_right_eye_shadows_enabled() const { 
          return m_native_stereo_fix_right_eye_shadows->value(); 
+    }
+    bool is_native_stereo_fix_right_eye_shadows_precise_enabled() const {
+        return m_native_stereo_fix_right_eye_shadows_precise->value();
+    }
+    bool is_native_stereo_fix_right_eye_shadows_precise_mirror_left_enabled() const {
+        return m_native_stereo_fix_right_eye_shadows_precise_mirror_left->value();
+    }
+    // DIAG: tests the render-thread race hypothesis - BeginRenderingViewFamily enqueues work to the
+    // render thread and can return before (or long after) that thread actually reads StereoPass, so
+    // restoring the original value the instant the game-thread call returns may let the render
+    // thread observe either the forced or the original value depending on scheduling jitter, causing
+    // per-frame flicker/darkening. When enabled, the precise fix's write is left in place (no
+    // restore) - relies on the known every-frame constructor re-stamp of pooled views to naturally
+    // reset it next frame. Default OFF - only for deliberate A/B testing.
+    bool is_native_stereo_fix_right_eye_shadows_precise_no_restore_enabled() const {
+        return m_native_stereo_fix_right_eye_shadows_precise_no_restore->value();
+    }
+    // DIAG: the broader heuristic eye_fields write loop (separate from the "precise" c90/1a0 fix
+    // above) ALWAYS restores pass2's original field values at the end of the frame, every single
+    // frame, with no toggle - meaning every field it touches is forced to match the left eye, then
+    // immediately reverted back to its original (different) value, then forced again next frame.
+    // That continuous write->revert->write cycle at eye_fields field count * every frame is a
+    // direct candidate for a persistent "fighting" flicker. When enabled, skip that restore so the
+    // written (left-matching) value is left in place on pass2 instead of being reverted - relies on
+    // the same every-frame constructor re-stamp of pooled views to naturally reset it if needed.
+    // Default OFF - only for deliberate A/B testing.
+    bool is_native_stereo_fix_right_eye_eye_fields_no_restore_enabled() const {
+        return m_native_stereo_fix_right_eye_eye_fields_no_restore->value();
+    }
+    // DIAG: manual override for the eye_fields scan (see sceneview_xref::eye_fields /
+    // refresh_eye_fields in FFakeStereoRenderingHook.cpp). Only {0xC, 0x13C} are hardcoded as
+    // always-excluded (confirmed to crash the engine). Everything else found by the scan is a
+    // heuristic guess, and the set of offsets that survive from run to run has proven inconsistent
+    // (see stereo4.txt sessions) - some offsets that fix right-eye darkness in one run look like
+    // "noise" in another. These let the user force specific offsets in or out without recompiling,
+    // to pin down exactly which offset(s) are responsible for the darkness vs the flicker.
+    // Format: comma/space separated hex or decimal offsets, e.g. "0x130, 0x164 0x1A0".
+    const std::string& native_stereo_fix_eye_fields_manual_exclude() const {
+        return m_native_stereo_fix_eye_fields_manual_exclude->value();
+    }
+    const std::string& native_stereo_fix_eye_fields_manual_include() const {
+        return m_native_stereo_fix_eye_fields_manual_include->value();
+    }
+    // DIAG: per-offset checkbox accessors for the six known candidate eye_fields offsets (replaces
+    // needing to type hex into the manual include/exclude text boxes for these specific ones).
+    // ON (default) = force this offset INTO the scan/refresh result every time, bypassing the
+    // normal small-int/pointer-like/null-right filters. OFF = force this offset OUT, no matter
+    // what the live scan would otherwise find.
+    // DIAG: logs the render-target swap, view-array swap, scene frame-count mutation, and
+    // pass2 view-state null/restore that run unconditionally every frame for NSF Pass2, completely
+    // independent of the eye_fields write loop. An earlier A/B test proved restricting eye_fields to
+    // only the 6 known offsets left the flicker completely unchanged, so this instruments the other
+    // parts of the Pass2 pipeline that are candidates instead.
+    bool is_diag_nsf_pass2_pipeline_trace_enabled() const { return m_diag_nsf_pass2_pipeline_trace->value(); }
+    bool is_eye_field_offset_130_enabled() const { return m_eye_field_offset_130_enabled->value(); }
+    bool is_eye_field_offset_154_enabled() const { return m_eye_field_offset_154_enabled->value(); }
+    bool is_eye_field_offset_164_enabled() const { return m_eye_field_offset_164_enabled->value(); }
+    bool is_eye_field_offset_1A0_enabled() const { return m_eye_field_offset_1A0_enabled->value(); }
+    bool is_eye_field_offset_2EC_enabled() const { return m_eye_field_offset_2EC_enabled->value(); }
+    bool is_eye_field_offset_C90_enabled() const { return m_eye_field_offset_C90_enabled->value(); }
+    // The ONLY two changes that have ever altered the visible darkness behavior (user-confirmed):
+    // 1) excluding 0x13C from the scans (stopped the CONSTANT right-eye darkness - writing 0x13C
+    //    actively caused it), and 2) debouncing the refresh scan (slowed the flicker). Both are
+    //    exposed as toggles so they can be A/B tested manually instead of being hardcoded.
+    // ON (default) = 0x13C is excluded from both scans, like the previously hardcoded behavior.
+    // OFF = 0x13C becomes a normal scan candidate again (expect constant right-eye darkness).
+    bool is_eye_field_exclude_13c_enabled() const { return m_eye_field_exclude_13c->value(); }
+    // ON = a candidate offset must differ across 2 consecutive refresh cycles (~4s) before being
+    // promoted into eye_fields, and must match across 2 consecutive cycles before being dropped -
+    // filters one-cycle transient noise offsets that otherwise churn in/out every 2s.
+    // OFF (previous behavior) = single-snapshot add/remove, maximum churn.
+    bool is_eye_field_refresh_debounce_enabled() const { return m_eye_field_refresh_debounce->value(); }
+    // Inline-hooks the primary-view predicate function itself (the same one the memory-patch
+    // precise fix validates bytes against) instead of writing/restoring +0xC90/+0x1A0 around the
+    // game-thread-only BeginRenderingViewFamily call. Runs on whatever thread actually calls the
+    // predicate, so there's no window where a different thread can observe the un-patched value -
+    // removes the render-thread race class of bug entirely. Mutually exclusive in practice with
+    // the memory-patch precise fix; prefer this one once confirmed working.
+    bool is_native_stereo_fix_right_eye_shadows_predicate_hook_enabled() const {
+        return m_native_stereo_fix_right_eye_shadows_predicate_hook->value();
+    }
+    bool is_diag_watchpoint_trace_c90_enabled() const {
+        return m_diag_watchpoint_trace_c90->value();
+    }
+    // DIAG: one-shot hardware watchpoint on the live backing float of r.Shadow.CSM.TransitionScale,
+    // armed for the same widened window as the existing +0xC90/+0x164 tracers. Confirmed behavior:
+    // TransitionScale=1 shows environmental/cascade shadows only in the left eye; =0 removes them
+    // from both eyes. Tracing reads/writes of the cvar's backing float during Pass1/Pass2 rendering
+    // should reveal the exact call site(s) that consume it, to narrow the shadow fix to the real
+    // cascade-shadow input instead of unrelated FSceneView fields.
+    bool is_diag_watchpoint_trace_csm_transition_scale_enabled() const {
+        return m_diag_watchpoint_trace_csm_transition_scale->value();
+    }
+    // DIAG (A/B test): while the right-eye shadow fix is active, force eye-adaptation/auto-exposure
+    // off via r.EyeAdaptationQuality=0. The shadow fix flips the right eye's StereoPass/primary
+    // identity for one render call; if exposure history is keyed off that identity (e.g. reading or
+    // writing the wrong eye's accumulated exposure value), this would manifest as exactly the
+    // observed symptom: both-eye flicker plus a persistent right-eye darkening. Disabling exposure
+    // entirely removes it as a variable. Default OFF - opt in only for this specific test.
+    bool is_diag_disable_eye_adaptation_during_shadow_fix_enabled() const {
+        return m_diag_disable_eye_adaptation_during_shadow_fix->value();
+    }
+    // DIAG (A/B test): while the right-eye shadow fix is active, force TAA off via
+    // r.PostProcessAAQuality=0. Tests whether the symptom comes from temporal history buffer
+    // cross-contamination between eyes (the forced identity swap could make the right eye read/
+    // write the left eye's TAA history slot for one frame). Default OFF - opt in only for this
+    // specific test.
+    bool is_diag_disable_taa_during_shadow_fix_enabled() const {
+        return m_diag_disable_taa_during_shadow_fix->value();
     }
     bool is_native_stereo_fix_auto_suspend_enabled() const {
         return m_native_stereo_fix_auto_suspend->value();
@@ -724,9 +860,14 @@ public:
         return m_native_stereo_fix_null_pass2_view_state->value();
     }
 
-    // See m_native_stereo_fix_dual_write_projection for rationale. Fallback-only, defaults OFF.
+    // DISABLED: proven unsafe by runtime testing. The dual-write fallback cached the `out` pointer
+    // from calculate_stereo_projection_matrix and wrote into it on a LATER frame for the other eye.
+    // `out` turned out to be a transient/short-lived scratch destination (not a stable per-eye
+    // struct member), so writing into a stale cached copy of it caused an immediate
+    // EXCEPTION_ACCESS_VIOLATION game crash. Hard-disabled here (ignoring the underlying toggle
+    // value) until a safe, long-lived anchor is found to write the other eye's projection into.
     bool is_native_stereo_fix_dual_write_projection_enabled() const {
-        return m_native_stereo_fix_dual_write_projection->value();
+        return false;
     }
 
     bool is_native_stereo_fix_sync_pose_enabled() const {
@@ -1052,6 +1193,41 @@ public:
         return m_diag_log_raw_view_index->value();
     }
 
+    // DIAG: enables scanning for per-eye 64-byte (4x4 matrix-sized) regions inside the live
+    // FSceneView pair that drive culling/frustum/projection (view/projection matrices). Logs
+    // whether each candidate region differs only by a plausible lateral (IPD-style) offset between
+    // the two eyes, or is suspiciously IDENTICAL (stale/shared pointer - a likely cause of
+    // single-eye-only culling/lighting artifacts). See sceneview_xref::scan_eye_matrix_regions().
+    bool is_diag_log_eye_frustum_diff_enabled() const {
+        return m_diag_log_eye_frustum_diff->value();
+    }
+
+    // WuWa far-lighting eye mismatch fix. The game's Cascade Lighting Volume (CLV) keeps a
+    // per-eye copy in each eye's FSceneViewState; on first build (boot/teleport/loading screen)
+    // only whichever eye renders first gets its far region filled, leaving the other eye's far CLV
+    // empty (missing bounce/sky light on distant objects). Forcing r.GPUScene.UploadEveryFrame on
+    // for exactly one frame right after such a transition fills both eyes' far CLV in that same
+    // frame; leaving it on permanently freezes rendering, so it must be pulsed back off immediately.
+    bool is_match_far_lighting_between_eyes_enabled() const {
+        return m_match_far_lighting_between_eyes->value();
+    }
+
+    // Manual fallback for situations the automatic transition detection doesn't catch.
+    void request_far_lighting_refill() {
+        m_far_lighting_refill_requested.store(true, std::memory_order_relaxed);
+    }
+
+    bool consume_far_lighting_refill_request() {
+        return m_far_lighting_refill_requested.exchange(false, std::memory_order_relaxed);
+    }
+
+    // DIAG: enables the offline TraceWriter
+    // module-relative RVAs for key stereo/scene-view events to a binary trace file plus a JSON
+    // module manifest on disk, for later offline annotation via tools/ghidra/annotate_uevr_trace.py.
+    bool is_diag_trace_writer_enabled() const {
+        return m_diag_trace_writer_enabled->value();
+    }
+
     // DIAG: enables a raw-address inline hook at utility::get_executable() + m_diag_dual_view_gate_rva,
     // a statically-confirmed "dual view gate" function that reads StereoPass off two FSceneView-shaped
     // pointers (rcx/rdx at entry) and gates a shared-state/cache path on them matching. Logs both
@@ -1105,6 +1281,16 @@ public:
     // Bitmask over session-stable sceneview_xref eye-field IDs (bit N = flip field FN). Default none for safe retesting.
     uint32_t get_diag_nsf_pass2_eye_field_mask() const {
         return (uint32_t)m_diag_nsf_pass2_eye_field_mask;
+    }
+
+    // DIAG A/B: see m_diag_nsf_disable_persist_rendering_state. When true, create_scene_capture()
+    // leaves bAlwaysPersistRenderingState at its engine default instead of forcing it true.
+    bool is_diag_nsf_persist_rendering_state_disabled() const {
+        return m_diag_nsf_disable_persist_rendering_state;
+    }
+
+    void set_diag_nsf_persist_rendering_state_disabled(bool value) {
+        m_diag_nsf_disable_persist_rendering_state = value;
     }
 
     // When enabled, Native Stereo Fix never spawns/creates the scene-capture actor/component.
@@ -1639,6 +1825,9 @@ private:
     std::atomic<uint32_t> m_dash_capture_seq{0};
     std::atomic<bool> m_dash_capture_mark_pending{false};
 
+    // See request_far_lighting_refill()/consume_far_lighting_refill_request().
+    std::atomic<bool> m_far_lighting_refill_requested{false};
+
     uint32_t m_lowest_xinput_user_index{};
 
     std::chrono::nanoseconds m_last_input_delay{};
@@ -1766,6 +1955,24 @@ private:
     // authoritative table of which raw indices actually occur (observed 0-4 previously) instead of
     // inferring it indirectly from aliasing/pose diagnostics alone.
     const ModToggle::Ptr m_diag_log_raw_view_index{ ModToggle::create(generate_name("DiagLogRawViewIndex"), false) };
+    // DIAG: enables sceneview_xref::scan_eye_matrix_regions(), which scans the live FSceneView pair
+    // for 64-byte (4x4 matrix-sized) regions and logs whether each candidate region differs between
+    // the two eyes by a plausible lateral offset (expected/healthy) or is bit-identical (suspicious -
+    // a likely culprit for single-eye-only culling/frustum/lighting artifacts since both eyes would
+    // be reading the same view/projection data). Off by default - spams a line per candidate region.
+    const ModToggle::Ptr m_diag_log_eye_frustum_diff{ ModToggle::create(generate_name("DiagLogEyeFrustumDiff"), false) };
+    // WuWa far-lighting fix: pulses r.GPUScene.UploadEveryFrame on for exactly one frame right after
+    // a detected boot/loading-screen/teleport transition, then back off, so the Cascade Lighting
+    // Volume's far region gets filled for BOTH eyes in that same frame instead of only whichever eye
+    // rendered first. On by default per confirmed fix. See is_match_far_lighting_between_eyes_enabled()/
+    // request_far_lighting_refill() above and the pulse logic in begin_render_viewfamily_real().
+    const ModToggle::Ptr m_match_far_lighting_between_eyes{ ModToggle::create(generate_name("MatchFarLightingBetweenEyes"), true) };
+    // DIAG: enables/disables the offline TraceWriter singleton (src/mods/vr/TraceWriter.hpp).
+    // When toggled on, truncates any previous trace.bin and starts recording binary trace records
+    // to the persistent data dir ("uevr_trace/trace.bin" + "uevr_trace/manifest.json"), which can
+    // later be parsed and used to annotate the static binary offline in Ghidra. Kept off by default
+    // since each record is a disk write once the buffer threshold is hit.
+    const ModToggle::Ptr m_diag_trace_writer_enabled{ ModToggle::create(generate_name("DiagTraceWriterEnabled"), false) };
     // DIAG: see is_diag_hook_dual_view_gate_enabled() for full rationale. NOTE: static analysis of the
     // full decompiled body of this function (FUN_180471440 in client-win64-shippingbase.dll) proved it
     // is HTTP/2 connection-pooling/multiplexing logic (strings like "Found bundle for host", "Server
@@ -1911,12 +2118,73 @@ private:
     // primary flag) to the left eye's values while it renders, so whole-scene shadows are set up for it.
     // Offsets/values are discovered at runtime by sceneview_xref, never hardcoded. Camera data untouched.
     const ModToggle::Ptr m_native_stereo_fix_right_eye_shadows{ ModToggle::create(generate_name("NativeStereoFixRightEyeShadows"), true) };
+    // Verified fix (community-confirmed, matches disassembly of the 3.7 primary-view predicate at
+    // RVA 0x55cd2c0: `test dword [rdx+0xc90], 0xFFFFFFFD; sete al; ret` - meaning only 0 or 2 count
+    // as primary). views[1] (the NSF secondary/right eye) constructs as StereoPass=3, which this
+    // predicate always evaluates false for, so it never receives whole-scene shadow setup. This is a
+    // narrow, self-validating replacement for the broader NativeStereoFixRightEyeShadows heuristic
+    // field-list fix above: it writes ONLY +0xC90 (StereoPass) and +0x1A0 (its cached copy) from 3 to
+    // 2, strictly scoped around views[1]'s own BeginRenderingViewFamily call, and restores both right
+    // after. Before writing anything it re-validates the exact predicate bytes at the known RVA and a
+    // handful of constructor-site byte checks; if any of those no longer match (future game update
+    // relocating the offsets), the fix disables itself for that run instead of writing to the wrong
+    // place.
+    const ModToggle::Ptr m_native_stereo_fix_right_eye_shadows_precise{ ModToggle::create(generate_name("NativeStereoFixRightEyeShadowsPrecise"), false) };
+    // Which "primary-passing" StereoPass value to write for the precise fix above. Both 0 (eSSP_FULL)
+    // and 2 (the left eye's real value) satisfy the engine's primary-view predicate, but mirroring
+    // the left eye's exact value (2) made the right eye alias the SAME per-pass-value cache/slot as
+    // the left eye within the same frame (observed as flicker/darkening). Using 0 keeps the view
+    // classified as primary while remaining distinct from the left eye's value. Default false = use 0.
+    const ModToggle::Ptr m_native_stereo_fix_right_eye_shadows_precise_mirror_left{ ModToggle::create(generate_name("NativeStereoFixRightEyeShadowsPreciseMirrorLeft"), false) };
+    // DIAG: see is_native_stereo_fix_right_eye_shadows_precise_no_restore_enabled() for rationale.
+    const ModToggle::Ptr m_native_stereo_fix_right_eye_shadows_precise_no_restore{ ModToggle::create(generate_name("NativeStereoFixRightEyeShadowsPreciseNoRestore"), false) };
+    // DIAG: see is_native_stereo_fix_right_eye_eye_fields_no_restore_enabled() for rationale.
+    const ModToggle::Ptr m_native_stereo_fix_right_eye_eye_fields_no_restore{ ModToggle::create(generate_name("NativeStereoFixRightEyeEyeFieldsNoRestore"), false) };
+    // DIAG: see is_eye_field_offset_enabled() for rationale. Checkbox-per-offset replaces the
+    // earlier free-text manual include/exclude boxes - those were confirmed hard to use correctly
+    // (the exact hex formatting had to match, easy to typo/not notice it wasn't taking effect).
+    // One checkbox per known candidate offset is unambiguous: checked = force this offset INTO the
+    // eye_fields list every scan/refresh (bypassing the normal filters); unchecked = force it OUT
+    // no matter what the auto-scan would otherwise find. All default to true (the six offsets
+    // empirically confirmed necessary to fix right-eye shadow darkness).
+    const ModToggle::Ptr m_eye_field_offset_130_enabled{ ModToggle::create(generate_name("EyeFieldOffset130Enabled"), true) };
+    const ModToggle::Ptr m_eye_field_offset_154_enabled{ ModToggle::create(generate_name("EyeFieldOffset154Enabled"), true) };
+    const ModToggle::Ptr m_eye_field_offset_164_enabled{ ModToggle::create(generate_name("EyeFieldOffset164Enabled"), true) };
+    const ModToggle::Ptr m_eye_field_offset_1A0_enabled{ ModToggle::create(generate_name("EyeFieldOffset1A0Enabled"), true) };
+    const ModToggle::Ptr m_eye_field_offset_2EC_enabled{ ModToggle::create(generate_name("EyeFieldOffset2ECEnabled"), true) };
+    const ModToggle::Ptr m_eye_field_offset_C90_enabled{ ModToggle::create(generate_name("EyeFieldOffsetC90Enabled"), true) };
+    // See is_eye_field_exclude_13c_enabled()/is_eye_field_refresh_debounce_enabled() for rationale.
+    const ModToggle::Ptr m_eye_field_exclude_13c{ ModToggle::create(generate_name("EyeFieldExclude13C"), true) };
+    const ModToggle::Ptr m_eye_field_refresh_debounce{ ModToggle::create(generate_name("EyeFieldRefreshDebounce"), true) };
+    // DIAG: see native_stereo_fix_eye_fields_manual_exclude()/_include() for rationale. Retained
+    // for excluding/including arbitrary offsets OTHER than the six known ones above (e.g. a new
+    // offset found by the live scan that looks suspicious this session).
+    const ModString::Ptr m_native_stereo_fix_eye_fields_manual_exclude{ ModString::create(generate_name("NativeStereoFixEyeFieldsManualExclude"), "") };
+    const ModString::Ptr m_native_stereo_fix_eye_fields_manual_include{ ModString::create(generate_name("NativeStereoFixEyeFieldsManualInclude"), "") };
+    // See is_native_stereo_fix_right_eye_shadows_predicate_hook_enabled() for rationale.
+    const ModToggle::Ptr m_native_stereo_fix_right_eye_shadows_predicate_hook{ ModToggle::create(generate_name("NativeStereoFixRightEyeShadowsPredicateHook"), false) };
+    // Dynamic watchpoint tracer (no external debugger needed): arms a hardware breakpoint on the
+    // right eye's live +0xC90 (StereoPass) field for the duration of its own BeginRenderingViewFamily
+    // call only, and logs every distinct module+RVA call site that reads/writes it during that single
+    // call. Use this to find exactly what consumes StereoPass (shadow cache key, exposure/TAA history
+    // validation, etc.) instead of guessing with further writes. Very invasive (single-steps on every
+    // touch of that address) - enable only briefly to capture a sample, then disable.
+    const ModToggle::Ptr m_diag_watchpoint_trace_c90{ ModToggle::create(generate_name("DiagWatchpointTraceC90"), false) };
+    // See is_diag_watchpoint_trace_csm_transition_scale_enabled() for rationale. Same invasiveness
+    // caveat as m_diag_watchpoint_trace_c90 - enable only briefly to capture a sample.
+    const ModToggle::Ptr m_diag_watchpoint_trace_csm_transition_scale{ ModToggle::create(generate_name("DiagWatchpointTraceCsmTransitionScale"), false) };
+    // See is_diag_disable_eye_adaptation_during_shadow_fix_enabled() for rationale.
+    const ModToggle::Ptr m_diag_disable_eye_adaptation_during_shadow_fix{ ModToggle::create(generate_name("DiagDisableEyeAdaptationDuringShadowFix"), false) };
+    // See is_diag_disable_taa_during_shadow_fix_enabled() for rationale.
+    const ModToggle::Ptr m_diag_disable_taa_during_shadow_fix{ ModToggle::create(generate_name("DiagDisableTaaDuringShadowFix"), false) };
     // Auto-suspend NSF (fall back to the non-scene-capture compositing path) while a level transition
     // is detected, and resume once the world settles. Replicates the manual off/on toggle workflow.
     const ModToggle::Ptr m_native_stereo_fix_auto_suspend{ ModToggle::create(generate_name("NativeStereoFixAutoSuspend"), true) };
     // DIAG: render NSF Pass2 with a null FSceneViewState (no occlusion/TAA history) to test whether
     // shared per-view-state history is what freezes distant foliage in the second-rendered eye.
     const ModToggle::Ptr m_native_stereo_fix_null_pass2_view_state{ ModToggle::create(generate_name("NativeStereoFixNullPass2ViewState"), false) };
+    // DIAG: see is_diag_nsf_pass2_pipeline_trace_enabled().
+    const ModToggle::Ptr m_diag_nsf_pass2_pipeline_trace{ ModToggle::create(generate_name("DiagNSFPass2PipelineTrace"), false) };
     // FALLBACK: this game's CalculateStereoProjectionMatrix is only ever called ONCE per frame
     // (confirmed via runtime STEREO-SETUP logs: proj_calls=0 for the left eye on every frame in the
     // reported double-vision window), the signature of Instanced Stereo Rendering (ISR). The primary
@@ -1926,7 +2194,23 @@ private:
     // init_canvas(), immediately after the single real call writes the called eye's matrix. Default
     // OFF - only enable if the ISR cvar mitigation is confirmed insufficient.
     const ModToggle::Ptr m_native_stereo_fix_dual_write_projection{ ModToggle::create(generate_name("NativeStereoFixDualWriteProjection"), false) };
-    // NSF renders both eyes within the same engine frame via two calculate_stereo_view_offset() calls
+    // Mirrors +0x2d0/+0x2d4 (and +0xCA4/+0xCA8), the FOV-like scalar, and the LOD distance factor at
+    // +0xfd8 (mirrored at +0x2b8) from the cached PRIMARY eye's constructed FSceneView into the
+    // SECONDARY eye's view immediately after its own constructor returns. Evidence (NSF-FOV-ORIGIN/
+    // NSF-FOV-ENTRY/NSF-FOV-TRANSITION) shows these fields hold a per-eye FOV-like scalar that the
+    // engine computes internally per-StereoPass at construction - when NSF is toggled on mid-session
+    // (after the primary camera pipeline already converged on the real FOV), the newly-constructed
+    // secondary view's constructor never derives that same real value and falls back to a stale/
+    // default one (observed stable split: 54.432 primary vs 90.0 secondary), which also drags the
+    // secondary eye's LOD distance factor down to the default 90-degree FOV's 1.0 instead of the
+    // real camera's (e.g. 0.836), causing it to pop to cheaper/non-animated LODs at a shorter
+    // distance than the primary eye. Headset-confirmed to fix the FOV/culling mismatch and the
+    // associated LOD/blur mismatch between eyes. Offsets are 3.7-specific.
+    const ModToggle::Ptr m_native_stereo_fix_mirror_fov{ ModToggle::create(generate_name("NativeStereoFixMirrorFov"), false) };
+    // DIAG: see is_diag_log_shadow_pathway_identity_enabled() for rationale. Default OFF - only for
+    // deliberate investigation of the character-shadow/environment-shadow eye split.
+    const ModToggle::Ptr m_diag_log_shadow_pathway_identity{ ModToggle::create(generate_name("DiagLogShadowPathwayIdentity"), false) };
+
     // (Pass1=left, Pass2=right). Unlike AFR (which already caches/reuses eye 0's rotation across the
     // frame - see m_last_afr_rotation), NSF has no equivalent: each eye independently reads whatever the
     // live animated camera pose is at the moment it's queried. During a camera-transition animation
@@ -2081,10 +2365,18 @@ private:
     int m_diag_nsf_pass2_eye_field_mask{0}; // bisect mask over session-stable runtime eye-field IDs; not persistent
     int m_diag_nsf_pass2_frame_count_mode{0};
     bool m_diag_nsf_frame_diff_logger{false}; // one-shot: logs per-frame-changing dwords in FSceneView/FSceneViewFamily to locate the foliage wind update Pass2 misses; not persistent
+    bool m_diag_nsf_flicker_burst_capture{false}; // one-shot: logs c90/1a0 and eye_fields state EVERY frame for ~3s (trigger right as the user sees the flicker) instead of the normal every-N-hundred-frame sampling, which is too coarse to see fast rhythmic flicker; not persistent
     bool m_diag_nsf_eye_view_dump{false}; // one-shot: logs dwords that differ between the live left/right FSceneViews; not persistent
     bool m_diag_nsf_eye_c90_read_scan{false}; // one-shot: scans executable game-module sections for decoded +0xC90 read candidates; not persistent
+    // DIAG: when true, skips setting bAlwaysPersistRenderingState=true on the scene-capture component in
+    // create_scene_capture(), reverting it to the engine default (false). Used to A/B whether manually
+    // forcing persisted per-view rendering state on the capture-driven right eye (vs. the engine's normal
+    // per-frame update order on the left/primary eye) is contributing to the NSF-only bilateral dark
+    // overlay/flicker. Not persistent.
+    bool m_diag_nsf_disable_persist_rendering_state{false};
 
     const ModKey::Ptr m_keybind_toggle_gui{ ModKey::create(generate_name("ToggleSlateGUIKey")) };
+    const ModKey::Ptr m_keybind_diag_nsf_flicker_burst{ ModKey::create(generate_name("DiagNsfFlickerBurstKey")) };
     
     const ModString::Ptr m_requested_runtime_name{ ModString::create("Frontend_RequestedRuntime", "unset") };
 
@@ -2146,6 +2438,7 @@ public:
             *m_diag_log_true_index_alias,
             *m_diag_log_world_to_meters,
             *m_diag_log_raw_view_index,
+            *m_diag_trace_writer_enabled,
             *m_diag_hook_dual_view_gate,
             *m_diag_dual_view_gate_rva,
             *m_diag_hook_dual_view_gate_caller,
@@ -2206,8 +2499,30 @@ public:
             *m_native_stereo_fix_same_pass,
             *m_native_stereo_fix_same_pass_force_primary,
             *m_native_stereo_fix_right_eye_shadows,
+            *m_native_stereo_fix_right_eye_shadows_precise,
+            *m_native_stereo_fix_right_eye_shadows_precise_mirror_left,
+            *m_native_stereo_fix_right_eye_shadows_precise_no_restore,
+            *m_native_stereo_fix_right_eye_eye_fields_no_restore,
+            *m_eye_field_offset_130_enabled,
+            *m_eye_field_offset_154_enabled,
+            *m_eye_field_offset_164_enabled,
+            *m_eye_field_offset_1A0_enabled,
+            *m_eye_field_offset_2EC_enabled,
+            *m_eye_field_offset_C90_enabled,
+            *m_eye_field_exclude_13c,
+            *m_eye_field_refresh_debounce,
+            *m_native_stereo_fix_eye_fields_manual_exclude,
+            *m_native_stereo_fix_eye_fields_manual_include,
+            *m_native_stereo_fix_right_eye_shadows_predicate_hook,
+            *m_native_stereo_fix_mirror_fov,
+            *m_native_stereo_fix_dual_write_projection,
+            *m_diag_watchpoint_trace_c90,
+            *m_diag_watchpoint_trace_csm_transition_scale,
+            *m_diag_disable_eye_adaptation_during_shadow_fix,
+            *m_diag_disable_taa_during_shadow_fix,
             *m_native_stereo_fix_auto_suspend,
             *m_native_stereo_fix_null_pass2_view_state,
+            *m_diag_nsf_pass2_pipeline_trace,
             *m_native_stereo_fix_sync_pose,
             *m_native_stereo_fix_sync_pose_position,
             *m_native_stereo_fix_sync_pose_blend_alpha,

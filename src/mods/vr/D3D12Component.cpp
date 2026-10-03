@@ -22,6 +22,9 @@
 
 #include "D3D12Component.hpp"
 #include <uevr/API.hpp>
+#include <sdk/UClass.hpp>
+#include <sdk/USceneCaptureComponent2D.hpp>
+#include <sdk/FProperty.hpp>
 
 //#define AFR_DEPTH_TEMP_DISABLED
 
@@ -897,6 +900,35 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
         }
     }
 
+    // DIAG [MENU-RIGHT-EYE]: is_world_loading gates the ENTIRE Native Stereo Fix scene-capture
+    // path below (binding, grace-period handling, stall tracking, and the pre_render right-eye
+    // composite further down). At the main menu there is no local player controller, so
+    // is_world_loading is true for as long as the user sits in the menu, meaning:
+    //   - m_scene_capture_tex is forcibly reset() every single frame (see the "else" branch below),
+    //   - the "right eye composite: scene capture texture is NULL, right eye will not be copied
+    //     this frame" log further down fires continuously,
+    //   - the right half of the double-wide render target is therefore NEVER written by us while
+    //     in the menu, leaving whatever the engine itself put there (stale/black/previous frame)
+    //     to be submitted as the right eye.
+    // This is logged on every state transition (menu <-> in-world) plus a low-frequency heartbeat
+    // while stuck in either state, so a main-menu capture will show this condition continuously
+    // without needing to toggle the shadow fix or any other cvar to reproduce it.
+    {
+        static bool s_diag_last_is_world_loading = false;
+        static uint32_t s_diag_world_loading_heartbeat = 0;
+        const bool uevr_api_present = uevr::API::get() != nullptr;
+        const bool state_changed = is_world_loading != s_diag_last_is_world_loading;
+        ++s_diag_world_loading_heartbeat;
+
+        if (state_changed || (s_diag_world_loading_heartbeat % 180) == 1) {
+            SPDLOG_INFO("[VR][DIAG][MENU-RIGHT-EYE] is_world_loading={} (uevr_api_present={}, nsf_enabled={}) -> NSF scene-capture path {} | frame_count={}",
+                is_world_loading, uevr_api_present, vr->is_native_stereo_fix_enabled(),
+                (vr->is_native_stereo_fix_enabled() && !is_world_loading) ? "ACTIVE (right eye will be composited from scene capture)" : "DISABLED (right eye will NOT be composited here this frame)",
+                vr->m_render_frame_count);
+            s_diag_last_is_world_loading = is_world_loading;
+        }
+    }
+
     if (vr->is_native_stereo_fix_enabled() && !is_world_loading) {
         const auto scene_capture = ffsr->get_render_target_manager()->get_scene_capture_render_target();
         const auto scene_capture_rt = scene_capture != nullptr ? (ID3D12Resource*)scene_capture->get_native_resource() : nullptr;
@@ -965,7 +997,8 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
     } else {
         static bool s_diag_last_reset_reason_loading = false;
         if (is_world_loading != s_diag_last_reset_reason_loading) {
-            SPDLOG_INFO("[VR][DIAG] D3D12 NSF scene capture texture reset: nsf_enabled={} is_world_loading={}", vr->is_native_stereo_fix_enabled(), is_world_loading);
+            SPDLOG_INFO("[VR][DIAG][MENU-RIGHT-EYE] D3D12 NSF scene capture texture reset: nsf_enabled={} is_world_loading={} previously_bound={:x} - right eye compositing is now DISABLED until this clears",
+                vr->is_native_stereo_fix_enabled(), is_world_loading, (uintptr_t)m_scene_capture_tex.texture.Get());
             s_diag_last_reset_reason_loading = is_world_loading;
         }
         if (m_scene_capture_tex.texture.Get() != nullptr) {
@@ -1083,6 +1116,114 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
                 (void*)m_game_tex.texture.Get(),
                 ffsr->get_view_target_generation(), stall_ms);
 
+            // DIAG [MENU-RIGHT-EYE-PIXELS]: sample the SOURCE textures (m_game_tex / left and
+            // m_scene_capture_tex / right) directly, BEFORE the copy_region below runs, so we can
+            // tell apart "the scene capture itself is dark/wrong content" (upstream of our
+            // compositor, e.g. exposure/lighting/post-process on the capture camera) from "the
+            // copy/compositor is somehow producing a dark right eye from a perfectly fine source"
+            // (a bug in our own code). Throttled to a low rate since this stalls the GPU via a
+            // fence wait (see diag_sample_texture). Samples the CENTER of each texture to avoid
+            // misleadingly-black letterbox/border pixels at the corner.
+            static uint32_t s_diag_menu_pixel_sample_count = 0;
+            const bool diag_should_sample_this_frame = vr->is_diag_verbose_logging_enabled() && (++s_diag_menu_pixel_sample_count <= 10 || s_diag_menu_pixel_sample_count % 150 == 1);
+            {
+                // DIAG: per-frame re-check of CaptureSource - if something (engine code, a level
+                // transition reset, or our own destroy/recreate cycle re-running create_scene_capture()
+                // with the write silently failing) resets this away from SCS_FinalColorLDR (2) after
+                // creation, the "no change at all" symptom would be explained: the fix would only take
+                // effect for a moment, if at all, before being reverted by something else. Reading it
+                // fresh from the LIVE component (not just at creation time) catches that directly.
+                if (diag_should_sample_this_frame && ffsr->get_render_target_manager() != nullptr) {
+                    auto rtm = ffsr->get_render_target_manager();
+                    auto scene_capture_c = rtm->get_scene_capture_component_diag();
+                    if (scene_capture_c != nullptr) {
+                        static const auto capture_source_prop = sdk::USceneCaptureComponent2D::static_class()->find_property(L"CaptureSource");
+                        if (capture_source_prop != nullptr) {
+                            auto data = capture_source_prop->get_data<uint8_t>(scene_capture_c);
+                            SPDLOG_INFO("[VR][DIAG][MENU-RIGHT-EYE-PIXELS] LIVE CaptureSource re-check (#{}): value={} (expected=2/SCS_FinalColorLDR) frame_count={}",
+                                s_diag_menu_pixel_sample_count, data != nullptr ? *data : (uint8_t)0xFF, vr->m_render_frame_count);
+                        }
+
+                        // DIAG: live re-check of the fixed-exposure override fields on the scene
+                        // capture's OWN PostProcessSettings. These are only written ONCE, at
+                        // creation time (create_scene_capture()). If anything in the engine (the
+                        // capture component's own tick, a world PostProcessVolume blend, or a
+                        // per-frame exposure recompute on the capture's FSceneView) silently
+                        // resets bOverride_* back to false or the values back to engine defaults
+                        // after creation, that would exactly explain a fix that "works for a
+                        // moment" and then reverts - the user-reported momentary flicker back
+                        // toward normal brightness/lighting.
+                        auto pp_settings_live = scene_capture_c->get_post_process_settings();
+                        if (pp_settings_live != nullptr) {
+                            static const auto pp_struct_live = sdk::find_uobject<sdk::UScriptStruct>(L"ScriptStruct /Script/Engine.PostProcessSettings");
+                            if (pp_struct_live != nullptr) {
+                                static const auto bias_override_prop = pp_struct_live->find_property(L"bOverride_AutoExposureBias");
+                                static const auto bias_prop = pp_struct_live->find_property(L"AutoExposureBias");
+                                static const auto min_override_prop = pp_struct_live->find_property(L"bOverride_AutoExposureMinBrightness");
+                                static const auto min_prop = pp_struct_live->find_property(L"AutoExposureMinBrightness");
+                                static const auto max_override_prop = pp_struct_live->find_property(L"bOverride_AutoExposureMaxBrightness");
+                                static const auto max_prop = pp_struct_live->find_property(L"AutoExposureMaxBrightness");
+
+                                auto bias_override = bias_override_prop != nullptr ? bias_override_prop->get_data<bool>(pp_settings_live) : nullptr;
+                                auto bias_val = bias_prop != nullptr ? bias_prop->get_data<float>(pp_settings_live) : nullptr;
+                                auto min_override = min_override_prop != nullptr ? min_override_prop->get_data<bool>(pp_settings_live) : nullptr;
+                                auto min_val = min_prop != nullptr ? min_prop->get_data<float>(pp_settings_live) : nullptr;
+                                auto max_override = max_override_prop != nullptr ? max_override_prop->get_data<bool>(pp_settings_live) : nullptr;
+                                auto max_val = max_prop != nullptr ? max_prop->get_data<float>(pp_settings_live) : nullptr;
+
+                                SPDLOG_INFO("[VR][DIAG][MENU-RIGHT-EYE-PIXELS] LIVE exposure-override re-check (#{}): bOverride_Bias={} Bias={:.3f} bOverride_Min={} Min={:.3f} bOverride_Max={} Max={:.3f} frame_count={}",
+                                    s_diag_menu_pixel_sample_count,
+                                    bias_override != nullptr ? *bias_override : false, bias_val != nullptr ? *bias_val : -999.0f,
+                                    min_override != nullptr ? *min_override : false, min_val != nullptr ? *min_val : -999.0f,
+                                    max_override != nullptr ? *max_override : false, max_val != nullptr ? *max_val : -999.0f,
+                                    vr->m_render_frame_count);
+                            }
+                        }
+                    }
+                }
+
+                if (diag_should_sample_this_frame) {
+                    const auto scene_center_x = scene_capture_desc.Width > 32 ? (uint32_t)scene_capture_desc.Width / 2 - 16 : 0;
+                    const auto scene_center_y = scene_capture_desc.Height > 32 ? (uint32_t)scene_capture_desc.Height / 2 - 16 : 0;
+                    const auto right_src_sample = diag_sample_texture(device, command_queue, m_scene_capture_tex.texture.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, scene_center_x, scene_center_y);
+
+                    if (right_src_sample.succeeded) {
+                        SPDLOG_INFO("[VR][DIAG][MENU-RIGHT-EYE-PIXELS] SOURCE scene_capture_tex CENTER pixel sample (#{}): {}x{} sample_xy=({},{}) avg_luminance={:.2f} nonzero={}/{} corner=0x{:08X} center=0x{:08X} frame_count={}",
+                            s_diag_menu_pixel_sample_count, scene_capture_desc.Width, scene_capture_desc.Height, scene_center_x, scene_center_y,
+                            right_src_sample.avg_luminance, right_src_sample.nonzero_pixels, right_src_sample.sampled_pixels,
+                            right_src_sample.corner_pixel, right_src_sample.center_pixel, vr->m_render_frame_count);
+                    } else {
+                        SPDLOG_WARN("[VR][DIAG][MENU-RIGHT-EYE-PIXELS] SOURCE scene_capture_tex CENTER pixel sample (#{}): FAILED to sample.", s_diag_menu_pixel_sample_count);
+                    }
+
+                    if (m_game_tex.texture.Get() != nullptr) {
+                        const auto game_tex_desc = m_game_tex.texture->GetDesc();
+
+                        // DIAG FIX: m_game_tex can be either a single-eye-sized texture OR the full
+                        // double-wide backbuffer (Width == 2 * dst_eye_width, see left_sizes_match
+                        // logic above). Naively centering on the FULL texture width in the latter case
+                        // lands the 32x32 sample window right on the left/right eye seam (half in the
+                        // left eye's content, half in empty/black gutter past the seam), which produced
+                        // a misleading nonzero=512/1024 + center=0x00000000 reading that looked like a
+                        // darkness bug but was actually just a bad sample location. Center within the
+                        // LEFT EYE's own region specifically (first dst_eye_width columns) instead.
+                        const auto game_eye_width = game_tex_desc.Width >= dst_eye_width * 2 ? dst_eye_width : (uint32_t)game_tex_desc.Width;
+                        const auto game_center_x = game_eye_width > 32 ? game_eye_width / 2 - 16 : 0;
+                        const auto game_center_y = game_tex_desc.Height > 32 ? (uint32_t)game_tex_desc.Height / 2 - 16 : 0;
+                        const auto left_src_sample = diag_sample_texture(device, command_queue, m_game_tex.texture.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, game_center_x, game_center_y);
+
+                        if (left_src_sample.succeeded) {
+                            SPDLOG_INFO("[VR][DIAG][MENU-RIGHT-EYE-PIXELS] SOURCE game_tex (LEFT) CENTER pixel sample (#{}): {}x{} sample_xy=({},{}) avg_luminance={:.2f} nonzero={}/{} corner=0x{:08X} center=0x{:08X} frame_count={}",
+                                s_diag_menu_pixel_sample_count, game_tex_desc.Width, game_tex_desc.Height, game_center_x, game_center_y,
+                                left_src_sample.avg_luminance, left_src_sample.nonzero_pixels, left_src_sample.sampled_pixels,
+                                left_src_sample.corner_pixel, left_src_sample.center_pixel, vr->m_render_frame_count);
+                        } else {
+                            SPDLOG_WARN("[VR][DIAG][MENU-RIGHT-EYE-PIXELS] SOURCE game_tex (LEFT) CENTER pixel sample (#{}): FAILED to sample.", s_diag_menu_pixel_sample_count);
+                        }
+                    }
+                }
+            }
+
             // DIAG: if the user has enabled the stale-scene-capture visual indicator, and we've been
             // presenting a stale right-eye texture for long enough to be visually meaningful, tint the
             // right eye red as a border overlay so the user can see in-headset, in real time, whether a
@@ -1103,6 +1244,31 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
                     D3D12_RESOURCE_STATE_RENDER_TARGET,
                     D3D12_RESOURCE_STATE_RENDER_TARGET
                 );
+
+                // DIAG [MENU-RIGHT-EYE-PIXELS]: sample the FINAL composited double-wide render_target
+                // immediately AFTER the copy_region above has been recorded, at the same throttle rate
+                // and sample counter as the SOURCE samples taken earlier in this function. The
+                // command list hasn't executed yet at this point (diag_sample_texture submits/fences
+                // its OWN throwaway command list on the same queue, so it serializes after everything
+                // already recorded here), so this reads the actual post-copy content once the GPU
+                // catches up. Comparing this against the SOURCE scene_capture_tex sample taken earlier
+                // in the SAME frame isolates whether darkness is introduced by this copy/compositor
+                // step specifically, as opposed to being present upstream (already ruled out when the
+                // SOURCE sample itself is dark) or downstream at OpenXR submission.
+                if (diag_should_sample_this_frame) {
+                    const auto dst_center_x = dst_eye_width + (dst_eye_width > 32 ? dst_eye_width / 2 - 16 : 0);
+                    const auto dst_center_y = dst_eye_height > 32 ? dst_eye_height / 2 - 16 : 0;
+                    const auto dst_sample = diag_sample_texture(device, command_queue, render_target, D3D12_RESOURCE_STATE_RENDER_TARGET, dst_center_x, dst_center_y);
+
+                    if (dst_sample.succeeded) {
+                        SPDLOG_INFO("[VR][DIAG][MENU-RIGHT-EYE-PIXELS] DEST render_target RIGHT-EYE CENTER pixel sample (#{}): sample_xy=({},{}) avg_luminance={:.2f} nonzero={}/{} corner=0x{:08X} center=0x{:08X} frame_count={}",
+                            s_diag_menu_pixel_sample_count, dst_center_x, dst_center_y,
+                            dst_sample.avg_luminance, dst_sample.nonzero_pixels, dst_sample.sampled_pixels,
+                            dst_sample.corner_pixel, dst_sample.center_pixel, vr->m_render_frame_count);
+                    } else {
+                        SPDLOG_WARN("[VR][DIAG][MENU-RIGHT-EYE-PIXELS] DEST render_target RIGHT-EYE CENTER pixel sample (#{}): FAILED to sample.", s_diag_menu_pixel_sample_count);
+                    }
+                }
             } else {
                 // Wrap the destination render target so render_srv_to_rtv can target it directly.
                 if (m_stereo_dst_tex.texture.Get() != render_target) {
@@ -1131,7 +1297,8 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
                 }
             }
         } else {
-            SPDLOG_INFO_EVERY_N_SEC(2, "[VR] right eye composite: scene capture texture is NULL, right eye will not be copied this frame");
+            SPDLOG_INFO_EVERY_N_SEC(2, "[VR][DIAG][MENU-RIGHT-EYE] right eye composite SKIPPED: scene capture texture is NULL, right half of double-wide target NOT written this frame | frame_count={} is_afr={}",
+                vr->m_render_frame_count, is_afr);
         }
 
         // DIAG: frame dump-on-marker BURST. If the user pressed the glitch marker key recently, this
@@ -3168,38 +3335,77 @@ void D3D12Component::OpenXR::copy(
 
             texture_ctx->commands.execute();
 
-            // DIAG: destination-side pixel readback for the AFR eye swapchains. Sampled AFTER
-            // our copy has been recorded/executed, so this reflects exactly what will be
-            // submitted to the OpenXR runtime for that eye. Compared against the SOURCE
-            // backbuffer sample above, this tells us definitively whether the black image is:
+            // DIAG: destination-side pixel readback for the eye swapchains actually submitted to
+            // OpenXR. Sampled AFTER our copy has been recorded/executed, so this reflects exactly
+            // what will be submitted to the OpenXR runtime for that eye/swapchain. Compared against
+            // the SOURCE backbuffer/scene_capture_tex samples and the DEST render_target sample
+            // taken earlier in D3D12Component::on_frame's right-eye composite, this tells us
+            // definitively where in the pipeline darkness is introduced:
             //   - already black in the source (upstream UE/engine rendering issue), or
-            //   - fine in the source but black in the destination (bug in our copy/compositor).
-            // Waited on the fence first so the copy has actually completed by the time we read.
+            //   - fine in the source but black in render_target (bug in our copy/compositor), or
+            //   - fine in render_target but black in this final swapchain copy (bug in this
+            //     swapchain blit/copy step, downstream of the compositor but upstream of OpenXR
+            //     actually presenting it).
+            // DOUBLE_WIDE is included (not just the AFR_LEFT_EYE/AFR_RIGHT_EYE swapchains) because
+            // Native Stereo Fix submits through the DOUBLE_WIDE swapchain, not the AFR ones - this
+            // is the actual destination for the menu/NSF right-eye darkness investigation.
             if (vr->is_diag_verbose_logging_enabled() &&
                 (swapchain_idx == (uint32_t)runtimes::OpenXR::SwapchainIndex::AFR_LEFT_EYE ||
-                 swapchain_idx == (uint32_t)runtimes::OpenXR::SwapchainIndex::AFR_RIGHT_EYE)) {
+                 swapchain_idx == (uint32_t)runtimes::OpenXR::SwapchainIndex::AFR_RIGHT_EYE ||
+                 swapchain_idx == (uint32_t)runtimes::OpenXR::SwapchainIndex::DOUBLE_WIDE)) {
                 static uint32_t diag_dst_left_count = 0;
                 static uint32_t diag_dst_right_count = 0;
+                static uint32_t diag_dst_double_wide_count = 0;
 
+                const bool is_double_wide = swapchain_idx == (uint32_t)runtimes::OpenXR::SwapchainIndex::DOUBLE_WIDE;
                 const bool is_left = swapchain_idx == (uint32_t)runtimes::OpenXR::SwapchainIndex::AFR_LEFT_EYE;
-                auto& diag_count = is_left ? diag_dst_left_count : diag_dst_right_count;
+                auto& diag_count = is_double_wide ? diag_dst_double_wide_count : (is_left ? diag_dst_left_count : diag_dst_right_count);
                 ++diag_count;
 
-                if (diag_count <= 5 || diag_count % 300 == 1) {
+                if (diag_count <= 10 || diag_count % 150 == 1) {
                     texture_ctx->commands.wait(INFINITE);
 
                     auto& hook = g_framework->get_d3d12_hook();
                     auto device = hook->get_device();
                     auto command_queue = hook->get_command_queue();
 
-                    const auto sample = diag_sample_texture(device, command_queue, ctx.textures[texture_index].texture, D3D12_RESOURCE_STATE_RENDER_TARGET);
+                    if (is_double_wide) {
+                        // Sample BOTH halves of the double-wide swapchain texture so we can directly
+                        // compare left-eye vs right-eye content at the exact point OpenXR submission
+                        // reads from, mirroring the SOURCE backbuffer LEFT/RIGHT-HALF-CENTER samples
+                        // taken earlier in on_frame().
+                        const auto sc_desc = ctx.textures[texture_index].texture->GetDesc();
+                        const auto half_w = (uint32_t)sc_desc.Width / 2;
+                        const auto left_center_x = half_w > 32 ? half_w / 2 - 16 : 0;
+                        const auto right_center_x = half_w > 32 ? half_w + half_w / 2 - 16 : half_w;
+                        const auto center_y = sc_desc.Height > 32 ? (uint32_t)sc_desc.Height / 2 - 16 : 0;
 
-                    if (sample.succeeded) {
-                        SPDLOG_INFO("[DIAG] DEST {} swapchain pixel sample (#{}): swapchain_idx={} avg_luminance={:.2f} nonzero={}/{} corner=0x{:08X} center=0x{:08X}",
-                            is_left ? "AFR_LEFT_EYE" : "AFR_RIGHT_EYE", diag_count, swapchain_idx,
-                            sample.avg_luminance, sample.nonzero_pixels, sample.sampled_pixels, sample.corner_pixel, sample.center_pixel);
+                        const auto left_sample = diag_sample_texture(device, command_queue, ctx.textures[texture_index].texture, D3D12_RESOURCE_STATE_RENDER_TARGET, left_center_x, center_y);
+                        const auto right_sample = diag_sample_texture(device, command_queue, ctx.textures[texture_index].texture, D3D12_RESOURCE_STATE_RENDER_TARGET, right_center_x, center_y);
+
+                        if (left_sample.succeeded) {
+                            SPDLOG_INFO("[VR][DIAG][MENU-RIGHT-EYE-PIXELS] DEST DOUBLE_WIDE swapchain LEFT-HALF-CENTER pixel sample (#{}): {}x{} avg_luminance={:.2f} nonzero={}/{} corner=0x{:08X} center=0x{:08X}",
+                                diag_count, sc_desc.Width, sc_desc.Height, left_sample.avg_luminance, left_sample.nonzero_pixels, left_sample.sampled_pixels, left_sample.corner_pixel, left_sample.center_pixel);
+                        } else {
+                            SPDLOG_WARN("[VR][DIAG][MENU-RIGHT-EYE-PIXELS] DEST DOUBLE_WIDE swapchain LEFT-HALF-CENTER pixel sample (#{}): FAILED to sample.", diag_count);
+                        }
+
+                        if (right_sample.succeeded) {
+                            SPDLOG_INFO("[VR][DIAG][MENU-RIGHT-EYE-PIXELS] DEST DOUBLE_WIDE swapchain RIGHT-HALF-CENTER pixel sample (#{}): {}x{} avg_luminance={:.2f} nonzero={}/{} corner=0x{:08X} center=0x{:08X}",
+                                diag_count, sc_desc.Width, sc_desc.Height, right_sample.avg_luminance, right_sample.nonzero_pixels, right_sample.sampled_pixels, right_sample.corner_pixel, right_sample.center_pixel);
+                        } else {
+                            SPDLOG_WARN("[VR][DIAG][MENU-RIGHT-EYE-PIXELS] DEST DOUBLE_WIDE swapchain RIGHT-HALF-CENTER pixel sample (#{}): FAILED to sample.", diag_count);
+                        }
                     } else {
-                        SPDLOG_INFO("[DIAG] DEST {} swapchain pixel sample (#{}): FAILED to sample.", is_left ? "AFR_LEFT_EYE" : "AFR_RIGHT_EYE", diag_count);
+                        const auto sample = diag_sample_texture(device, command_queue, ctx.textures[texture_index].texture, D3D12_RESOURCE_STATE_RENDER_TARGET);
+
+                        if (sample.succeeded) {
+                            SPDLOG_INFO("[DIAG] DEST {} swapchain pixel sample (#{}): swapchain_idx={} avg_luminance={:.2f} nonzero={}/{} corner=0x{:08X} center=0x{:08X}",
+                                is_left ? "AFR_LEFT_EYE" : "AFR_RIGHT_EYE", diag_count, swapchain_idx,
+                                sample.avg_luminance, sample.nonzero_pixels, sample.sampled_pixels, sample.corner_pixel, sample.center_pixel);
+                        } else {
+                            SPDLOG_INFO("[DIAG] DEST {} swapchain pixel sample (#{}): FAILED to sample.", is_left ? "AFR_LEFT_EYE" : "AFR_RIGHT_EYE", diag_count);
+                        }
                     }
                 }
             }

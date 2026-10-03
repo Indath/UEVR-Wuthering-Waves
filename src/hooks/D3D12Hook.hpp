@@ -3,6 +3,7 @@
 #include <iostream>
 #include <functional>
 #include <chrono>
+#include <atomic>
 
 #pragma comment(lib, "d3d12.lib")
 #pragma comment(lib, "dxgi")
@@ -106,6 +107,28 @@ public:
         m_next_present_interval = interval;
     }
 
+    // DIAG accessors: let external watchdogs (e.g. Framework::hook_monitor) detect the case where
+    // the hook was installed successfully but Present was never actually called through it before
+    // the process terminates, which points at the patched vtable slots not being the ones the live
+    // swapchain uses (or something reverting the patch) rather than a hang in our own code.
+    bool has_seen_first_present() const {
+        return m_first_present_seen;
+    }
+
+    // Unlike has_seen_first_present(), this only becomes true once a Present call has actually
+    // made it all the way to invoking the registered on_present callback (i.e. Framework::on_frame_*),
+    // which is what actually flips m_d3d_hook_ever_succeeded. A call can be "seen" (enter
+    // present_internal) but never be "handled" if it gets bounced out early by WindowFilter or the
+    // phase-1/og-instance swapchain-identity checks - which is exactly the gap that let the hook
+    // monitor think the hook was still dead and churn through destructive rehooks.
+    bool has_handled_first_present() const {
+        return m_first_present_handled;
+    }
+
+    std::chrono::steady_clock::time_point get_hook_installed_time() const {
+        return m_hook_installed_time;
+    }
+
 protected:
     ID3D12Device4* m_device{ nullptr };
     IDXGISwapChain3* m_swap_chain{ nullptr };
@@ -129,6 +152,26 @@ protected:
     bool m_inside_present{false};
     std::chrono::steady_clock::time_point m_present_enter_time{};
     bool m_ignore_next_present{false};
+
+    // DIAG/perf: once the dummy-swapchain RTTI type-info probe in hook() has thrown once this
+    // process, skip it on subsequent rehook attempts (see hook() for rationale) instead of paying
+    // its sometimes multi-second cost on every single rehook. Static because Framework::hook_d3d12()
+    // constructs a brand new D3D12Hook instance on every rehook attempt, so a plain member would
+    // reset back to false each time and never actually suppress repeat attempts.
+    static inline bool m_skip_type_info_probe{false};
+
+    // DIAG: track when the Present vtable hooks were installed and whether we've ever actually
+    // observed a call come through them. If hook() logs success but the game process terminates
+    // shortly afterward without m_first_present_seen ever flipping true, that proves Present was
+    // never actually invoked through our patched pointers (e.g. anti-cheat reverted the patch, or
+    // the patched vtable slots aren't the ones the live swapchain actually uses), rather than a
+    // crash/hang happening deeper inside our own Present handling logic.
+    std::chrono::steady_clock::time_point m_hook_installed_time{};
+    std::atomic<bool> m_first_present_seen{false};
+    std::atomic<bool> m_first_present_handled{false};
+    std::atomic<bool> m_first_present_filtered_logged{false};
+    void* m_hooked_present_fn_addr{nullptr};
+    void* m_hooked_present1_fn_addr{nullptr};
 
     std::unique_ptr<PointerHook> m_present_hook{};
     std::unique_ptr<PointerHook> m_present1_hook{};

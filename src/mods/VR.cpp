@@ -115,6 +115,18 @@ std::optional<std::string> VR::clean_initialize() try {
 
     m_init_finished = true;
 
+    // If the user left "DIAG: Enable Offline Trace Writer" on from a previous session (toggle
+    // state is persisted in config), start tracing again automatically here instead of requiring
+    // them to find/click the toggle in a laggy/just-loaded menu. Also replay anything sceneview_xref
+    // has already resolved by this point so an early-enabled trace isn't missing those one-shot
+    // events either.
+    if (m_diag_trace_writer_enabled->value()) {
+        uevr_trace::TraceWriter::get().set_enabled(true);
+        if (auto& hook = get_fake_stereo_hook(); hook != nullptr) {
+            hook->replay_trace_state();
+        }
+    }
+
     // all OK
     return Mod::on_initialize();
 } catch(...) {
@@ -2166,6 +2178,17 @@ void VR::handle_keybinds() {
     if (m_keybind_toggle_gui->is_key_down_once()) {
         m_enable_gui->toggle();
     }
+
+    // DIAG: trigger a per-frame (not every-N-hundred-frame) burst capture of the NSF shadow-fix
+    // c90/1a0 identity fields, eye_fields state, and right/left luminance for the next ~15 seconds.
+    // The normal sampling cadence (every ~300-600 frames, several seconds apart) is too coarse to
+    // see a fast rhythmic flicker - press this right as the flicker is observed to get an exact
+    // frame-by-frame picture of what's actually changing. The window is long enough to also span
+    // the bright->flicker->permanent-darkening collapse observed to take several seconds to settle.
+    if (m_keybind_diag_nsf_flicker_burst->is_key_down_once()) {
+        m_diag_nsf_flicker_burst_capture = true;
+        SPDLOG_INFO("[VR][DIAG] NSF flicker burst capture triggered - logging every frame for ~15s");
+    }
 }
 
 void VR::on_frame() {
@@ -2663,6 +2686,97 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
             if (ImGui::IsItemHovered()) {
                 ImGui::SetTooltip("While the right eye renders, marks its view as the shadow-owning (primary) eye\nso whole-scene shadows are generated for it. Field offsets are discovered at\nruntime by comparing the two eye views. Camera/projection are untouched, so\nstereo depth is preserved.");
             }
+            m_native_stereo_fix_right_eye_eye_fields_no_restore->draw("[Diag] Heuristic Fix: Leave Applied, Skip Restore (fighting-flicker test)");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Tests whether the flicker is caused by this fix fighting itself every frame:\nnormally every tracked eye_fields value is forced to match the left eye, then\nimmediately restored back to its original (different) value at the end of the\nsame frame, then forced again next frame - a continuous write->revert->write\ncycle. When ON, the write is left in place instead of restored. If flicker\ndisappears (even if right-eye darkness returns), this fighting cycle is confirmed\nas the flicker's cause.");
+            }
+            m_native_stereo_fix_eye_fields_manual_exclude->draw("[Diag] Eye Fields: Manual Exclude Offsets (hex, comma/space separated)");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Force ADDITIONAL struct offsets OUT of the heuristic eye_fields scan/refresh (for\noffsets other than the six known ones above, which have their own checkboxes).\nExample: 0x200 0x3A4\nTakes effect on the next refresh (~2s) or at the next full rescan.");
+            }
+            m_native_stereo_fix_eye_fields_manual_include->draw("[Diag] Eye Fields: Manual Force-Include Offsets (hex, comma/space separated)");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Force ADDITIONAL struct offsets IN to the heuristic eye_fields scan/refresh (for\noffsets other than the six known ones above, which have their own checkboxes),\nbypassing the normal small-int/pointer-like/null-right filters (still subject to\nthe hardcoded 0xC/0x13C crash-offset exclusion).\nExample: 0x200 0x3A4");
+            }
+            ImGui::TextDisabled("[Diag] Eye Fields: Known Offset Include/Exclude");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("One checkbox per known candidate eye_fields offset. ON (default) = force this\noffset INTO the scan/refresh result every time, bypassing the normal filters.\nOFF = force this offset OUT, no matter what the live scan would otherwise find.\nUse this to isolate exactly which offset(s) fix right-eye shadow darkness vs.\nwhich may be contributing to flicker, without typing/formatting hex by hand.");
+            }
+            m_eye_field_offset_130_enabled->draw("0x130");
+            ImGui::SameLine();
+            m_eye_field_offset_154_enabled->draw("0x154");
+            ImGui::SameLine();
+            m_eye_field_offset_164_enabled->draw("0x164");
+            m_eye_field_offset_1A0_enabled->draw("0x1A0");
+            ImGui::SameLine();
+            m_eye_field_offset_2EC_enabled->draw("0x2EC");
+            ImGui::SameLine();
+            m_eye_field_offset_C90_enabled->draw("0xC90");
+            m_eye_field_exclude_13c->draw("Exclude 0x13C From Scans");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("The ONLY change ever confirmed to stop the CONSTANT right-eye darkness: 0x13C\n"
+                                  "frequently differs between eyes and looks like an identity enum, so the scanner\n"
+                                  "kept selecting it and force-writing the left value into the right eye - which\n"
+                                  "actively CAUSED the darkness (it's a real per-eye value that must differ).\n"
+                                  "ON (default) = never selected. OFF = becomes a normal scan candidate again\n"
+                                  "(expect constant right-eye darkness to return). Takes effect on next refresh (~2s).");
+            }
+            m_eye_field_refresh_debounce->draw("Debounce Refresh Scan (2-cycle promote/drop)");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Confirmed to SLOW the eye flicker: without this, any offset that happens to\n"
+                                  "differ for a single 2s scan window is immediately promoted into eye_fields and\n"
+                                  "force-written, then dropped the next window (raw churn like 6->16->6->9->6\n"
+                                  "fields). ON = a candidate must differ across 2 consecutive refresh cycles (~4s)\n"
+                                  "before being written, and must match across 2 consecutive cycles before being\n"
+                                  "dropped - one-cycle transient noise is filtered out. OFF = raw single-snapshot\n"
+                                  "add/remove (previous behavior, maximum churn). Checkbox/manual force-includes\n"
+                                  "bypass the debounce.");
+            }
+            if (ImGui::Button("[Diag] Reset NSF Eye Field State (no relaunch)")) {
+                if (auto& hook = get_fake_stereo_hook(); hook != nullptr) {
+                    hook->reset_nsf_eye_field_state();
+                }
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Clears the accumulated eye_fields list, ID map, debounce streaks, and refresh\n"
+                                  "timer in-place, without a full game relaunch. Settings toggles only affect FUTURE\n"
+                                  "promotions - they never retroactively clean out offsets/streaks that already\n"
+                                  "accumulated earlier in the session. Use this to test whether behavior changes\n"
+                                  "previously attributed to a code change + relaunch were actually just caused by\n"
+                                  "getting a clean/reset state, not the code change itself.");
+            }
+            m_native_stereo_fix_right_eye_shadows_precise->draw("Right Eye Shadow Fix (Precise, +0xC90/+0x1A0 only)");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Community-confirmed fix: writes ONLY StereoPass (+0xC90) and its cached copy\n(+0x1A0) from 3 to 2 while the right eye's own BeginRenderingViewFamily runs,\nthen restores both immediately after. Matches the disassembled primary-view\npredicate (only 0 or 2 count as primary). Re-validates predicate/constructor\nbytes before every write and disables itself if they no longer match.\nPrefer this over the heuristic field-list fix above; disable that one first.");
+            }
+            m_native_stereo_fix_right_eye_shadows_precise_mirror_left->draw("Precise Fix: Mirror Left Eye's Value (2) instead of 0");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("The precise fix's target value. OFF (default) writes 0 (eSSP_FULL), which still\npasses the primary-view predicate but keeps the right eye's identity distinct\nfrom the left eye's value (2). ON mirrors the left eye's exact value (2) instead -\nthis was the first attempt and caused visible flicker/darkening, likely from both\neyes aliasing the same per-pass-value cache/slot within the same frame.");
+            }
+            m_native_stereo_fix_right_eye_shadows_precise_no_restore->draw("[Diag] Precise Fix: Leave Applied, Skip Restore (race test)");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Tests whether the flicker/darkening is caused by a render-thread race:\nBeginRenderingViewFamily enqueues work to the render thread and can return\nbefore (or after) that thread actually reads StereoPass, so restoring the\noriginal value the instant the game-thread call returns may let the render\nthread observe either value depending on scheduling jitter. When ON, the\nwrite is left in place instead of restored - pooled views are re-stamped by\ntheir constructor every frame regardless, so this should be safe to test.\nIf flicker/darkening disappears with this enabled, the race theory is confirmed.");
+            }
+            m_native_stereo_fix_right_eye_shadows_predicate_hook->draw("Right Eye Shadow Fix (Predicate Hook, no memory writes)");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Alternative to the memory-patch precise fix above: instead of writing/restoring\nStereoPass (+0xC90) and its cached copy around the right eye's render call,\ninline-hooks the primary-view predicate function itself at the same validated\nRVA and makes it answer true for the right eye's real StereoPass (3) directly.\nRuns on whatever thread calls the predicate, so there is no write/restore and\nno render-thread race window at all. Disable the memory-patch precise fix\nabove before enabling this to avoid both paths fighting each other.");
+            }
+            m_diag_watchpoint_trace_c90->draw("[Diag] Trace StereoPass (+0xC90) consumers (1 frame)");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Arms a hardware breakpoint on the right eye's live +0xC90 field for the duration\nof its own BeginRenderingViewFamily call only, and logs every distinct module+RVA\ncall site that reads/writes it during that single call. Very invasive (single-steps\non every touch) - leave off except to capture a sample in the log, then disable.");
+            }
+            m_diag_watchpoint_trace_csm_transition_scale->draw("[Diag] Trace r.Shadow.CSM.TransitionScale consumers (1 frame)");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Arms a hardware breakpoint on the live backing float of r.Shadow.CSM.TransitionScale\nduring the same widened Pass1/Pass2 window as the StereoPass (+0xC90) tracer above, and\nlogs every distinct module+RVA call site that reads/writes it. Confirmed: TransitionScale=1\nshows environmental/cascade shadows only in the left eye; =0 removes them from both eyes.\nUse this to find the actual cascade-shadow consumer instead of guessing FSceneView fields.\nVery invasive (single-steps on every touch) - leave off except to capture a sample, then disable.");
+            }
+            m_diag_disable_eye_adaptation_during_shadow_fix->draw("[Diag] A/B: Disable Eye Adaptation during Shadow Fix");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("A/B test for the flicker/right-eye-darkening side effect: forces\nr.EyeAdaptationQuality=0 while the right eye shadow fix is active, then restores\nit when the fix is disabled. Tests whether the symptom comes from auto-exposure\nhistory being read/written under the wrong eye's identity for one render call.\nIf the darkening/flicker disappears with this enabled, exposure history is the cause.");
+            }
+            m_diag_disable_taa_during_shadow_fix->draw("[Diag] A/B: Disable TAA during Shadow Fix");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("A/B test for the flicker/right-eye-darkening side effect: forces\nr.PostProcessAAQuality=0 while the right eye shadow fix is active, then restores\nit when the fix is disabled. Tests whether the symptom comes from TAA temporal\nhistory buffers being cross-contaminated between eyes for one render call.\nIf the flicker disappears with this enabled, TAA history is the cause.");
+            }
             m_native_stereo_fix_same_pass->draw("Use Same Stereo Pass (unstable)");
             if (ImGui::IsItemHovered()) {
                 ImGui::SetTooltip("Legacy approach: hides the view family from the FSceneView constructor and\nforces PRIMARY on the secondary view's init options. Crashes in this game\n(null deref inside the engine). Superseded by Right Eye Shadow Fix.");
@@ -2681,6 +2795,19 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
             m_native_stereo_fix_auto_suspend->draw("Auto-Suspend During Level Transitions");
             if (ImGui::IsItemHovered()) {
                 ImGui::SetTooltip("Automatically turns Native Stereo Fix off while a loading screen / level\ntransition is detected (tick stall, missing pawn/controller, stale world) and\nback on once the world settles - the same as manually toggling it. Untick to\ntest whether the fix is still needed now that the scene capture is no longer\nrooted across LoadMap.");
+            }
+            m_native_stereo_fix_mirror_fov->draw("Mirror Primary Eye FOV/LOD Into Secondary Eye (fixes FOV/culling/LOD mismatch)");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Copies +0x2d0/+0x2d4 (FOV-like scalar, mirrored at +0xca4/+0xca8) and the LOD factor\n"
+                                  "at +0xfd8 (mirrored at +0x2b8) from the cached PRIMARY eye's constructed FSceneView\n"
+                                  "into the SECONDARY eye's view immediately after its own constructor returns. Headset-\n"
+                                  "confirmed to fix the stable FOV/culling mismatch between eyes (observed 54.432\n"
+                                  "primary vs 90.0 secondary) and the associated LOD/blur mismatch this causes, since\n"
+                                  "the secondary eye's LOD distance factor otherwise falls back to the default 90 degree\n"
+                                  "FOV's 1.0 instead of the real camera's. Also a prime suspect for missing cascade/\n"
+                                  "environment shadows on distant scenery (trees/bridges/terrain), since cascade split\n"
+                                  "distances and shadow-caster LOD selection are computed from these same per-view\n"
+                                  "fields. Offsets are 3.7-specific.");
             }
 
             ImGui::Separator();
@@ -3033,6 +3160,7 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
             m_keybind_toggle_2d_screen->draw("Toggle 2D Screen Mode Key");
             m_keybind_toggle_gui->draw("Toggle In-Game UI Key");
             m_keybind_disable_vr->draw("Disable VR Key");
+            m_keybind_diag_nsf_flicker_burst->draw("DIAG: NSF Flicker Burst Capture Key");
 
             ImGui::TreePop();
         }
@@ -3227,6 +3355,13 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
                                   "If distant trees stop freezing in the right eye with this on, shared per-view-state occlusion history is the cause. "
                                   "Expect aliasing/flicker in the right eye while enabled.");
             }
+            m_diag_nsf_pass2_pipeline_trace->draw("[Diag] Trace NSF Pass2 Pipeline (render target swap / view swap / frame count / view state)");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Logs the render-target swap, view-array swap, scene frame-count mutation, and pass2\\n"
+                                  "view-state null/restore every frame - all of which run unconditionally, independent\\n"
+                                  "of the eye_fields write/restore loop. Use this to test whether flicker persists when\\n"
+                                  "eye_fields is fully disabled, to isolate it from these other Pass2 mechanisms instead.");
+            }
             m_native_stereo_fix_dual_write_projection->draw("DIAG: Dual-Write Missing Eye Projection Matrix (double vision fallback)");
             if (ImGui::IsItemHovered()) {
                 ImGui::SetTooltip("This title only calls CalculateStereoProjectionMatrix ONCE per frame (Instanced Stereo\\n"
@@ -3235,6 +3370,17 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
                                   "after the real call writes the called eye's matrix, using the same offset init_canvas()\\n"
                                   "resolves. Experimental - may crash or produce garbage if the cached view pointer for\\n"
                                   "the other eye is stale or the offset does not apply to it.");
+            }
+            m_diag_log_shadow_pathway_identity->draw("DIAG: Log Shadow Pathway Eye-Identity (character vs environment shadow split)");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("UE4.26 renders whole-scene/environment shadows only for the view where\\n"
+                                  "IStereoRendering::IsAPrimaryView(View) is true, then projects into both eyes;\\n"
+                                  "per-object (character) shadows use a separate primary/secondary resolution path.\\n"
+                                  "If NSF's eye-identity hacks make these two checks disagree, environment shadows\\n"
+                                  "can stick to one eye while character shadows stick to the other. Logs the known\\n"
+                                  "identity fields (StereoPass, +0x164, +0x1a0, +0x2ec, +0xc90) for both views at:\\n"
+                                  "before Pass1 submit, after Pass1 submit/before swap, before Pass2 submit, and\\n"
+                                  "after Pass2 restore, to find exactly where/when the two passes disagree.");
             }
             m_native_stereo_fix_sync_pose_force_full->draw("DIAG: Force Full Sync Every Frame (bypass hard-cut gate)");
             if (ImGui::IsItemHovered()) {
@@ -3371,6 +3517,35 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
                                   "instead of piecing it together from aliasing/pose diagnostics alone.\n"
                                   "Very verbose - enable only during a short repro window.");
             }
+            m_diag_log_eye_frustum_diff->draw("DIAG: Log Per-Eye Frustum/Matrix Diff (culling/lighting)");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Scans the live FSceneView pair for 64-byte (4x4 matrix-sized) regions and\n"
+                                  "logs [VR][EYE-FRUSTUM-DIFF] for each candidate: whether it differs between\n"
+                                  "the two eyes by a plausible lateral (IPD-style) offset (expected/healthy),\n"
+                                  "or is bit-IDENTICAL between eyes (suspicious - both eyes would be reading\n"
+                                  "the same view/projection/frustum data, a likely cause of objects/lighting\n"
+                                  "only appearing correctly in one eye). Use this to locate the view/projection\n"
+                                  "matrix fields empirically and confirm whether culling data is actually\n"
+                                  "being computed per-eye.");
+            }
+            m_match_far_lighting_between_eyes->draw("Match Far Lighting Between Eyes");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Fixes a far-distance lighting mismatch between eyes caused by the game's Cascade\n"
+                                  "Lighting Volume (CLV): each eye keeps its own copy in its view state, and when it\n"
+                                  "rebuilds (boot, loading screens, teleports) only whichever eye renders first gets\n"
+                                  "its far region filled, so distant objects miss bounce/sky light in the other eye.\n"
+                                  "This pulses r.GPUScene.UploadEveryFrame on for exactly one frame right after the\n"
+                                  "world settles from such a transition, filling both eyes' far CLV in that frame,\n"
+                                  "then turns it back off (leaving it on permanently freezes rendering). May cause a\n"
+                                  "short hitch each time it fires. On by default.");
+            }
+            if (ImGui::Button("Refill Far Lighting Now")) {
+                request_far_lighting_refill();
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Manually triggers the one-frame far-lighting refill pulse above, for situations\n"
+                                  "the automatic boot/loading-screen/teleport detection doesn't catch.");
+            }
             m_diag_hook_dual_view_gate->draw("DIAG: Hook Dual-View Gate Function (statically-confirmed RVA)");
             if (ImGui::IsItemHovered()) {
                 ImGui::SetTooltip("Installs an inline hook directly on the dual-view gate function itself, at\n"
@@ -3410,6 +3585,33 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
                                   "chance to resolve, then grep the log for ADDR-DUMP to gather every address in\n"
                                   "one place for static cross-referencing instead of hunting through the whole\n"
                                   "session log for each one's individual first-resolved log line.");
+            }
+            if (m_diag_trace_writer_enabled->draw("DIAG: Enable Offline Trace Writer")) {
+                uevr_trace::TraceWriter::get().set_enabled(m_diag_trace_writer_enabled->value());
+                if (m_diag_trace_writer_enabled->value()) {
+                    if (auto& hook = get_fake_stereo_hook(); hook != nullptr) {
+                        hook->replay_trace_state();
+                    }
+                }
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Records module-relative RVAs for key stereo/scene-view events to a binary\n"
+                                  "trace file (uevr_trace/trace.bin) plus a JSON module manifest\n"
+                                  "(uevr_trace/manifest.json) in the persistent data directory. Toggling this ON\n"
+                                  "truncates any previous trace.bin and starts a fresh recording session. The\n"
+                                  "trace is intended to be parsed entirely offline by tools/ghidra/annotate_uevr_trace.py\n"
+                                  "to annotate the static binary, instead of relying on live debugging/sockets.\n"
+                                  "This setting is persisted - leave it ON and it will automatically resume\n"
+                                  "tracing (and replay already-resolved offsets) the next time the game starts,\n"
+                                  "so you don't need to race the main-menu loading-screen lag to click it.");
+            }
+            if (ImGui::Button("DIAG: Flush Trace Now")) {
+                uevr_trace::TraceWriter::get().flush();
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Forces any buffered trace records to be written to disk immediately, and\n"
+                                  "rewrites the JSON module manifest. Useful right before closing the game so\n"
+                                  "the last partial buffer isn't lost.");
             }
             m_diag_exclude_view_index_from_sync_cache->draw("DIAG: Exclude View Index From Sync-Pose Cache");
             if (ImGui::IsItemHovered()) {
@@ -3512,6 +3714,13 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
         }
         if (ImGui::IsItemHovered()) {
             ImGui::SetTooltip("All fields start disabled. Each F id is stable for this session and maps to the raw +offset\nlogged by 'sceneview_xref: eye identity fields'. Enable ONE candidate at a time and restart\nthe test after any crash; only validated small-enum values are written.");
+        }
+        ImGui::Checkbox("DIAG: NSF disable bAlwaysPersistRenderingState on scene capture", &m_diag_nsf_disable_persist_rendering_state);
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Requires Native Stereo Fix ON + a fresh scene capture (toggle NSF off/on or reload to re-trigger\n"
+                              "create_scene_capture()). When checked, leaves bAlwaysPersistRenderingState at the engine default\n"
+                              "(false) instead of forcing it true, to A/B whether manually persisting per-view rendering state on\n"
+                              "the capture-driven right eye is contributing to the bilateral dark overlay/flicker.");
         }
         ImGui::Checkbox("Stereo Emulation Mode", &m_stereo_emulation_mode);
         ImGui::Checkbox("Wait for Present", &m_wait_for_present);

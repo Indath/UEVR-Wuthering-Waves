@@ -1,1 +1,185 @@
-vv
+Added Lineup 3D Display
+- A 3D/2D button will appear in the top right corner of the Team screen, allowing you to switch between 3D and 2D display. (※2D is the default.)
+- Select the 3D option to display your Resonators in 3D mode.
+- Added the Preset Teams menu to the lineup page for Tower of Adversity, allowing you to select one of the Preset Teams for a challenge.
+- 3D Display is not available on devices with the following configurations:
+①iOS:
+RAM≤ 4GB
+②Android:
+RAM≤ 6GB.
+※Enabling 3D Display may contribute to the device load. Please choose the suitable option based on the performance of your device.
+※The current 3D Display feature is not the final version. We will continue to refine this feature in further versions in terms of visuals and device load.
+ 
+●Camera Mode:
+Improved Functionality & Usability
+- New UI, with the previously available features intact.
+- Added more shooting modes and adjustable parameters.
+ 
+New Shooting Modes
+- Handheld mode, allowing you to adjust the character's line of sight.
+- Selfie mode, allowing you to take photos of Rover in various poses and expressions. (※Only Rover is available in Selfie mode.)
+- Added a drone view to the original shooting mode, allowing you to capture expansive panoramic views from great distances.
+ 
+New Supportive Features
+- Added reference lines, allowing you to better frame and adjust shots.
+- Added lens templates, allowing you to select among the preset lens templates.
+- Added Quick Focus, allowing you to focus the camera on your subject by clicking on it. After using Quick Focus, you can adjust the Focus Distance with your subject as a reference.
+ 
+Added On-character Lighting Templates
+- Select lighting templates to adjust the lighting effects on the current Resonator. You may adjust the Lighting Direction.
+※We will continue to refine the on-character lighting parameters and bring you more options in this regard. Please stay tuned.
+ 
+Added Environmental Settings
+- You can adjust environmental settings such as Time, Weather, and Foliage Wind Direction in the Environment tab. (Changes to Time may take some time to take effect.)
+- Added the Atmosphere effect option. You can adjust the effect density.
+- With the Foliage Wind Direction option, you can adjust the wind direction, along with the wind strength. The wind direction and strength will affect how the foliage and the Atmosphere objects move.
+- The Environmental Settings apply only to Camera mode.
+ 
+Added Preset Frames
+- You can add a preset frame to the photo you are taking.
+- Added the selectable "Wuthering Waves" logo to the photo you are taking (the size of the logo is adjustable.)
+ 
+Optimized Global Filter Settings
+- In addition to the preset Filters in camera mode, there are also an adjustable Color Palette and other adjustable advanced parameters.
+- The Global Filter settings in Camera mode do not affect the Global Filter settings for and the display of the Overworld.
+ 
+✦Leveling✦
+●Synthesis:
+Added One-Way Conversion
+- Access this feature via Synthesis > Conversion > One-Way Conversion
+- Added a method of obtaining Regenerative Pistils (Bioprinting material). You can convert collectible Resonator Ascension materials found within Jinzhou, Black Shores, Rinascita, Roya Frostlands, and Mengzhou, via One-Way Conversion, into Regenerative Pistils.
+ 
+✦Challenges, Puzzles, & Events✦
+●Weekly Activity:
+Partially Adjusted Gameplay of "Fantasies of the Thousand Gateways"
+- Added Sigils associated with Flashburn (Fusion Burst) and Frostbane (Glacio Chafe).
+- Added gameplay content associated with Metaphors and Shop Items.
+ 
+- Optimized the mechanics of how Popular Teams recommendations are made in Tower of Adversity.
+ 
+●Quests
+●Journey Log:
+Added Main Quest Replay Mode
+- After Version 3.7 is released, you can replay the Main Quests of Version 1.1: Thaw of Eons, Version 1.2: In the Turquoise Moonglow, and Version 1.3: To the Shore's End.
+- If you've already completed the above-mentioned Main Quests, go to Quests > Journey Log. To enter Replay Mode, press "Replay" on any of the Main Quests available for Replay. ※(To unlock Version 1.2: In the Turquoise Moonglow in Replay Mode, complete the Main Quest of Version 1.1 first.)
+- Your progress is automatically saved when you exit Replay Mode. You can resume from where you left off in the Journey Log, or reset your progress manually.
+※Some Main Quest-exclusive Trophies can be obtained through Replay Mode, but Items obtained during Replay Mode only exist there and won't carry over.
+※We will continue to refine the Journey Log feature and include more Quests in Replay Mode. Please stay tuned.
+ 
+- Optimized the quest flow and instructions of the Daily Quest "Short Days, Shorter Nights" and increased its daily reset frequency.
+ 
+✦UI✦
+- Added a display of reward collection progress for certain gameplay features available in the Simulacrum Nexus of Mengzhou. When you're experiencing a specific gameplay feature, press the icon that appears next to the mini map in the top left corner of the screen to view your reward collection progress for the gameplay feature.
+- Adjusted the information that is displayed upon pressing certain icons on the map. When icons associated with certain gameplay features available in the Simulacrum Nexus of Mengzhou are selected, the displayed information will now include your reward collection progress.
+ 
+- Optimized the display of certain icons.
+ 
+✦Graphics & Performance✦
+●Graphics Settings
+Extended Availability of Vulkan on Mobile
+Following the Version 3.7 update maintenance, the Vulkan option can also be enabled on the following processors:
+①Kirin Series: Kirin 8000, Kirin 8000A
+②Dimensity Series: Dimensity 7200, Dimensity 7200-Ultra, Dimensity 8000, Dimensity 8100, Dimensity 8100-MAX, Dimensity 8200, Dimensity 8200-Ultimate, Dimensity 8200-Ultra, Dimensity 8250 Star Speed Edition, Dimensity 7300, Dimensity 7300-Ultra, Dimensity 8300-Ultra, Dimensity 8350, Dimensity 7500
+②Exynos Series: Exynos 1480
+- This option is accessible via Settings > Graphics > Vulkan. Please restart the game after enabling the Vulkan option for the change to take effect.
+- Enabling the Vulkan option improves the game's performance and power consumption while it is being run on mobile.
+※Additionally, the Vulkan option will now be on by default on mobile devices equipped with Exynos 2600, Exynos 2500, Exynos 2400, Exynos 2200, or Exynos 1480, for better performance.
+ 
+Extended Availability of Self-developed Frame Generation on Mobile
+- Extended support for self-developed frame generation to mobile devices equipped with Dimensity 9300 and Dimensity 9300+. If your processor meets the requirements, you can enable this option via Settings > Graphics > Frame Generation after enabling Vulkan.
+- Running the game with the "Frame Generation" option enabled at 60FPS (maximum) consumes less power than running the game at 60FPS without the option enabled.
+ 
+✦Audio✦
+- Optimized some audio/stereo effects.
+ 
+✦Other✦
+- Optimized instructional text that appears while driving the motorbike in certain scenarios.
+- Optimized the descriptions of certain in-game settings and functions.
+ 
+✦Online Testing✦
+●Limited Test
+Tiered Client Resource Downloads
+- Tiered Client Resource Downloads is a feature that allows you to select between different resource tiers. In future versions of Wuthering Waves, the original single resource package will be divided into three tiers based on differences in graphics quality, models, and other game assets: UHD, HD, and SD. You may select and download the tier that best suits the storage space and device specifications of your device.
+ 
+- Test Participants and Test Schedule:
+①PC (※Official Launcher): The test will become available in stages on PC after the Version 3.7 update.
+②iOS/Android Mobile: The test will become available on all iOS/Android mobile devices after the Version 3.7 update.
+※The test schedule may be subject to change due to version stability or other considerations. Please refer to the announcement titled "About Tiered Client Resource Downloads" for more information about the test, available features, and FAQ.
+※This feature is at the testing stage and is not the final version.
+ 
+●Full-scale Test
+"New Programming Language" Cross-Platform Performance Optimization
+- We have conducted several rounds of testing for the "New Programming Language" performance optimization in Version 3.6 and have verified its stability. The limited test phase ended on 2026-09-09 at 15:00 (UTC+8). This optimization is now available to all players across all platforms.
+- On devices that meet the requirements across all platforms, the game's overall performance and average frame rate will improve to a certain extent.
+- This optimization is currently unavailable on the following devices (on these devices, the game client will continue to run in the original programming language, and the gaming experience will not be affected):
+①iOS mobile: RAM ≤ 4GB; iPhone 14 series with iOS 16.0/17.0/17.1/17.2.
+②Android mobile: RAM≤ 6GB.
+※This optimization is at the testing stage and is not the final version. The requirements regarding device specifications and the overall performance may be subject to change.
+ 
+[Bug Fixes]
+●Resonators & Weapons
+- Fixed an issue where Resonator Qingxiao's character model sometimes behaved abnormally while in the "Ephemeral Transcendence" state.
+- Fixed an issue where a number appeared on certain Skill icons while Resonator Qingxiao was in the "Sword Flight" state to show the remaining attempts of the Skill.
+- Fixed an issue where Resonator Qingxiao might move outside the bounds of the Map upon casting Sword Step.
+- Fixed a clipping issue with Resonator Qingxiao's character model displayed on the Resonators page.
+- Fixed an issue where Plume Step might not be triggered at the right time while Resonator Suisui was in the "Roaming Transcendent" state.
+- Fixed an issue where Resonator Chisa's character model behaved abnormally on some mobile devices when she made certain movements while wearing the Outfit "Peach Parfait."
+- Fixed an issue with the movements of Resonator Cartethyia in her Fleurdelys form while walking on water.
+- Fixed an issue that prevented Rover: Electro from interacting with the Hearthbear in the "Roya Frostlands - Frostlands Surface" area.
+- Fixed an issue where switching teams or weapons might prevent the buff "the ATK of all nearby Resonators in the team is increased" offered by the weapon "Firstlight's Herald" from taking effect.
+ 
+●Enemies & Echoes
+- Fixed an issue where the effect "after casting the Echo Skill 'Thousand-Puppet Pavilion,' when the Resonator equipped with this Echo inflicts Havoc Bane, consume 1 Blade of Thousand Memories to deal Havoc DMG" could be triggered more than once every 1s.
+ 
+●Features
+- Fixed an issue where the frame generation function might not work while in the "Huanglong - Mengzhou" area.
+- Fixed an issue where the screens of devices equipped with AMD Series graphics cards might flash with the frame generation option enabled.
+- Fixed an issue in the "Guidebook - Activity - Weekly - Phantasma Dreamland: Rhapsody" event where Echoes in the Chop Chop series might not be devoured first after the item "Unbeliever's Crown" was selected.
+- Fixed an issue that might cause a random prompt to pop up when claiming rewards on the "Guidebook - Activity" screen.
+- Fixed an issue where the Exploration Report for the "Roya Frostlands - Lahai-Roi - Rebirth Uplands" area contained textual errors.
+- Fixed an issue with the lighting effects that affected the current screen when opening the Resonators screen while in the "Roya Frostlands - Dimmr Plains" area.
+- Fixed an issue where the "Tactical Hologram: Calamity - Impermanence Heron" entry was marked as uncompleted on the Milestones screen after the corresponding challenge had been completed.
+- Fixed an issue with the order of the Sonata Sets displayed on the "Data Bank - Sonata Gallery" screen.
+- Fixed an issue that prevented red dots on the "Terminal - Guidebook" screen from disappearing.
+- Fixed an issue in Keyboard & Mouse mode where some input setting changes made via Settings > Controls might be nullified in some situations.
+- Fixed an issue that prevented the player from pressing and holding the icon of a Resonator to shift it to a different slot on the Lineup screen.
+- Fixed a display issue with the time on the Chat screen.
+- Fixed an issue with the lighting effects of the expedition motorbike screen.
+- Fixed an issue where certain player actions could nullify changes to the order of the favorited songs in the Heart Radio Channel.
+- Fixed an issue where the Hack Response option was missing from the Combat Role section on the Filter menu for Resonators.
+- Fixed an issue in controller mode where the "releasing the Wheel button will trigger the feature the stick is pointing to" function for the Utility wheel was closed by default.
+- Fixed a display issue with some of the text displayed on the Echo recommendation screen.
+- Fixed a display issue with certain Item icons.
+ 
+●Challenges, Puzzles, & Events
+- Fixed an issue in the "Endstate Matrix" event where the temporary Resonance Mode selected for a Resonator with multiple Resonance Modes and additional Vigor in the team was not saved in some situations, making it necessary to make the section again when restarting a challenge.
+- Fixed an issue in controller mode where certain player actions could cause the screen to become unresponsive in the "Whimpering Wastes" event.
+- Fixed an issue in the "Lament Recon: Tacet Crisis" event where the items "Purple Candy" and "Blue Candy" did not take effect after being selected.
+- Fixed an issue in the "Lament Recon: Tacet Crisis" event where only one instance of healing occurred after collecting a large number of Life Balls with the item "Sign of Harvest" selected.
+- Fixed an issue where the "Lament Recon: Tacet Crisis" event remained marked as uncompleted after it was completed.
+- Fixed an issue in the "Old Man and the Whale" event where the confirmation dialog box appeared repeatedly upon using "Baiting" or "Fast Travel to Dock."
+- Fixed a display issue in the "Old Man and the Whale" event that affected the displayed text after selecting Rachel the Fishing Boat.
+- Fixed an issue where the character model might float above the surface after completing Sword Flight.
+- Fixed an issue where certain Sword Flight Points remained marked as uncompleted after the corresponding challenges had been completed.
+- Fixed an issue that prevented the player from exiting the "Squarefield Sparring" event.
+- Fixed an issue in controller mode where button remapping did not take full effect in Route Constructor Racing Challenges.
+- Fixed an issue where certain interactable objects in "The Three Fratellis' Challenge" in the "Rinascita - Ragunna - Thessaleo Fells" area remained displayed as interactable after the challenge had been completed.
+ 
+●Quests
+- Fixed an issue in the Main Quest "Song of the Heart Sword" where the Resonator might drop below the surface and could not return to the task location during the objective "Defeat the incoming Autopuppet."
+- Fixed an issue in the Main Quest "Song of the Heart Sword" where Qingxiao's character model behaved abnormally on some Android devices under specific settings while displaying certain scenes.
+- Fixed an issue in the Main Quest "Song of the Heart Sword" where certain scenes were blurry on iOS devices.
+- Fixed an issue in the Main Quest "Beneath a Melting Night Sky" where opening WavesLine might cause a random pop-up to appear.
+- Fixed a clipping issue with certain Resonator models and NPC models in some Main Quests.
+- Fixed an issue where a black screen occurred briefly on PS5 devices while displaying certain scenes of some Main Quests.
+- Fixed an issue that prevented quest progression in the Exploration Quest "Faithful Heart Tested at Skyfall" where Zhongxu might fall outside the bounds of the Map and could not return to the Map while it was being operated by the player.
+- Fixed an issue in the Side Quest "A Night of Shimmering Stars" where identical NPCs appeared simultaneously at some task locations.
+- Fixed an issue where the Side Quest "Where Wisdom Lights the Way" remained marked as uncompleted in Journey Log after it was completed.
+- Fixed an issue in Autoplay mode during certain quests where the next dialogue section did not play when the current section had been played.
+- Fixed an issue where it was impossible to use Fast Travel to return to the task location during certain quests.
+- Fixed an issue where the quest tracking icon did not appear after some Side Quests were accepted after messaging with the corresponding NPCs.
+ 
+●Environment
+- Fixed an issue with certain bodies of water in the "Huanglong - Mengzhou - Western Fang Peaks" area that made it impossible to swim in them.
+- Fixed an issue on Mac where the water surface did not freeze as the motorbike passed over it.
+- Resolved known instances of objects clipping through each other or floating above the surface.

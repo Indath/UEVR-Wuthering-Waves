@@ -155,6 +155,20 @@ void Framework::hook_monitor() {
 
     const auto renderer_type = get_renderer_type();
 
+    // DIAG: watchdog for the specific "hook installs successfully but the game process terminates
+    // a few seconds later without a single Present ever coming through it" scenario. If this fires,
+    // the patched D3D12 Present vtable slots were never actually called by the game before exit -
+    // ruling out a hang/crash inside our own Present handling and pointing instead at either wrong
+    // vtable slots being patched, or something external (e.g. anti-cheat) reverting the patch.
+    if (renderer_type == Framework::RendererType::D3D12 && d3d12 != nullptr && d3d12->is_hooked() && !d3d12->has_handled_first_present()) {
+        const auto ms_since_hook = std::chrono::duration_cast<std::chrono::milliseconds>(now - d3d12->get_hook_installed_time()).count();
+
+        if (ms_since_hook >= 2000) {
+            SPDLOG_WARNING_EVERY_N_SEC(1, "Framework::hook_monitor(): D3D12 hook installed {}ms ago but no Present call has been handled through it yet (seen={})",
+                ms_since_hook, d3d12->has_seen_first_present());
+        }
+    }
+
     // Separately detect a hang that occurs while the render thread is still *inside* Present
     // (e.g. stuck inside a depth texture reallocation call in the RHI chain). The branch below
     // only watches for time spent *outside* Present, so a hang here would otherwise never be
@@ -265,9 +279,29 @@ void Framework::hook_monitor() {
             }
 
             if (!m_has_last_chance && now - m_last_chance_time > std::chrono::seconds(1)) {
-                if (m_valid) {
-                    spdlog::warn("Framework::hook_monitor(): suppressing D3D rehook because a D3D hook was previously successful");
-                    m_last_chance_time = now + std::chrono::seconds(5);
+                // IMPORTANT: once a D3D hook has already proven itself by successfully receiving
+                // at least one real Present/frame callback, do NOT tear it down and recreate the
+                // device/swapchain/command queue just because Present has gone quiet for a while.
+                // That is far more likely to be a legitimate loading screen / level transition /
+                // UAF-recovery hiccup than a dead hook, and destructively rehooking during that
+                // window can itself prevent the game from ever reaching its next real Present,
+                // leading to an infinite rehook loop and eventual shutdown. Only attempt rehooks
+                // before the very first successful hook.
+                if (m_d3d_hook_ever_succeeded) {
+                    SPDLOG_WARNING_EVERY_N_SEC(1, "Framework::hook_monitor(): suppressing D3D rehook because a D3D hook was previously successful");
+
+                    m_last_chance_time = now;
+                    m_has_last_chance = true;
+                } else if (now - m_construction_time < std::chrono::seconds(3)) {
+                    // IMPORTANT: on process startup the engine hasn't necessarily created its real
+                    // D3D11/D3D12 device/swapchain yet. Rehooking (unhook + hook dummy device again)
+                    // this early just churns through extra hook installs/teardowns for no benefit and
+                    // can race the engine's own device creation. Give it a short grace window before
+                    // attempting the very first rehook so we have a better chance of landing on the
+                    // real swapchain in one shot.
+                    SPDLOG_INFO_EVERY_N_SEC(1, "Framework::hook_monitor(): within startup grace period, deferring first rehook attempt");
+
+                    m_last_chance_time = now;
                     m_has_last_chance = true;
                 } else {
                     if (!m_stall_dump_written) {
@@ -443,6 +477,7 @@ Framework::Framework(HMODULE framework_module)
     m_last_message_time = std::chrono::steady_clock::time_point{}; // Instantly send the first message
     m_last_chance_time = std::chrono::steady_clock::time_point{}; // Instantly send the first message
     m_has_last_chance = false;
+    m_construction_time = std::chrono::steady_clock::now();
 
     m_uevr_shared_memory = std::make_unique<UEVRSharedMemory>();
     m_command_thread = std::make_unique<std::jthread>([this](std::stop_token s) {
@@ -562,7 +597,17 @@ bool Framework::hook_d3d12() {
 }
 
 Framework::~Framework() {
-    spdlog::info("Framework shutting down...");
+    spdlog::error(
+        "Framework shutting down... (pid={}, tid={}, m_terminating={}, m_initialized={}, m_game_data_initialized={}, m_d3d_hook_ever_succeeded={}, is_dx11={})",
+        GetCurrentProcessId(),
+        GetCurrentThreadId(),
+        (bool)m_terminating,
+        (bool)m_initialized,
+        (bool)m_game_data_initialized,
+        (bool)m_d3d_hook_ever_succeeded,
+        (bool)m_is_d3d11
+    );
+    spdlog::default_logger()->flush();
 
     m_terminating = true;
     m_d3d_monitor_thread->request_stop();
@@ -710,6 +755,8 @@ void Framework::on_frame_d3d11() {
 }
 
 void Framework::on_post_present_d3d11() {
+    m_d3d_hook_ever_succeeded = true;
+
     if (!m_error.empty() || !m_initialized || !m_game_data_initialized) {
         if (m_last_present_time <= std::chrono::steady_clock::now()){
             m_last_present_time = std::chrono::steady_clock::now();
@@ -732,10 +779,11 @@ void Framework::on_frame_d3d12() {
     std::scoped_lock _{ m_imgui_mtx };
 
     m_renderer_type = RendererType::D3D12;
+    m_d3d_hook_ever_succeeded = true;
 
     auto command_queue = m_d3d12_hook->get_command_queue();
     //spdlog::debug("on_frame (D3D12)");
-    
+
     if (!m_initialized) {
         if (!initialize()) {
             spdlog::error("Failed to initialize Framework on DirectX 12");
@@ -1114,13 +1162,16 @@ void Framework::on_frontend_command(UEVRSharedMemory::Command command) {
         m_uevr_shared_memory->data().signal_frontend_config_setup = false;
         break;
     case UEVRSharedMemory::Command::QUIT:
+        spdlog::error("Received QUIT command from frontend! (m_wnd={})", (void*)m_wnd);
+        spdlog::default_logger()->flush();
+
         if (m_wnd != nullptr) {
             PostMessageA(m_wnd, WM_CLOSE, 0, 0);
             PostMessageA(m_wnd, WM_DESTROY, 0, 0);
             PostMessageA(m_wnd, WM_QUIT, 0, 0);
             m_terminating = true;
         }
-        
+
         break;
     default:
         spdlog::error("Unknown frontend command received: {}", (int)command);

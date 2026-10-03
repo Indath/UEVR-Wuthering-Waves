@@ -44,6 +44,11 @@ public:
     auto& openxr() { return m_openxr; }
     auto& get_openvr_ui_tex() { return m_openvr.ui_tex; }
 
+    // Exposed so callers tearing down a scene-capture actor/resource (e.g.
+    // VRRenderTargetManager_Base::destroy_scene_capture) can flush outstanding GPU work against it
+    // first, avoiding a release-while-in-flight race with the game's own D3D12 command lists.
+    void wait_for_scene_capture_copies();
+
 private:
     bool setup();
     std::unique_ptr<DirectX::DX12::SpriteBatch> setup_sprite_batch_pso(
@@ -54,7 +59,6 @@ private:
 
     void draw_spectator_view(ID3D12GraphicsCommandList* command_list, bool is_right_eye_frame);
     void clear_backbuffer();
-    void wait_for_scene_capture_copies();
 
     template <typename T> using ComPtr = Microsoft::WRL::ComPtr<T>;
 

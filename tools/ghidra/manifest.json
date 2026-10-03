@@ -1,0 +1,11 @@
+{
+  "format_version": 1,
+  "modules": [
+    {
+      "base": 5368709120,
+      "name": "D:\\Steam Games\\steamapps\\common\\Wuthering Waves\\Client\\Binaries\\Win64\\Client-Win64-Shipping.exe",
+      "size": 181538816
+    }
+  ],
+  "record_size_bytes": 48
+}

@@ -109,6 +109,10 @@ public:
 
     sdk::UTexture* get_scene_capture_utexture();
 
+    // DIAG: exposes the scene capture component for diagnostic property reads (e.g. live
+    // re-checking CaptureSource) from outside this class without requiring full friend access.
+    sdk::USceneCaptureComponent2D* get_scene_capture_component_diag() const { return scene_capture_component.get(); }
+
     // True until a short grace period has elapsed since the scene capture render target became
     // usable. Callers doing heavier per-frame work (e.g. the native-stereo-fix "same pass"
     // secondary-view/depth rendering) should treat this as still-loading and fall back to the
@@ -222,6 +226,17 @@ protected:
     sdk::UObjectReference<sdk::UTexture> scene_capture_target_rhi_thread{nullptr}; // For custom compatibility rendering
     sdk::UTexture* in_flight_target{nullptr}; // Not a reference because this is basically a barrier against creating a new scene capture target
     sdk::FViewport* last_viewport{nullptr};
+
+    // Bumped every time a new scene capture target is created or destroyed. Captured by value into
+    // the async render/RHI/game-thread jobs spawned by create_scene_capture() so they can detect, at
+    // every step before touching raw memory, that THIS specific capture attempt was invalidated (e.g.
+    // destroy_scene_capture() ran concurrently on another thread/level transition) even if `tgt` is
+    // still a non-null UObjectReference that merely hasn't flipped tgt.valid() to false yet (there is
+    // an unavoidable window between the engine freeing/GC\u2019ing the object and valid() reflecting that).
+    // This is a much cheaper and more precise guard than relying solely on tgt.valid() checks, since it
+    // is incremented synchronously and deterministically on the game thread rather than depending on
+    // UObject validity tracking that can lag behind the actual free.
+    std::atomic<uint64_t> scene_capture_generation{0};
 
     // Throttle for create_scene_capture(). During a level transition the engine tick can flicker
     // (resume for a frame or two, then stall again), which was previously enough to let the loading
@@ -385,6 +400,17 @@ public:
     // and cross-referenced in a static disassembler without having to grep the log for a dozen
     // separately-emitted "Found X at 0x..." lines from different points in the session.
     void dump_stereo_addresses();
+
+    // DIAG: in-place reset of all accumulated NSF eye_fields state (the field list, ID map,
+    // debounce streaks, refresh timer) without requiring a full game relaunch. See
+    // sceneview_xref::reset_state() for rationale.
+    void reset_nsf_eye_field_state();
+
+    // DIAG: re-emits trace records for whatever sceneview_xref has already resolved (stereo pass
+    // offset, init-options offsets), without re-running the resolution logic. Call this right
+    // after enabling the offline TraceWriter so late-enabled tracing still captures state that
+    // was already resolved earlier in the session (e.g. at the loading screen).
+    void replay_trace_state();
 
     void request_lgui_diagnostic_dump() {
         m_lgui_diagnostic_dump_state.store(1, std::memory_order_release);
@@ -560,6 +586,37 @@ public:
         m_last_pose_divergence_time = std::chrono::steady_clock::now();
         m_had_pose_divergence = true;
     }
+
+    // WuWa far-lighting eye mismatch fix (see is_match_far_lighting_between_eyes_enabled() in
+    // VR.hpp). Tracks whether a far-CLV refill pulse is currently pending/active so it can be
+    // started exactly once per detected transition (boot/loading-screen/teleport) and consumed for
+    // exactly one frame of r.GPUScene.UploadEveryFrame=1 before being turned back off. was_suspended
+    // is the NSF auto-suspend flag observed THIS call; a pulse is armed on the falling edge (was
+    // suspended last call, not suspended now - i.e. the world just settled after a transition).
+    bool should_arm_far_lighting_refill_pulse(bool currently_suspended) {
+        const bool just_resumed = m_far_lighting_was_suspended && !currently_suspended;
+        m_far_lighting_was_suspended = currently_suspended;
+        return just_resumed;
+    }
+
+    void arm_far_lighting_refill_pulse() {
+        m_far_lighting_refill_pulse_pending = true;
+    }
+
+    // Must be called at most once per real frame. Returns true exactly once per armed pulse (the
+    // frame r.GPUScene.UploadEveryFrame should be forced to 1), then clears the pending flag so the
+    // caller restores the cvar to its normal value on the next frame.
+    bool consume_far_lighting_refill_pulse() {
+        if (!m_far_lighting_refill_pulse_pending) {
+            return false;
+        }
+
+        m_far_lighting_refill_pulse_pending = false;
+        return true;
+    }
+
+    bool m_far_lighting_was_suspended{false};
+    bool m_far_lighting_refill_pulse_pending{false};
 
     // Returns how long (in ms) it has been since the last pose-divergence event. Returns UINT64_MAX if
     // no divergence has ever been observed yet, so callers can distinguish "never happened" from
@@ -776,6 +833,18 @@ private:
     // FSceneView
     static sdk::FSceneView* sceneview_constructor(sdk::FSceneView* sceneview, sdk::FSceneViewInitOptions* init_options, void* a3, void* a4);
     
+    // UNIFIED EYE IDENTITY: adjust_view_rect, calculate_stereo_view_offset, and
+    // calculate_stereo_projection_matrix each used to maintain their OWN independent
+    // index_starts_from_one/index_was_ever_two static state, all derived from the exact same raw
+    // engine view_index stream. Because each function's state only mutates when THAT function is
+    // called, the three trackers could fall out of phase with each other (e.g. one function sees
+    // view_index==2 and flips its local flag before another function has processed the same
+    // transition), silently causing one hook site to classify a given call as the opposite eye
+    // from another hook site for the same logical call. Route all three through this single
+    // shared classifier (one set of static state, shared by every caller) so they can never
+    // disagree about which eye a given raw view_index belongs to.
+    static uint32_t classify_true_index(int32_t index);
+
     // IStereoRendering
     static bool is_stereo_enabled(FFakeStereoRendering* stereo);
     static void adjust_view_rect(FFakeStereoRendering* stereo, int32_t index, int* x, int* y, uint32_t* w, uint32_t* h);
@@ -832,6 +901,16 @@ private:
         // FSceneView when this title only calls CalculateStereoProjectionMatrix once per frame.
         uint32_t cached_view_frame_count[2]{};
         sdk::FSceneView* cached_view_for_eye[2]{};
+
+        // FALLBACK (v2): runtime evidence (NSF-PROJ-DUAL-WRITE logs) showed `out` in
+        // calculate_stereo_projection_matrix is NOT a sub-object inside the per-frame FSceneView -
+        // it is a small, stable, reused address completely separate from the (large, per-frame
+        // heap-allocated) FSceneView* above. So instead of computing an offset relative to a cached
+        // FSceneView*, directly cache the actual `out` (Matrix4x4f*) destination written to for
+        // each eye, per frame. When the engine only calls us for one eye this frame, write the
+        // other eye's projection matrix straight into its last-known `out` address.
+        uint32_t cached_proj_out_frame_count[2]{};
+        void* cached_proj_out_for_eye[2]{};
     } m_sceneview_data;
 
     safetyhook::InlineHook m_localplayer_get_viewpoint_hook{};
@@ -922,17 +1001,28 @@ private:
     std::chrono::steady_clock::time_point m_last_pose_divergence_time{};
     bool m_had_pose_divergence{false};
 
-    // NSF (non-AFR) equivalent of the AFR rotation-cache above:
-    // location for the current frame so Pass2 (right eye) can be forced to reuse it, eliminating a
-    // momentary eye desync when the live animated camera pose changes between the two eyes' render
-    // calls within the same frame (camera-transition animations). Gated behind
-    // is_native_stereo_fix_sync_pose_enabled(); see calculate_stereo_view_offset().
+    // NSF (non-AFR) UNIFIED per-frame camera pose cache. REDESIGNED: this used to be eye-biased -
+    // Pass1 (left, true_index==0) unconditionally wrote its live pose here every frame, and Pass2
+    // (right) + the excluded auxiliary view were force-snapped/blended toward it. That made the right
+    // eye structurally always "the follower" of a value captured moments earlier, which read as a
+    // persistent right-eye lag/blur during motion - a one-sided patch, not a symmetric fix.
+    //
+    // FIXED: no eye is privileged anymore. Whichever call (real eye OR the auxiliary/shadow-culling
+    // view) arrives FIRST for a new g_frame_count captures its raw (pre-IPD-offset) rotation/position
+    // into these fields as "this frame's canonical pose". Every subsequent call within that same
+    // g_frame_count (any true_index, any view_index, excluding manual calls and the full-pass
+    // fallback) is then hard-overwritten with that identical pose before the per-eye IPD/eye-offset
+    // math runs further down - so both eyes (and the auxiliary view) always render from one shared,
+    // frame-locked transform. Depth/parallax is unaffected since the IPD offset is applied afterward,
+    // keyed by true_index as before. See calculate_stereo_view_offset().
     Rotator<float> m_nsf_sync_pose_rotation{};
     Rotator<double> m_nsf_sync_pose_rotation_double{};
     Vector3f m_nsf_sync_pose_location{};
     Vector3d m_nsf_sync_pose_location_double{};
     uint32_t m_nsf_sync_pose_frame_count{0};
-    bool m_nsf_sync_pose_have_left{false};
+    // Renamed from m_nsf_sync_pose_have_left: true once ANY call (regardless of eye) has captured
+    // the canonical pose for m_nsf_sync_pose_frame_count. Reset whenever g_frame_count advances.
+    bool m_nsf_sync_pose_captured_this_frame{false};
 
     // HARD-CUT detection state for the NSF sync-pose blend (see calculate_stereo_view_offset). Plain
     // magnitude thresholds alone (mirroring the Lua cutscene-actor reset script's >10deg/>30unit test)

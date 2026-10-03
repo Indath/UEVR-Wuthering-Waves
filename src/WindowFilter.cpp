@@ -20,8 +20,16 @@ WindowFilter::WindowFilter() {
 
             m_last_job_tick = std::chrono::steady_clock::now();
 
+            // BUGFIX: this used to `return` here, which permanently kills this thread the first
+            // time it ticks with no queued jobs (i.e. within ~100ms of startup, before any window
+            // has even called is_filtered() once). Once dead, m_last_job_tick freezes forever, so
+            // is_filtered()'s "job pending, trust it for up to 2s" check falls through to treating
+            // *every* newly-seen window (including the game's real swapchain window) as filtered
+            // on its first Present call, with nothing left alive to ever reclassify it. That first
+            // Present is often the only one available during an early loading screen, so losing it
+            // means Framework::initialize() never runs and the hook is wrongly declared dead.
             if (m_window_jobs.empty()) {
-                return;
+                continue;
             }
 
             std::scoped_lock _{m_mutex};

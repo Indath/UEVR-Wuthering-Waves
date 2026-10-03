@@ -277,6 +277,7 @@ private:
     bool m_valid{false};
     bool m_initialized{false};
     bool m_created_default_cfg{false};
+    std::atomic<bool> m_d3d_hook_ever_succeeded{false};
     std::atomic<bool> m_terminating{false};
     std::atomic<bool> m_game_data_initialized{false};
     std::atomic<bool> m_mods_fully_initialized{false};
@@ -351,6 +352,7 @@ private:
     bool m_has_last_chance{true};
     bool m_first_initialize{true};
     bool m_stall_dump_written{false};
+    std::chrono::steady_clock::time_point m_construction_time{};
 
     bool m_sent_message{false};
     bool m_message_hook_requested{false};

@@ -245,6 +245,18 @@ void CVarManager::on_draw_ui() {
 				 {"ForceUpdateCSMOnce 1", "r.Shadow.ForceUpdateCSMOnce 1"}, {"Mode3IntervalOverride 0", "r.Shadow.CSMMode3EnableUpdateIntervalOverride 0"}},
 				{{"KuroCustomShadowDepth 0", "r.kuro.EnableKuroCustomShadowDepthPass 0"}, {"KuroCustomShadowDepth 1", "r.kuro.EnableKuroCustomShadowDepthPass 1"},
 				 {"KuroPlanarRefl 0", "r.Kuro.EnablePlanarReflection 0"}, {"KuroPlanarRefl 1", "r.Kuro.EnablePlanarReflection 1"}},
+				// Game-specific (non-stock-UE4.26) shadow/light layer found via SHADOW-DUMP:
+				// KuroCustomShadowDepthWorldSubsystem + r.kuro.EnableSequenceShadowFix + per-object
+				// toon mask filters. Leading suspects for left-eye-only CSM/cached direct-light
+				// behavior, since this custom pass runs outside the stock whole-scene shadow gate
+				// (IStereoRendering::IsAPrimaryView) that normally keeps environment shadows in sync
+				// across both eyes.
+				{{"SequenceShadowFix 0", "r.kuro.EnableSequenceShadowFix 0"}, {"SequenceShadowFix 1", "r.kuro.EnableSequenceShadowFix 1"},
+				 {"CSMMaskStencilFilter 0", "r.Kuro.Shadow.CSMMaskStencilFilter 0"}, {"CSMMaskStencilFilter 1", "r.Kuro.Shadow.CSMMaskStencilFilter 1"}},
+				{{"PerObjMaskExcludeToon 0", "r.Kuro.Shadow.PerObjMaskExcludeToon 0"}, {"PerObjMaskExcludeToon 1", "r.Kuro.Shadow.PerObjMaskExcludeToon 1"},
+				 {"DirLightCastShadowDynamic 0", "r.Kuro.EnableDirectionLightCastShadowDynamic 0"}, {"DirLightCastShadowDynamic 1", "r.Kuro.EnableDirectionLightCastShadowDynamic 1"}},
+				{{"GlobalLightShadowQuality_PC 0", "r.Kuro.GlobalLightShadowQuality_PC 0"}, {"GlobalLightShadowQuality_PC 3", "r.Kuro.GlobalLightShadowQuality_PC 3"},
+				 {"DisableGlobalGITransition 0", "r.Kuro.DisableGlobalGITransition 0"}, {"DisableGlobalGITransition 1", "r.Kuro.DisableGlobalGITransition 1"}},
 			};
 
 			for (const auto& row : rows) {

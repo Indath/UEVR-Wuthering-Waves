@@ -18,6 +18,34 @@ D3D12Hook::~D3D12Hook() {
     unhook();
 }
 
+namespace {
+// std::type_info::name()/raw_name() are declared noexcept in the MSVC STL. If the underlying
+// type_info/RTTICompleteObjectLocator data is bogus (e.g. a false-positive vtable/locator read
+// from a swapchain whose layout doesn't match our RTTI assumptions), dereferencing it can raise
+// a hardware access violation *inside* that noexcept function. An AV that would escape a noexcept
+// function causes an immediate std::terminate() - a C++ try/catch(...) around the call site can
+// never catch it, because the unwind never gets that far. Structured Exception Handling (SEH)
+// intercepts the hardware exception before the noexcept/terminate machinery ever sees it, so we
+// have to guard this with __try/__except instead of try/catch.
+bool seh_safe_get_type_info_name(const std::type_info* ti, const char** out_name) {
+    __try {
+        *out_name = ti->name();
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+bool seh_safe_get_type_info_raw_name(const std::type_info* ti, const char** out_name) {
+    __try {
+        *out_name = ti->raw_name();
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+}
+
 bool D3D12Hook::hook() {
     spdlog::info("Hooking D3D12");
 
@@ -224,27 +252,56 @@ bool D3D12Hook::hook() {
         return false;
     }
 
-    try {
-        const auto ti = utility::rtti::get_type_info(swap_chain1);
-        const auto swapchain_classname = ti != nullptr && ti->name() != nullptr ? std::string_view{ti->name()} : "unknown";
-        const auto raw_name = ti != nullptr && ti->raw_name() != nullptr ? std::string_view{ti->raw_name()} : "unknown";
+    // DIAG: this RTTI probe only exists to detect DLSS3 (Streamline) / FSR3 frame-generation
+    // swapchain wrappers for special-case handling below - it is not required for the hook itself
+    // to function. On this game it has been observed to sometimes take several seconds to resolve
+    // (presumably due to how first-chance SEH exceptions are handled in this process when invalid
+    // RTTI/vtable data is hit), and that multi-second stall happens synchronously on every single
+    // rehook attempt while m_hook_monitor_mutex is held, directly contributing to the rehook storm
+    // seen when the hook has to be reinstalled repeatedly in a short window. Since the outcome is
+    // deterministic for a given game binary, skip the probe on subsequent hook() calls this process
+    // once it has failed once, rather than paying this cost again on every rehook.
+    if (!m_skip_type_info_probe) {
+        const auto probe_start = std::chrono::steady_clock::now();
 
-        spdlog::info("Swapchain type info: {}", swapchain_classname);
-        spdlog::info("Swapchain raw type info: {}", raw_name);
-        
-        if (swapchain_classname.contains("interposer::DXGISwapChain")) { // DLSS3
-            spdlog::info("Found Streamline (DLSSFG) swapchain during dummy initialization: {:x}", (uintptr_t)swap_chain1);
-            m_using_frame_generation_swapchain = true;
+        try {
+            const auto ti = utility::rtti::get_type_info(swap_chain1);
+
+            const char* raw_name_ptr = nullptr;
+            const char* name_ptr = nullptr;
+            const bool got_name = ti != nullptr && seh_safe_get_type_info_name(ti, &name_ptr) && name_ptr != nullptr;
+            const bool got_raw_name = ti != nullptr && seh_safe_get_type_info_raw_name(ti, &raw_name_ptr) && raw_name_ptr != nullptr;
+
+            const auto swapchain_classname = got_name ? std::string_view{name_ptr} : "unknown";
+            const auto raw_name = got_raw_name ? std::string_view{raw_name_ptr} : "unknown";
+
+            spdlog::info("Swapchain type info: {}", swapchain_classname);
+            spdlog::info("Swapchain raw type info: {}", raw_name);
+
+            if (swapchain_classname.contains("interposer::DXGISwapChain")) { // DLSS3
+                spdlog::info("Found Streamline (DLSSFG) swapchain during dummy initialization: {:x}", (uintptr_t)swap_chain1);
+                m_using_frame_generation_swapchain = true;
+            }
+            // Need to test this one to see if it actually has the same issues - disabling it for now
+            /*else if (swapchain_classname.contains("FrameInterpolationSwapChain")) { // FSR3
+                spdlog::info("Found FSR3 swapchain during dummy initialization: {:x}", (uintptr_t)swap_chain1);
+                m_using_frame_generation_swapchain = true;
+            }*/
+        } catch (const std::exception& e) {
+            spdlog::error("Failed to get type info: {}", e.what());
+            m_skip_type_info_probe = true;
+        } catch (...) {
+            spdlog::error("Failed to get type info: unknown exception");
+            m_skip_type_info_probe = true;
         }
-        // Need to test this one to see if it actually has the same issues - disabling it for now
-        /*else if (swapchain_classname.contains("FrameInterpolationSwapChain")) { // FSR3
-            spdlog::info("Found FSR3 swapchain during dummy initialization: {:x}", (uintptr_t)swap_chain1);
-            m_using_frame_generation_swapchain = true;
-        }*/
-    } catch (const std::exception& e) {
-        spdlog::error("Failed to get type info: {}", e.what());
-    } catch (...) {
-        spdlog::error("Failed to get type info: unknown exception");
+
+        const auto probe_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - probe_start).count();
+
+        if (probe_ms >= 500) {
+            spdlog::warn("[D3D12Hook DIAG] RTTI type-info probe took {}ms (abnormally long, likely SEH/exception-handling overhead); skipping it on future rehooks this session", probe_ms);
+        }
+    } else {
+        spdlog::info("Skipping RTTI type-info probe (previously failed this session)");
     }
 
     spdlog::info("Finding command queue offset");
@@ -343,9 +400,23 @@ bool D3D12Hook::hook() {
 
         auto& present_fn = (*(void***)target_swapchain)[8]; // Present
         auto& present1_fn = (*(void***)target_swapchain)[22]; // Present1
+
+        // DIAG: capture the exact vtable slot addresses and original function pointers being
+        // patched, so we can later verify (from present_internal, or post-mortem) whether these
+        // slots still point to our detours, or whether something (e.g. anti-cheat integrity
+        // checks) reverted the patch out from under us before Present was ever actually called.
+        m_hooked_present_fn_addr = &present_fn;
+        m_hooked_present1_fn_addr = &present1_fn;
+        spdlog::info("[D3D12Hook DIAG] Present vtable slot @ {:x} (original fn {:x}), Present1 vtable slot @ {:x} (original fn {:x})",
+            (uintptr_t)&present_fn, (uintptr_t)present_fn, (uintptr_t)&present1_fn, (uintptr_t)present1_fn);
+
         m_present_hook = std::make_unique<PointerHook>(&present_fn, (void*)&D3D12Hook::present);
         m_present1_hook = std::make_unique<PointerHook>(&present1_fn, (void*)&D3D12Hook::present1);
         m_hooked = true;
+        m_first_present_seen = false;
+        m_first_present_handled = false;
+        m_first_present_filtered_logged = false;
+        m_hook_installed_time = std::chrono::steady_clock::now();
     } catch (const std::exception& e) {
         spdlog::error("Failed to initialize hooks: {}", e.what());
         m_hooked = false;
@@ -390,6 +461,18 @@ thread_local int32_t g_present_depth = 0;
 HRESULT D3D12Hook::present_internal(IDXGISwapChain3* swap_chain, UINT sync_interval, UINT flags, DXGI_PRESENT_PARAMETERS* params, bool present1) {
     auto d3d12 = g_d3d12_hook;
 
+    // DIAG: this is the single most important log line for the "hook installs but game shuts
+    // down before anything renders" scenario. If "Hooked DirectX 12" is logged but this line
+    // never appears before process exit, Present was never actually invoked through our patched
+    // vtable slots at all (e.g. the real swapchain uses different vtable slots than the dummy one
+    // we patched, or something like anti-cheat reverted the patch before the game's own Present
+    // call happened), which rules out a crash/hang inside our own Present handling logic.
+    if (!d3d12->m_first_present_seen.exchange(true)) {
+        const auto ms_since_hook = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - d3d12->m_hook_installed_time).count();
+        spdlog::info("[D3D12Hook DIAG] First Present call received {}ms after hook install (present1={})", ms_since_hook, present1);
+    }
+
     HWND swapchain_wnd{nullptr};
     swap_chain->GetHwnd(&swapchain_wnd);
 
@@ -403,6 +486,16 @@ HRESULT D3D12Hook::present_internal(IDXGISwapChain3* swap_chain, UINT sync_inter
     }
 
     if (d3d12->m_is_phase_1 && WindowFilter::get().is_filtered(swapchain_wnd)) {
+        // DIAG: this is the gap that made "First Present call received" misleading on its own -
+        // a Present call can reach here and still never result in on_present() being invoked if
+        // WindowFilter bounces it (e.g. it belongs to a different/overlay window sharing the same
+        // globally-patched vtable slot, not the game's real swapchain). Log this once so it's
+        // obvious when the "first present seen" diagnostic was actually a filtered, not a real,
+        // frame.
+        if (!d3d12->m_first_present_filtered_logged.exchange(true)) {
+            spdlog::warn("[D3D12Hook DIAG] First Present call was filtered out by WindowFilter (hwnd={:x}), on_present was NOT invoked", (uintptr_t)swapchain_wnd);
+        }
+
         return present_fn(swap_chain, sync_interval, flags, params);
     }
 
@@ -489,6 +582,17 @@ HRESULT D3D12Hook::present_internal(IDXGISwapChain3* swap_chain, UINT sync_inter
     }
 
     if (d3d12->m_on_present) {
+        // DIAG: this is the actual "real frame handled" moment - the one that flips
+        // Framework::m_d3d_hook_ever_succeeded inside on_frame_d3d12(). Log the first time we get
+        // here (distinct from has_seen_first_present(), which can be true from a filtered call
+        // that never reaches this point) so the gap between "a Present call arrived" and "the hook
+        // actually did something with it" is visible.
+        if (!d3d12->m_first_present_handled.exchange(true)) {
+            const auto ms_since_hook = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - d3d12->m_hook_installed_time).count();
+            spdlog::info("[D3D12Hook DIAG] First Present call actually handled (on_present invoked) {}ms after hook install", ms_since_hook);
+        }
+
         d3d12->m_on_present(*d3d12);
 
         if (d3d12->m_next_present_interval) {
