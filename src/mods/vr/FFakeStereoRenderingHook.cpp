@@ -11970,6 +11970,20 @@ void FFakeStereoRenderingHook::begin_render_viewfamily_real(
         views.count = 2;
     }
 
+    // DIAG: see is_diag_disable_taa_during_dual_view_csm_enabled() for rationale (tests whether
+    // dual-view-CSM's confirmed aliasing/blur artifacts come from TAA's jitter/history reprojection
+    // seeing views.count=2 for this single submit). Scoped as tightly as possible: only forced for
+    // the duration of this one BeginRenderingViewFamily call, restored immediately after, distinct
+    // from and independent of the precise-shadow-fix's own TAA A/B toggle above.
+    static bool s_taa_forced_off_for_dual_view_csm = false;
+    if (nsf_dual_view_csm_applied_this_call && vr->is_diag_disable_taa_during_dual_view_csm_enabled()) {
+        sdk::set_cvar_int(L"Engine", L"r.PostProcessAAQuality", 0);
+        s_taa_forced_off_for_dual_view_csm = true;
+    } else if (s_taa_forced_off_for_dual_view_csm) {
+        sdk::set_cvar_int(L"Engine", L"r.PostProcessAAQuality", 4);
+        s_taa_forced_off_for_dual_view_csm = false;
+    }
+
     g_hook->m_render_module_begin_render_viewfamily_hook.unsafe_call<void>(render_module, canvas, view_family_candidate);
 
     if (nsf_dual_view_csm_applied_this_call) {

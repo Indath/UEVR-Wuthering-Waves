@@ -30,5 +30,6 @@ void render_srv_to_rtv(
     std::optional<RECT> src_rect,
     std::optional<RECT> dest_rect,
     D3D12_RESOURCE_STATES src_state, 
-    D3D12_RESOURCE_STATES dst_state);
+    D3D12_RESOURCE_STATES dst_state,
+    DirectX::FXMVECTOR color_multiplier = DirectX::Colors::White);
 }

@@ -863,6 +863,15 @@ public:
     bool is_native_stereo_fix_right_eye_shadows_precise_wide_copy_invalidate_cache_enabled() const {
         return m_native_stereo_fix_right_eye_shadows_precise_wide_copy_invalidate_cache->value();
     }
+    // PATCH (not a real fix): the right-eye shadow fix (when enabled) makes the right eye look
+    // noticeably darker than the left, and the underlying CSM/cascade-per-eye bug has not been
+    // resolved (see "Shadows Fixes attempt for CSM not wroking yet.md"). This is a compositor-side
+    // brightness multiplier applied ONLY to the right eye's final composited image (via the
+    // existing SpriteBatch color-multiply path in render_srv_to_rtv), to make the darker right eye
+    // more comfortable/playable while the real fix remains unsolved. 1.0 = no change (default).
+    float get_right_eye_brightness_compensation() const {
+        return m_right_eye_brightness_compensation->value();
+    }
     // DIAG: the broader heuristic eye_fields write loop (separate from the "precise" c90/1a0 fix
     // above) ALWAYS restores pass2's original field values at the end of the frame, every single
     // frame, with no toggle - meaning every field it touches is forced to match the left eye, then
@@ -941,21 +950,42 @@ public:
         return m_diag_watchpoint_trace_csm_transition_scale->value();
     }
     // DIAG (A/B test): while the right-eye shadow fix is active, force eye-adaptation/auto-exposure
-    // off via r.EyeAdaptationQuality=0. The shadow fix flips the right eye's StereoPass/primary
-    // identity for one render call; if exposure history is keyed off that identity (e.g. reading or
-    // writing the wrong eye's accumulated exposure value), this would manifest as exactly the
-    // observed symptom: both-eye flicker plus a persistent right-eye darkening. Disabling exposure
-    // entirely removes it as a variable. Default OFF - opt in only for this specific test.
+    // off via r.EyeAdaptationQuality=0. ORIGINAL rationale was that exposure history keyed off the
+    // forced StereoPass identity could read/write the wrong eye's accumulated value, explaining the
+    // precise-fix's dark-overlay flicker. RULED OUT by NSF-VIEWSTATE-IDENTITY (stereo4.txt,
+    // 2026-10-04): pass1/pass2 share the SAME FSceneViewStateInterface* (SAME_STATE=true) on every
+    // sampled frame, so there is no per-eye exposure history to diverge in the first place - this
+    // toggle is kept only as a sanity-check A/B lever, not an active hypothesis. Default OFF.
     bool is_diag_disable_eye_adaptation_during_shadow_fix_enabled() const {
         return m_diag_disable_eye_adaptation_during_shadow_fix->value();
     }
     // DIAG (A/B test): while the right-eye shadow fix is active, force TAA off via
-    // r.PostProcessAAQuality=0. Tests whether the symptom comes from temporal history buffer
-    // cross-contamination between eyes (the forced identity swap could make the right eye read/
-    // write the left eye's TAA history slot for one frame). Default OFF - opt in only for this
-    // specific test.
+    // r.PostProcessAAQuality=0. Tests whether the precise-fix's dark-overlay flicker comes from
+    // temporal history buffer cross-contamination between eyes (the forced identity swap could make
+    // the right eye read/write the left eye's TAA history slot for one frame). Default OFF - opt in
+    // only for this specific test. NOTE: this is the PRECISE SHADOW FIX pathway
+    // (is_native_stereo_fix_right_eye_shadows_precise_enabled) - do not confuse with the separate
+    // dual-view-CSM experiment and its own TAA toggle below, which targets a different symptom
+    // (aliasing/blur, not darkening) on a different code path.
     bool is_diag_disable_taa_during_shadow_fix_enabled() const {
         return m_diag_disable_taa_during_shadow_fix->value();
+    }
+    // DIAG (A/B test): while is_native_stereo_fix_experimental_dual_view_csm_enabled() is active,
+    // force TAA off via r.PostProcessAAQuality=0 for the duration of that single Pass1 submit only.
+    // RATIONALE (distinct from the precise-shadow-fix's dark-overlay flicker above): the user
+    // confirmed (2026-10-04) that with dual-view-CSM, CSM cascade shadows now render correctly in
+    // BOTH eyes (the structural adjacency fix works), but character models and environment show
+    // aliasing/blurring artifacts instead - no darkening, no flicker-between-eyes. Dual-view-CSM
+    // temporarily sets views.count=2 for the ENTIRE BeginRenderingViewFamily submit (not just the
+    // CSM cascade-gathering call), so every other per-submit system that iterates
+    // FSceneViewFamily::Views also sees 2 views for that call - including TAA's temporal jitter
+    // sequence/index advancement and history reprojection, which key off view index and view count.
+    // If TAA computes/advances its jitter offset or blends history using the wrong view's index
+    // (or double-advances because 2 views were iterated instead of 1), that produces exactly an
+    // aliasing/blur symptom (undersampled or incorrectly-reprojected temporal history) rather than
+    // a brightness change. Default OFF - opt in only for this specific test.
+    bool is_diag_disable_taa_during_dual_view_csm_enabled() const {
+        return m_diag_disable_taa_during_dual_view_csm->value();
     }
     bool is_native_stereo_fix_auto_suspend_enabled() const {
         return m_native_stereo_fix_auto_suspend->value();
@@ -2187,6 +2217,7 @@ private:
     const ModToggle::Ptr m_diag_log_shadow_cache_key_hunt{ ModToggle::create(generate_name("DiagLogShadowCacheKeyHunt"), false) };
     // FIX/DIAG: see is_native_stereo_fix_right_eye_shadows_precise_wide_copy_invalidate_cache_enabled().
     const ModToggle::Ptr m_native_stereo_fix_right_eye_shadows_precise_wide_copy_invalidate_cache{ ModToggle::create(generate_name("NativeStereoFixRightEyeShadowsPreciseWideCopyInvalidateCache"), false) };
+    const ModSlider::Ptr m_right_eye_brightness_compensation{ ModSlider::create(generate_name("RightEyeBrightnessCompensation"), 1.0f, 2.0f, 1.0f) };
     // DIAG: see is_native_stereo_fix_right_eye_eye_fields_no_restore_enabled() for rationale.
     const ModToggle::Ptr m_native_stereo_fix_right_eye_eye_fields_no_restore{ ModToggle::create(generate_name("NativeStereoFixRightEyeEyeFieldsNoRestore"), false) };
     // DIAG: see is_eye_field_offset_enabled() for rationale. Checkbox-per-offset replaces the
@@ -2226,6 +2257,8 @@ private:
     const ModToggle::Ptr m_diag_disable_eye_adaptation_during_shadow_fix{ ModToggle::create(generate_name("DiagDisableEyeAdaptationDuringShadowFix"), false) };
     // See is_diag_disable_taa_during_shadow_fix_enabled() for rationale.
     const ModToggle::Ptr m_diag_disable_taa_during_shadow_fix{ ModToggle::create(generate_name("DiagDisableTaaDuringShadowFix"), false) };
+    // See is_diag_disable_taa_during_dual_view_csm_enabled() for rationale.
+    const ModToggle::Ptr m_diag_disable_taa_during_dual_view_csm{ ModToggle::create(generate_name("DiagDisableTaaDuringDualViewCsm"), false) };
     // Auto-suspend NSF (fall back to the non-scene-capture compositing path) while a level transition
     // is detected, and resume once the world settles. Replicates the manual off/on toggle workflow.
     const ModToggle::Ptr m_native_stereo_fix_auto_suspend{ ModToggle::create(generate_name("NativeStereoFixAutoSuspend"), true) };
@@ -2518,8 +2551,8 @@ public:
             *m_camera_right_offset,
             *m_camera_up_offset,
             *m_world_scale,
+            *m_right_eye_brightness_compensation,
             *m_depth_scale,
-            *m_custom_z_near,
             *m_custom_z_near_enabled,
             *m_ghosting_fix,
             *m_disable_lgui_ui_redirect,
@@ -2552,6 +2585,7 @@ public:
             *m_diag_watchpoint_trace_csm_transition_scale,
             *m_diag_disable_eye_adaptation_during_shadow_fix,
             *m_diag_disable_taa_during_shadow_fix,
+            *m_diag_disable_taa_during_dual_view_csm,
             *m_native_stereo_fix_auto_suspend,
             *m_native_stereo_fix_null_pass2_view_state,
             *m_diag_nsf_pass2_pipeline_trace,

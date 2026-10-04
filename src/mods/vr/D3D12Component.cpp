@@ -1267,7 +1267,15 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
                 SPDLOG_INFO_EVERY_N_SEC(1, "[VR][DIAG] Scene capture stall indicator ACTIVE (stall_ms={})", stall_ms);
             }
 
-            if (sizes_match) {
+            // PATCH (not a real fix): the right-eye shadow fix makes the right eye noticeably
+            // darker than the left (see "Shadows Fixes attempt for CSM not wroking yet.md"). Raw
+            // CopyTextureRegion cannot apply a color multiplier, so when the user has configured a
+            // non-default brightness compensation, force the shader blit path (which can tint via
+            // SpriteBatch's color multiply) even when sizes_match would otherwise allow a raw copy.
+            const auto right_eye_brightness = vr->get_right_eye_brightness_compensation();
+            const auto use_raw_copy = sizes_match && right_eye_brightness == 1.0f;
+
+            if (use_raw_copy) {
                 D3D12_BOX right_src_box{
                     .left = 0, .top = 0, .front = 0,
                     .right = dst_eye_width, .bottom = dst_eye_height, .back = 1
@@ -1374,6 +1382,8 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
                         (LONG)m_backbuffer_size[0], (LONG)dst_eye_height
                     };
 
+                    const auto brightness_color = DirectX::XMVectorSet(right_eye_brightness, right_eye_brightness, right_eye_brightness, 1.0f);
+
                     d3d12::render_srv_to_rtv(
                         m_game_batch.get(),
                         commands.cmd_list.Get(),
@@ -1382,7 +1392,8 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
                         std::nullopt,
                         dest_rect,
                         D3D12_RESOURCE_STATE_RENDER_TARGET,
-                        D3D12_RESOURCE_STATE_RENDER_TARGET
+                        D3D12_RESOURCE_STATE_RENDER_TARGET,
+                        brightness_color
                     );
                 }
             }

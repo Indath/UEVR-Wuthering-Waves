@@ -170,7 +170,8 @@ void render_srv_to_rtv(
     std::optional<RECT> src_rect,
     std::optional<RECT> dest_rect,
     D3D12_RESOURCE_STATES src_state, 
-    D3D12_RESOURCE_STATES dst_state)
+    D3D12_RESOURCE_STATES dst_state,
+    DirectX::FXMVECTOR color_multiplier)
 {
     if (src.texture == nullptr || dst.texture == nullptr) {
         return;
@@ -188,7 +189,7 @@ void render_srv_to_rtv(
     viewport.Height = (float)dst_desc.Height;
     viewport.MinDepth = D3D12_MIN_DEPTH;
     viewport.MaxDepth = D3D12_MAX_DEPTH;
-    
+
     batch->SetViewport(viewport);
 
     D3D12_RECT scissor_rect{};
@@ -236,12 +237,12 @@ void render_srv_to_rtv(
             DirectX::XMUINT2{ (uint32_t)src_desc.Width, (uint32_t)src_desc.Height },
             *dest_rect,
             &*src_rect,
-            DirectX::Colors::White);
+            color_multiplier);
     } else {
         batch->Draw(src.get_srv_gpu(), 
             DirectX::XMUINT2{ (uint32_t)src_desc.Width, (uint32_t)src_desc.Height },
             *dest_rect,
-            DirectX::Colors::White);
+            color_multiplier);
     }
 
     batch->End();
