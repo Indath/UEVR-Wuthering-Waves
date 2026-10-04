@@ -6880,7 +6880,14 @@ static void* lgui_slot24_hook(void* self, void* a2, void* a3, void* a4, void* a5
         }
     }
 
-    if (a2 != nullptr && !IsBadReadPtr((void*)((uintptr_t)a2 + LGUI_PASS_OWNER_OFF), 8)) {
+    // Like LGUI_DIFF_BUILDER_EVERY_FRAME above, this reads a2+LGUI_PASS_OWNER_OFF and the owner's
+    // pass-registry header unconditionally on every call with only IsBadReadPtr as protection. a2 (the
+    // FRDGBuilder) or the allocation it points to can be freed/reallocated between frames during a
+    // menu/level transition, causing an access violation inside this read (or inside IsBadReadPtr itself).
+    // This block was never gated behind a toggle (unlike its siblings), so it kept running even with the
+    // LGUI redirect feature disabled. Now gated behind LGUI_DIAG_VERBOSE (off by default) so it only runs
+    // when actively re-probing LGUI's pass registry offsets.
+    if (LGUI_DIAG_VERBOSE && a2 != nullptr && !IsBadReadPtr((void*)((uintptr_t)a2 + LGUI_PASS_OWNER_OFF), 8)) {
         const auto owner = *(uintptr_t*)((uintptr_t)a2 + LGUI_PASS_OWNER_OFF);
         if (owner > 0x10000 && !IsBadReadPtr((void*)(owner + LGUI_PASS_ARR_OFF), 16)) {
             pass_arr_snap = std::make_pair(owner + LGUI_PASS_ARR_OFF, *(int32_t*)(owner + LGUI_PASS_ARR_OFF + 8));
@@ -7400,6 +7407,25 @@ void SceneViewExtensionAnalyzer::FillVtable<N>::fill2(std::array<uintptr_t, 50>&
 // TODO: Add support for all versions via PDB dumps
 constexpr auto INIT_OPTIONS_OFFSET = 0x50;
 
+// Tracks the FSceneViewFamily that begin_render_viewfamily_real most recently confirmed to be the
+// real HMD stereo family (i.e. it had >=2 views, a valid scene interface, and a valid render
+// target). sceneview_constructor() cannot tell an unrelated single-view scene capture (menu
+// portrait captures, UI thumbnail captures, etc.) apart from the real stereo family just from
+// stereo-pass value alone, and forcing those unrelated families into the same-pass path corrupts
+// their render (black menu characters, black screens). Gate the same-pass branch on this pointer
+// so it only ever touches the real HMD family. (Defined up here so the sceneview_xref diagnostics
+// can use it as a decisive family-identity check.)
+static std::atomic<sdk::FSceneViewFamily*> g_last_real_stereo_view_family{nullptr};
+
+// Last-known pass1 (left) / pass2 (right) FSceneView pointers for this frame, updated wherever
+// the NSF code resolves them (see "auto pass1_view = views.data[1]" / pass2_view assignment).
+// Used by the caller2-bp CSM watchpoint to decisively classify which eye a call's resolved view
+// (RDX-derived) actually belongs to, instead of relying on the StereoPass byte-match (eye_guess),
+// which is unreliable because we intentionally overwrite Pass2's StereoPass byte to PRIMARY for
+// an earlier, unrelated camera/culling fix.
+static std::atomic<void*> g_last_known_pass1_view{nullptr};
+static std::atomic<void*> g_last_known_pass2_view{nullptr};
+
 // Cross-reference resolver for FSceneViewInitOptions / FSceneView offsets.
 // The SDK's vtable-walk heuristic lands on the wrong fields in this game (get_view_family() returns
 // a non-pointer like 0xf7d602). After the real constructor has run we hold BOTH the raw init options
@@ -7614,7 +7640,13 @@ static void resolve_live(sdk::FSceneViewFamily* family, sdk::FSceneView* v0, sdk
     if (++live_attempts > 300) return;
 
     if (!live_view_family_offset) {
-        for (uint32_t i = 0; i + sizeof(void*) <= 0x1000; i += sizeof(void*)) {
+        // Start at sizeof(void*), not 0: FSceneView is polymorphic, so +0x0 is virtually guaranteed to
+        // be the vtable pointer. Matching at i==0 previously happened by coincidence/stale-memory
+        // aliasing and locked in a bogus "family" offset that actually reads the vtable pointer -
+        // every downstream consumer that dereferences it as a FSceneViewFamily* (e.g.
+        // dump_family_views_from_view) then misinterprets vtable bytes as a Views TArray, producing
+        // implausible garbage like Views.count in the billions.
+        for (uint32_t i = sizeof(void*); i + sizeof(void*) <= 0x1000; i += sizeof(void*)) {
             if (*(uintptr_t*)((uintptr_t)v0 + i) == (uintptr_t)family && *(uintptr_t*)((uintptr_t)v1 + i) == (uintptr_t)family) {
                 live_view_family_offset = i;
                 SPDLOG_INFO("[VR] sceneview_xref: RESOLVED live view family@{:x} (family={:x})", i, (uintptr_t)family);
@@ -7997,6 +8029,195 @@ static void scan_culling_region_raw(sdk::FSceneView* v0, sdk::FSceneView* v1, ui
     }
 }
 
+// READ-ONLY diagnostic modeled on the Days Gone offscreen-view contract (FSceneView::IsSceneCapture
+// @+0x1276, FSceneViewFamily::UseSeparateRenderTarget @+0x20, ::ResolveScene @+0x4E - all byte-sized
+// bools, validated as <=1). The existing eye_fields scan above only covers FSceneView at DWORD
+// granularity over +0x0..+0x1000, so it would never see a byte bool at +0x1276, nor any byte bool
+// that happens to share a dword with non-boolean neighbor bytes. This scan:
+//  - walks FSceneView at BYTE granularity over an extended range (default +0x1000..+0x1400, which
+//    straddles Days Gone's +0x1276) looking for byte values <=1 that differ between the two eyes
+//  - walks the first part of FSceneViewFamily (+0x0..+0x80, where Days Gone's FrameNumber/+0x48,
+//    UseSeparateRenderTarget/+0x20, ResolveScene/+0x4E all live) at byte granularity looking for
+//    byte values <=1, logging ones that look plausible as engine-mode flags (does not require a
+//    left/right diff for the family since both eyes share the same family in this engine's NSF path)
+// Does NOT write any memory - purely informational, to find candidates before trusting any offset.
+static void scan_scene_capture_bool_candidates(sdk::FSceneView* v0, sdk::FSceneView* v1, sdk::FSceneViewFamily* family, uint32_t frame) {
+    if (v0 == nullptr || v1 == nullptr) return;
+
+    constexpr uint32_t view_region_start = 0x1000;
+    constexpr uint32_t view_region_size = 0x400; // +0x1000..+0x1400, straddles Days Gone's +0x1276
+
+    if (!IsBadReadPtr((void*)((uintptr_t)v0 + view_region_start), view_region_size) &&
+        !IsBadReadPtr((void*)((uintptr_t)v1 + view_region_start), view_region_size)) {
+        std::string hits{};
+        for (uint32_t off = view_region_start; off < view_region_start + view_region_size; ++off) {
+            const auto a = *(const uint8_t*)((uintptr_t)v0 + off);
+            const auto b = *(const uint8_t*)((uintptr_t)v1 + off);
+            if (a > 1 || b > 1) continue; // not a sane bool on either side
+            if (a == b) continue; // not a candidate for an eye-dependent flag
+            hits += fmt::format(" +{:x}:{}->{}", off, a, b);
+        }
+        if (!hits.empty()) {
+            SPDLOG_INFO("[VR][NSF-SCENE-CAPTURE-SCAN] frame={} FSceneView byte bool candidates (left->right):{}", frame, hits);
+        }
+    } else {
+        SPDLOG_WARN_ONCE("[VR][NSF-SCENE-CAPTURE-SCAN] FSceneView region +{:x}..+{:x} unreadable", view_region_start, view_region_start + view_region_size);
+    }
+
+    if (family == nullptr) return;
+    constexpr uint32_t family_region_start = 0x0;
+    constexpr uint32_t family_region_size = 0x80; // covers Days Gone's +0x20/+0x48/+0x4E
+
+    if (IsBadReadPtr((void*)((uintptr_t)family + family_region_start), family_region_size)) {
+        SPDLOG_WARN_ONCE("[VR][NSF-SCENE-CAPTURE-SCAN] FSceneViewFamily region +0x0..+0x80 unreadable");
+        return;
+    }
+
+    std::string family_hits{};
+    for (uint32_t off = family_region_start; off < family_region_start + family_region_size; ++off) {
+        const auto val = *(const uint8_t*)((uintptr_t)family + off);
+        if (val > 1) continue;
+        family_hits += fmt::format(" +{:x}:{}", off, val);
+    }
+    if (!family_hits.empty()) {
+        SPDLOG_INFO("[VR][NSF-SCENE-CAPTURE-SCAN] frame={} FSceneViewFamily byte bool candidates:{}", frame, family_hits);
+    }
+}
+
+// READ-ONLY diagnostic: given a resolved FSceneView* (e.g. one identified via byte-match at a
+// caller2-style breakpoint), reads its live FSceneViewFamily pointer (live_view_family_offset) and
+// dumps the family's Views array - pointer, resolved StereoPass, and whether it equals the view we
+// were given. Intended to answer "from INSIDE the CSM-adjacent call itself, does the family's Views
+// array actually contain the other eye at all?" since begin_render_viewfamily_real's own adjacency
+// diagnostic only samples the family at hook entry, not at the point this deep call executes.
+static void dump_family_views_from_view(sdk::FSceneView* resolved_view, const char* tag, uint32_t frame) {
+    if (resolved_view == nullptr || !live_view_family_offset) {
+        return;
+    }
+
+    // Sanity floor: genuine heap pointers in this 64-bit process have consistently been >= 0x1'0000'0000
+    // in every other diagnostic in this file. A smaller value here means the caller resolved a bogus
+    // "view" (e.g. via the weaker indirect/one-deref byte-match path), not a real FSceneView*, and
+    // walking its family/Views would just dump garbage.
+    if ((uintptr_t)resolved_view < 0x100000000ull) {
+        return;
+    }
+
+    auto* family_ptr_slot = (sdk::FSceneViewFamily**)((uintptr_t)resolved_view + *live_view_family_offset);
+    if (IsBadReadPtr(family_ptr_slot, sizeof(void*))) {
+        SPDLOG_WARN("[VR][NSF-CSM-SITE-FAMILY] {} frame={} view={:x}: family pointer slot unreadable at +{:x}",
+            tag, frame, (uintptr_t)resolved_view, *live_view_family_offset);
+        return;
+    }
+
+    auto* family = *family_ptr_slot;
+    // NOTE: do NOT apply the >= 4GB heap floor here. resolve_live() logged the genuine family at
+    // 0xf7e370 - FSceneViewFamilyContext is stack/low-address allocated in this game, so a 4GB floor
+    // rejects the real object. Guard only against the null page; IsBadReadPtr + the TArray
+    // plausibility checks below do the rest.
+    if (family == nullptr || (uintptr_t)family < 0x10000ull || ((uintptr_t)family & 7) != 0 || IsBadReadPtr(family, sizeof(void*))) {
+        SPDLOG_WARN("[VR][NSF-CSM-SITE-FAMILY] {} frame={} view={:x}: NOT-A-VIEW verdict - +{:x} holds {:x} which is not a plausible "
+            "FSceneViewFamily* (unaligned/low/unreadable). The byte-matched register object is not an FSceneView.",
+            tag, frame, (uintptr_t)resolved_view, *live_view_family_offset, (uintptr_t)family);
+        return;
+    }
+
+    // Decisive identity check: we know the real family pointer from the render hook. If the value at
+    // +live_view_family_offset doesn't equal it, the resolved object is NOT one of our eye views.
+    auto* known_family = g_last_real_stereo_view_family.load(std::memory_order_relaxed);
+    if (known_family != nullptr && family != known_family) {
+        SPDLOG_WARN("[VR][NSF-CSM-SITE-FAMILY] {} frame={} view={:x}: family mismatch - read {:x} but known live family is {:x}; "
+            "resolved object is not one of our stereo views (or belongs to a different family, e.g. scene capture)",
+            tag, frame, (uintptr_t)resolved_view, (uintptr_t)family, (uintptr_t)known_family);
+        return;
+    }
+
+    // family is now PROVEN identical to g_last_real_stereo_view_family - the exact object the render
+    // hook validated via family->get_views() successfully (views.count>=2 logged every frame). So the
+    // SDK's discovered s_views_offset SHOULD still be valid on this same object. Log it directly
+    // alongside a local scan so we can see whether the offset itself is wrong, or whether Views is
+    // just transiently resized (e.g. to count=1) during per-eye serialization at this call site.
+    const auto sdk_views_offset = sdk::FSceneViewFamily::get_views_offset();
+    if (sdk_views_offset) {
+        auto* sdk_views = (sdk::TArray<sdk::FSceneView*>*)((uintptr_t)family + *sdk_views_offset);
+        if (!IsBadReadPtr(sdk_views, sizeof(*sdk_views))) {
+            SPDLOG_WARN("[VR][NSF-CSM-SITE-FAMILY] {} frame={} view={:x} family={:x}: SDK s_views_offset=+{:x} data={:x} count={} capacity={}",
+                tag, frame, (uintptr_t)resolved_view, (uintptr_t)family, *sdk_views_offset,
+                (uintptr_t)sdk_views->data, sdk_views->count, sdk_views->capacity);
+        }
+    } else {
+        SPDLOG_WARN("[VR][NSF-CSM-SITE-FAMILY] {} frame={} view={:x} family={:x}: SDK s_views_offset not yet discovered",
+            tag, frame, (uintptr_t)resolved_view, (uintptr_t)family);
+    }
+
+    // Do NOT trust sdk::FSceneViewFamily::get_views() here: it relies on a GLOBAL static
+    // s_views_offset discovered once (see FSceneViewFamily.cpp update_offsets()), and in this game it
+    // resolves to a field that reads 0 or garbage inconsistently across calls even though `family`
+    // itself is now PROVEN correct (matches g_last_real_stereo_view_family). Instead, scan the family
+    // object locally for a TArray-shaped {data,count,capacity} triplet whose data[] actually CONTAINS
+    // resolved_view - the strongest possible validation, since we already know resolved_view is a real
+    // FSceneView belonging to this exact family.
+    sdk::TArray<sdk::FSceneView*>* views = nullptr;
+    uint32_t views_offset_found = 0;
+    // Widened from 0x100 to 0x400: the prior window never found the Views array even though both
+    // `family` and `resolved_view` are independently PROVEN correct (family matches
+    // g_last_real_stereo_view_family; resolved_view's own +live_view_family_offset reads back
+    // `family`). That means the TArray genuinely lives further into FSceneViewFamily than 0x100 in
+    // this game/engine customization.
+    for (uint32_t off = sizeof(void*); off + sizeof(sdk::TArray<sdk::FSceneView*>) <= 0x400; off += sizeof(void*)) {
+        auto* candidate = (sdk::TArray<sdk::FSceneView*>*)((uintptr_t)family + off);
+        if (IsBadReadPtr(candidate, sizeof(sdk::TArray<sdk::FSceneView*>))) {
+            continue;
+        }
+        if (candidate->data == nullptr || candidate->count <= 0 || candidate->count > 8 || candidate->capacity < candidate->count) {
+            continue;
+        }
+        if (IsBadReadPtr(candidate->data, sizeof(void*) * candidate->count)) {
+            continue;
+        }
+
+        bool contains_self = false;
+        for (int32_t i = 0; i < candidate->count; ++i) {
+            if (candidate->data[i] == resolved_view) {
+                contains_self = true;
+                break;
+            }
+        }
+
+        if (contains_self) {
+            views = candidate;
+            views_offset_found = off;
+            break;
+        }
+    }
+
+    if (views == nullptr) {
+        SPDLOG_WARN("[VR][NSF-CSM-SITE-FAMILY] {} frame={} view={:x} family={:x}: local Views-offset scan found no TArray "
+            "containing resolved_view (scanned +{:x}..+{:x})",
+            tag, frame, (uintptr_t)resolved_view, (uintptr_t)family, (uint32_t)sizeof(void*), (uint32_t)0x400);
+        return;
+    }
+
+    SPDLOG_INFO("[VR][NSF-CSM-SITE-FAMILY] {} frame={}: locally discovered Views offset=+{:x} (SDK global s_views_offset may be wrong)",
+        tag, frame, views_offset_found);
+
+
+    int32_t self_index = -1;
+    std::string dump{};
+    for (int32_t i = 0; i < views->count; ++i) {
+        auto* v = views->data[i];
+        uint32_t pass = 0xFFFFFFFF;
+        if (live_stereo_pass_offset && v != nullptr && !IsBadReadPtr((void*)((uintptr_t)v + *live_stereo_pass_offset), sizeof(uint32_t))) {
+            pass = *(uint32_t*)((uintptr_t)v + *live_stereo_pass_offset);
+        }
+        if (v == resolved_view) self_index = i;
+        dump += fmt::format(" [{}]={:x}(pass={}){}", i, (uintptr_t)v, pass, v == resolved_view ? "*SELF*" : "");
+    }
+
+    SPDLOG_WARN("[VR][NSF-CSM-SITE-FAMILY] {} frame={} view={:x} family={:x}: Views.count={} contents:{} self_index={}",
+        tag, frame, (uintptr_t)resolved_view, (uintptr_t)family, views->count, dump, self_index);
+}
+
 // Called after the original constructor has run for a full-size game view. Maps the live offsets
 // (resolved above) back into FSceneViewInitOptions by VALUE: the constructor copies Family and
 // StereoPass verbatim from the init options, so whatever the constructed view holds at the live
@@ -8173,6 +8394,50 @@ inline void log_shadow_pathway_identity(const char* tag, sdk::FSceneView* left, 
 
     SPDLOG_INFO("[VR][SHADOW-PATHWAY-IDENTITY] {} frame={} L view={:x} stereo_pass={}{} | R view={:x} stereo_pass={}{}",
         tag, g_frame_count, (uintptr_t)left, left_stereo_pass, left_fields, (uintptr_t)right, right_stereo_pass, right_fields);
+}
+
+// DIAG (2026-10, cache-key hunt): dumps a wide raw dword window around the right eye's view every
+// ~1s, tagged with which precise-fix mode is currently active (none/normal/write-once/per-view-
+// write-once/wide-copy/early-write) and whether that mode is currently producing flicker-free-but-
+// shadowless behavior vs flickering-but-has-shadows behavior (per user observation). The goal is to
+// capture one log while running a "stable, no flicker, no shadows" mode and another log while
+// running a "flickering, has shadows" mode, then diff the two dumps: any dword that reads
+// differently in a MEANINGFUL, CONSISTENT way between the two conditions (not just per-eye matrix
+// noise) is a candidate for the actual shadow-cache/identity key the engine uses to decide
+// reuse-vs-rebuild, as opposed to just the StereoPass predicate bits we've already confirmed are
+// stable in both conditions.
+inline void log_shadow_cache_key_hunt(sdk::FSceneView* pass2_view, const char* active_mode) {
+    if (pass2_view == nullptr) {
+        return;
+    }
+
+    static uint64_t s_last_log_tick = 0;
+    const auto now = GetTickCount64();
+    if (now - s_last_log_tick < 1000) {
+        return;
+    }
+    s_last_log_tick = now;
+
+    constexpr uint32_t window_offset = 0x0;
+    constexpr uint32_t window_size = 0x1000;
+    const auto* base = (const uint8_t*)pass2_view + window_offset;
+
+    if (IsBadReadPtr(base, window_size)) {
+        SPDLOG_WARN("[VR][NSF-CACHE-KEY-HUNT] mode={} pass2_view={:x} window unreadable", active_mode, (uintptr_t)pass2_view);
+        return;
+    }
+
+    std::string dump{};
+    dump.reserve(window_size * 6);
+    const auto* words = (const uint32_t*)base;
+    for (uint32_t i = 0; i < window_size / sizeof(uint32_t); ++i) {
+        if (words[i] != 0) {
+            dump += fmt::format("{:x}={:x} ", i * 4, words[i]);
+        }
+    }
+
+    SPDLOG_INFO("[VR][NSF-CACHE-KEY-HUNT] mode={} frame={} pass2_view={:x} nonzero_dwords: {}",
+        active_mode, g_frame_count, (uintptr_t)pass2_view, dump);
 }
 
 // DIAG: dumps every scalar reflected property (bool/int/float/double/byte) on the live
@@ -8422,6 +8687,50 @@ inline void log_kuro_shadow_subsystem_raw_diff(sdk::UObject* subsystem, const ch
     }
 }
 
+// SEH-free pointer validity check for use INSIDE the watchpoint VEH below. IsBadReadPtr relies on
+// deliberately triggering and catching its own access-violation exception, which causes a nested
+// exception dispatch while we are already mid-dispatch for the single-step exception that invoked
+// this handler. That reentrant VEH chain was observed to collide with the anti-cheat's own
+// vectored handler (ACE-Base64.dll appeared directly in the exception dispatch chain in a captured
+// crash), so IsBadReadPtr must never be called from this handler. VirtualQuery is a plain syscall
+// wrapper with no SEH involved and is safe to call here.
+static bool watchpoint_is_safe_to_read(const void* address, size_t size) {
+    if (address == nullptr || size == 0) {
+        return false;
+    }
+
+    MEMORY_BASIC_INFORMATION mbi{};
+    const auto start = (uintptr_t)address;
+    const auto end = start + size;
+
+    // A read can span multiple pages/regions, so walk VirtualQuery results across the whole range.
+    uintptr_t cursor = start;
+    while (cursor < end) {
+        if (VirtualQuery((void*)cursor, &mbi, sizeof(mbi)) != sizeof(mbi)) {
+            return false;
+        }
+
+        if (mbi.State != MEM_COMMIT) {
+            return false;
+        }
+
+        constexpr DWORD kReadableMask = PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
+            PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+        if ((mbi.Protect & kReadableMask) == 0 || (mbi.Protect & PAGE_GUARD) != 0) {
+            return false;
+        }
+
+        const auto region_end = (uintptr_t)mbi.BaseAddress + mbi.RegionSize;
+        if (region_end <= cursor) {
+            return false;
+        }
+
+        cursor = region_end;
+    }
+
+    return true;
+}
+
 // Dynamic (in-process) watchpoint tracer: sets a hardware breakpoint (debug register) on a live
 // address for the current thread only, for the duration of this scope, and records every distinct
 // RIP (as module+RVA) that reads or writes it via a vectored exception handler. This lets us find
@@ -8493,6 +8802,13 @@ public:
 
         s_active_tag[m_slot] = nullptr;
         disarm_entry_breakpoint(m_slot);
+        s_entry_bp_eyes_seen[m_slot] = 0;
+        s_entry_bp_rearm_count[m_slot] = 0;
+        s_cached_caller_entry_point[m_slot] = 0;
+        disarm_caller2_breakpoint(m_slot);
+        s_caller2_eyes_seen[m_slot] = 0;
+        s_caller2_hit_count[m_slot] = 0;
+        s_caller2_entry_point[m_slot] = 0;
 
         const auto hits = s_hit_counts[m_slot];
         SPDLOG_INFO("[VR][WATCHPOINT][{}] disarmed Dr{}, {} distinct call site(s) hit:", m_tag, m_slot, s_hit_sites[m_slot].size());
@@ -8535,19 +8851,214 @@ private:
     static inline std::array<uint8_t, 4> s_entry_bp_orig_byte{};
     static inline std::array<bool, 4> s_entry_bp_armed{};
     static inline std::array<bool, 4> s_entry_bp_hit{};
+    // Bitmask of which eyes (bit 0 = left/primary "1", bit 1 = right/secondary "2") we've already
+    // captured a resolved entry_eye_guess for, per slot. Re-arming is cheap (one byte write), so we
+    // keep re-arming on every deep-diag pass until BOTH eyes have been seen at least once, instead of
+    // stopping after the first capture - otherwise we only ever happen to catch whichever eye's pass
+    // runs first within the deep-diag hit cap (observed: always left/primary in practice).
+    static inline std::array<int, 4> s_entry_bp_eyes_seen{};
+    static constexpr int kEntryBpRearmCap = 20000; // bound total one-shot rearms per slot; raised from 60
+                                                     // because the previous cap exhausted in ~0.13s (all
+                                                     // within a single frame's left-eye cascade loop),
+                                                     // which wasn't a long enough window to prove the
+                                                     // right eye never calls this function - only that it
+                                                     // didn't happen to call it in that split second.
+    static inline std::array<int, 4> s_entry_bp_rearm_count{};
+    // Cache of the resolved immediate-caller entry point per slot, so we can cheaply re-arm the entry
+    // breakpoint on every subsequent hit (bounded by kEntryBpRearmCap) without re-running the expensive
+    // unwind every time - only the unwind itself is gated by kDeepDiagHitsPerSite.
+    static inline std::array<uintptr_t, 4> s_cached_caller_entry_point{};
 
-    static void arm_entry_breakpoint(int slot, uintptr_t address) {
-        if (s_entry_bp_armed[slot] || address == 0 || IsBadReadPtr((void*)address, 1)) {
+    // Caller-of-caller (grandparent) persistent breakpoint: unlike the one-shot entry-bp above, this
+    // is deliberately re-planted every single time it fires (restore original byte, single-step over
+    // the real instruction via Dr7 trap flag, then re-write 0xCC), so it logs EVERY invocation of the
+    // grandparent function for the entire lifetime of the diagnostic - not just the first hit. This
+    // lets us see whether the function that DECIDES to call the cascade-setup leaf runs once per eye
+    // (and only branches into the leaf for the left eye) or only runs once per frame at all (meaning
+    // the skip happens even further upstream than this frame).
+    static inline std::array<uintptr_t, 4> s_caller2_entry_point{};
+    static inline std::array<uintptr_t, 4> s_caller2_addr{};
+    static inline std::array<uint8_t, 4> s_caller2_orig_byte{};
+    static inline std::array<bool, 4> s_caller2_armed{};
+    static inline std::array<bool, 4> s_caller2_awaiting_restep{};
+    static inline std::array<int, 4> s_caller2_eyes_seen{};
+    static inline std::array<uint32_t, 4> s_caller2_hit_count{};
+    static constexpr uint32_t kCaller2LogCap = 200; // cap verbose logging to avoid log spam/lag over a long soak
+
+    // Global (cross-slot) registry of addresses that currently have a software 0xCC planted, shared
+    // between entry-bp and caller2-bp. Different watchpoint slots (e.g. Dr0 tracing +0xC90, Dr1
+    // tracing +0x164) can independently unwind to the SAME caller address. Without this guard, two
+    // slots raced to plant/restore a breakpoint at the same address: slot A plants 0xCC, slot B then
+    // "saves" that 0xCC as its own original byte and plants over it again, so whichever slot restores
+    // last leaves a permanent stray 0xCC baked into the game's code - observed as an unhandled
+    // STATUS_BREAKPOINT crash later when unrelated code ran through that corrupted address. Every
+    // arm must check/reserve the address here first, and every restore must release it.
+    static inline std::unordered_set<uintptr_t> s_armed_bp_addresses{};
+
+    static bool reserve_bp_address(uintptr_t address) {
+        return s_armed_bp_addresses.insert(address).second;
+    }
+
+    static void release_bp_address(uintptr_t address) {
+        s_armed_bp_addresses.erase(address);
+    }
+
+    // Isolated in its own function (no C++ objects requiring unwinding in scope) so __try/__except
+    // can be used: an external agent (e.g. anti-cheat) can race the protection change and revert it
+    // before this write executes, turning a normally-safe code-byte write into an AV. Returns true if
+    // the write completed successfully.
+    static bool seh_guarded_restore_byte(uintptr_t address, uint8_t original_byte) {
+        DWORD old_protect = 0;
+        if (!VirtualProtect((void*)address, 1, PAGE_EXECUTE_READWRITE, &old_protect)) {
+            return false;
+        }
+
+        bool success = true;
+
+        __try {
+            *(uint8_t*)address = original_byte;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            success = false;
+        }
+
+        VirtualProtect((void*)address, 1, old_protect, &old_protect);
+
+        if (success) {
+            FlushInstructionCache(GetCurrentProcess(), (void*)address, 1);
+        }
+
+        return success;
+    }
+
+    // Companion to seh_guarded_restore_byte: plants 0xCC instead of restoring an original byte.
+    // Returns true if the write completed successfully.
+    static bool seh_guarded_plant_breakpoint(uintptr_t address) {
+        DWORD old_protect = 0;
+        if (!VirtualProtect((void*)address, 1, PAGE_EXECUTE_READWRITE, &old_protect)) {
+            return false;
+        }
+
+        bool success = true;
+
+        __try {
+            *(uint8_t*)address = 0xCC;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            success = false;
+        }
+
+        VirtualProtect((void*)address, 1, old_protect, &old_protect);
+
+        if (success) {
+            FlushInstructionCache(GetCurrentProcess(), (void*)address, 1);
+        }
+
+        return success;
+    }
+
+    // Software (INT3) breakpoints planted here are only safe on code that is exclusively reached
+    // from the specific call path we're tracing (the game's own exe/UE module). System DLLs like
+    // KERNEL32.DLL/ntdll.dll export functions that are called constantly from unrelated threads and
+    // code paths all over the process - planting a persistent 0xCC there causes it to trip from
+    // completely unrelated callers whose stack/register state our handler never expects, which is
+    // exactly what produced an unhandled STATUS_BREAKPOINT (0x80000003) crash in
+    // begin_render_viewfamily_real when the caller-unwind resolved to a KERNEL32 address. Gate both
+    // breakpoint-arming paths on the target living inside one of the game's own modules.
+    static bool is_safe_breakpoint_target_module(uintptr_t address) {
+        const auto mod = utility::get_module_within((void*)address);
+        if (!mod.has_value()) {
+            return false;
+        }
+
+        if ((HMODULE)*mod == (HMODULE)utility::get_executable()) {
+            return true;
+        }
+
+        static const auto s_shipping_base = GetModuleHandleA("client-win64-shippingbase.dll");
+        return s_shipping_base != nullptr && (HMODULE)*mod == s_shipping_base;
+    }
+
+    static void arm_caller2_breakpoint(int slot, uintptr_t address) {
+        if (s_caller2_armed[slot] || address == 0 || IsBadReadPtr((void*)address, 1) ||
+            !is_safe_breakpoint_target_module(address)) {
+            return;
+        }
+
+        if (!reserve_bp_address(address)) {
+            // Another slot already has a breakpoint planted at this exact address - do NOT plant
+            // over it (see s_armed_bp_addresses comment for why this previously corrupted code).
             return;
         }
 
         DWORD old_protect = 0;
         if (!VirtualProtect((void*)address, 1, PAGE_EXECUTE_READWRITE, &old_protect)) {
+            release_bp_address(address);
             return;
         }
 
-        s_entry_bp_orig_byte[slot] = *(uint8_t*)address;
-        *(uint8_t*)address = 0xCC;
+        __try {
+            s_caller2_orig_byte[slot] = *(uint8_t*)address;
+            *(uint8_t*)address = 0xCC;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            VirtualProtect((void*)address, 1, old_protect, &old_protect);
+            release_bp_address(address);
+            return;
+        }
+
+        VirtualProtect((void*)address, 1, old_protect, &old_protect);
+        FlushInstructionCache(GetCurrentProcess(), (void*)address, 1);
+
+        s_caller2_addr[slot] = address;
+        s_caller2_armed[slot] = true;
+        SPDLOG_INFO("[VR][WATCHPOINT][caller2-bp] armed persistent entry breakpoint for slot {} at {:x}", slot, address);
+    }
+
+    static void disarm_caller2_breakpoint(int slot) {
+        if (!s_caller2_armed[slot] || s_caller2_addr[slot] == 0) {
+            return;
+        }
+
+        const auto address = s_caller2_addr[slot];
+        DWORD old_protect = 0;
+        if (VirtualProtect((void*)address, 1, PAGE_EXECUTE_READWRITE, &old_protect)) {
+            __try {
+                *(uint8_t*)address = s_caller2_orig_byte[slot];
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+            }
+            VirtualProtect((void*)address, 1, old_protect, &old_protect);
+            FlushInstructionCache(GetCurrentProcess(), (void*)address, 1);
+        }
+
+        release_bp_address(address);
+        s_caller2_addr[slot] = 0;
+        s_caller2_armed[slot] = false;
+        s_caller2_awaiting_restep[slot] = false;
+    }
+
+    static void arm_entry_breakpoint(int slot, uintptr_t address) {
+        if (s_entry_bp_armed[slot] || address == 0 || IsBadReadPtr((void*)address, 1) ||
+            !is_safe_breakpoint_target_module(address)) {
+            return;
+        }
+
+        if (!reserve_bp_address(address)) {
+            return;
+        }
+
+        DWORD old_protect = 0;
+        if (!VirtualProtect((void*)address, 1, PAGE_EXECUTE_READWRITE, &old_protect)) {
+            release_bp_address(address);
+            return;
+        }
+
+        __try {
+            s_entry_bp_orig_byte[slot] = *(uint8_t*)address;
+            *(uint8_t*)address = 0xCC;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            VirtualProtect((void*)address, 1, old_protect, &old_protect);
+            release_bp_address(address);
+            return;
+        }
+
         VirtualProtect((void*)address, 1, old_protect, &old_protect);
         FlushInstructionCache(GetCurrentProcess(), (void*)address, 1);
 
@@ -8565,11 +9076,15 @@ private:
         const auto address = s_entry_bp_addr[slot];
         DWORD old_protect = 0;
         if (VirtualProtect((void*)address, 1, PAGE_EXECUTE_READWRITE, &old_protect)) {
-            *(uint8_t*)address = s_entry_bp_orig_byte[slot];
+            __try {
+                *(uint8_t*)address = s_entry_bp_orig_byte[slot];
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+            }
             VirtualProtect((void*)address, 1, old_protect, &old_protect);
             FlushInstructionCache(GetCurrentProcess(), (void*)address, 1);
         }
 
+        release_bp_address(address);
         s_entry_bp_addr[slot] = 0;
         s_entry_bp_armed[slot] = false;
     }
@@ -8592,48 +9107,87 @@ private:
 
                         s_entry_bp_hit[slot] = true;
 
-                        // Check RCX/RDX/R8/R9 (first 4 integer/pointer args) for a pointer whose
-                        // +0xAF0 byte reads a plausible EStereoscopicPass value (1=left/primary,
-                        // 2=right/secondary), to reliably tag which eye this caller invocation is for.
-                        constexpr uintptr_t FSCENEVIEW_STEREO_PASS_OFFSET_ENTRY = 0xAF0;
+                        // Check RCX/RDX/R8/R9 (first 4 integer/pointer args) against every previously-
+                        // confirmed StereoPass/eye-identity offset seen in this file (0xAF0 FSceneView
+                        // StereoPass, 0x10C cached copy, 0xC90/0x164/0x1A0/0x2EC eye-identity fields,
+                        // 0x130 additional eye field), both directly (reg+offset) and one level of
+                        // indirection (*(T**)reg + offset), since a register may hold a pointer-to-view
+                        // (e.g. FSceneView**) rather than the view itself. A single fixed-offset,
+                        // no-indirection probe (what we tried previously) matched 0/6 times here, so
+                        // this widens the search considerably before giving up.
+                        static constexpr uintptr_t kEyeIdentityOffsets[] = {0xAF0, 0x10C, 0xC90, 0x164, 0x1A0, 0x2EC, 0x130};
                         const char* arg_names[] = {"RCX", "RDX", "R8", "R9"};
                         const DWORD64 arg_regs[] = {bctx->Rcx, bctx->Rdx, bctx->R8, bctx->R9};
                         std::string arg_dump{};
                         int entry_eye_guess = -1;
 
-                        for (int ai = 0; ai < 4; ++ai) {
-                            const auto reg = arg_regs[ai];
-                            arg_dump += fmt::format("{}={:x} ", arg_names[ai], reg);
-
-                            if (reg == 0 || entry_eye_guess != -1) {
-                                continue;
+                        const auto probe_byte_offset = [](uintptr_t base, uintptr_t offset, int& out_guess, std::string& out_desc) {
+                            if (out_guess != -1 || base == 0) {
+                                return;
                             }
 
-                            const auto candidate_addr = (void*)(reg + FSCENEVIEW_STEREO_PASS_OFFSET_ENTRY);
+                            const auto candidate_addr = (void*)(base + offset);
                             if (IsBadReadPtr(candidate_addr, sizeof(uint8_t))) {
-                                continue;
+                                return;
                             }
 
                             const auto pass_byte = *(uint8_t*)candidate_addr;
                             if (pass_byte == 1 || pass_byte == 2) {
-                                entry_eye_guess = pass_byte;
-                                arg_dump += fmt::format("(eye-match on {}) ", arg_names[ai]);
+                                out_guess = pass_byte;
+                                out_desc += fmt::format("(byte-match +{:x}={}) ", offset, pass_byte);
+                            }
+                        };
+
+                        for (int ai = 0; ai < 4; ++ai) {
+                            const auto reg = arg_regs[ai];
+                            arg_dump += fmt::format("{}={:x} ", arg_names[ai], reg);
+
+                            if (reg == 0) {
+                                continue;
+                            }
+
+                            // Direct: treat reg as a context/view pointer itself.
+                            for (const auto off : kEyeIdentityOffsets) {
+                                std::string desc;
+                                probe_byte_offset(reg, off, entry_eye_guess, desc);
+                                if (!desc.empty()) {
+                                    arg_dump += fmt::format("[{} direct {}] ", arg_names[ai], desc);
+                                }
+                            }
+
+                            // One level of indirection: treat reg as T** (pointer-to-view-pointer).
+                            if (entry_eye_guess == -1 && !IsBadReadPtr((void*)reg, sizeof(uintptr_t))) {
+                                const auto deref = *(uintptr_t*)reg;
+                                if (deref != 0) {
+                                    for (const auto off : kEyeIdentityOffsets) {
+                                        std::string desc;
+                                        probe_byte_offset(deref, off, entry_eye_guess, desc);
+                                        if (!desc.empty()) {
+                                            arg_dump += fmt::format("[{} *->{:x} indirect {}] ", arg_names[ai], deref, desc);
+                                        }
+                                    }
+                                }
                             }
                         }
 
-                        SPDLOG_INFO("[VR][WATCHPOINT][entry-bp] slot {} hit at {:x}, args: {} entry_eye_guess={}",
-                            slot, hit_rip, arg_dump, entry_eye_guess);
+                        SPDLOG_INFO("[VR][WATCHPOINT][entry-bp] slot {} hit at {:x}, args: {} entry_eye_guess={} eyes_seen_mask={:02b}",
+                            slot, hit_rip, arg_dump, entry_eye_guess, s_entry_bp_eyes_seen[slot]);
+
+                        if (entry_eye_guess == 1) {
+                            s_entry_bp_eyes_seen[slot] |= 0b01;
+                        } else if (entry_eye_guess == 2) {
+                            s_entry_bp_eyes_seen[slot] |= 0b10;
+                        }
 
                         // Restore original byte immediately - this is a one-shot capture, not a
                         // persistent breakpoint (persistent INT3s on a hot caller would re-introduce
                         // the same lag problem we already fixed for the watchpoint hits).
-                        DWORD old_protect = 0;
-                        if (VirtualProtect((void*)hit_rip, 1, PAGE_EXECUTE_READWRITE, &old_protect)) {
-                            *(uint8_t*)hit_rip = s_entry_bp_orig_byte[slot];
-                            VirtualProtect((void*)hit_rip, 1, old_protect, &old_protect);
-                            FlushInstructionCache(GetCurrentProcess(), (void*)hit_rip, 1);
-                        }
+                        // SEH-guarded (see seh_guarded_restore_byte): an external agent can race the
+                        // protection change and revert it before this write executes, turning a
+                        // normally-safe write into an AV.
+                        seh_guarded_restore_byte(hit_rip, s_entry_bp_orig_byte[slot]);
 
+                        release_bp_address(hit_rip);
                         s_entry_bp_armed[slot] = false;
                         s_entry_bp_addr[slot] = 0;
 
@@ -8642,11 +9196,267 @@ private:
                         return EXCEPTION_CONTINUE_EXECUTION;
                     }
 
+                    // Persistent grandparent (caller-of-caller) breakpoint: logs EVERY invocation for
+                    // the whole diagnostic lifetime, unlike the one-shot entry-bp above. We restore the
+                    // original byte, set the trap flag so we single-step past the real instruction, and
+                    // replant 0xCC on the SINGLE_STEP that follows (handled further below).
+                    for (int slot = 0; slot < 4; ++slot) {
+                        if (!s_caller2_armed[slot] || s_caller2_addr[slot] != hit_rip) {
+                            continue;
+                        }
+
+                        s_caller2_hit_count[slot]++;
+
+                        if (s_caller2_hit_count[slot] <= kCaller2LogCap) {
+                            static constexpr uintptr_t kEyeIdentityOffsets2[] = {0xAF0, 0x10C, 0xC90, 0x164, 0x1A0, 0x2EC, 0x130};
+                            const char* arg_names2[] = {"RCX", "RDX", "R8", "R9"};
+                            const DWORD64 arg_regs2[] = {bctx->Rcx, bctx->Rdx, bctx->R8, bctx->R9};
+                            std::string arg_dump2{};
+                            int eye_guess2 = -1;
+                            uintptr_t resolved_view_ptr2 = 0; // base address that produced the eye_guess2 byte-match
+
+                            const auto probe2 = [](uintptr_t base, uintptr_t offset, int& out_guess, std::string& out_desc) {
+                                if (out_guess != -1 || base == 0) {
+                                    return;
+                                }
+
+                                const auto candidate_addr = (void*)(base + offset);
+                                if (IsBadReadPtr(candidate_addr, sizeof(uint8_t))) {
+                                    return;
+                                }
+
+                                const auto pass_byte = *(uint8_t*)candidate_addr;
+                                if (pass_byte == 1 || pass_byte == 2) {
+                                    out_guess = pass_byte;
+                                    out_desc += fmt::format("(byte-match +{:x}={}) ", offset, pass_byte);
+                                }
+                            };
+
+                            for (int ai = 0; ai < 4; ++ai) {
+                                const auto reg = arg_regs2[ai];
+                                arg_dump2 += fmt::format("{}={:x} ", arg_names2[ai], reg);
+
+                                if (reg == 0) {
+                                    continue;
+                                }
+
+                                for (const auto off : kEyeIdentityOffsets2) {
+                                    std::string desc;
+                                    probe2(reg, off, eye_guess2, desc);
+                                    if (!desc.empty()) {
+                                        arg_dump2 += fmt::format("[{} direct {}] ", arg_names2[ai], desc);
+                                        // Only trust DIRECT register matches for the family/Views dump below -
+                                        // the indirect (one-deref) path below can coincidentally byte-match on
+                                        // small/garbage values that pass IsBadReadPtr but aren't real FSceneView*
+                                        // (seen in practice: a resolved "view" of 0x3a980100, far smaller than any
+                                        // genuine heap pointer in this process), producing a bogus family dump.
+                                        if (resolved_view_ptr2 == 0) resolved_view_ptr2 = reg;
+                                    }
+                                }
+
+                                if (eye_guess2 == -1 && !IsBadReadPtr((void*)reg, sizeof(uintptr_t))) {
+                                    const auto deref = *(uintptr_t*)reg;
+                                    if (deref != 0) {
+                                        for (const auto off : kEyeIdentityOffsets2) {
+                                            std::string desc;
+                                            probe2(deref, off, eye_guess2, desc);
+                                            if (!desc.empty()) {
+                                                arg_dump2 += fmt::format("[{} *->{:x} indirect {}] ", arg_names2[ai], deref, desc);
+                                                // Not used for resolved_view_ptr2 - see comment above.
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            if (eye_guess2 == 1) {
+                                s_caller2_eyes_seen[slot] |= 0b01;
+                            } else if (eye_guess2 == 2) {
+                                s_caller2_eyes_seen[slot] |= 0b10;
+                            }
+
+                            // DECISIVE view resolution: byte-match heuristics proved unreliable here (the
+                            // +0x164==1 match hit an unrelated struct whose +0x148 held drifting float
+                            // garbage - see NOT-A-VIEW verdicts in the logs). A genuine FSceneView MUST
+                            // hold the known live family pointer at +live_view_family_offset, so scan the
+                            // four argument registers (direct and one-deref) for exactly that property and
+                            // let it override the heuristic pick.
+                            {
+                                const auto known_family2 = (uintptr_t)g_last_real_stereo_view_family.load(std::memory_order_relaxed);
+                                const auto fam_off2 = sceneview_xref::live_view_family_offset;
+                                if (known_family2 != 0 && fam_off2) {
+                                    const auto is_view = [&](uintptr_t base) -> bool {
+                                        if (base == 0 || (base & 7) != 0) return false;
+                                        const auto slot_addr = (void*)(base + *fam_off2);
+                                        if (IsBadReadPtr(slot_addr, sizeof(uintptr_t))) return false;
+                                        return *(uintptr_t*)slot_addr == known_family2;
+                                    };
+
+                                    uintptr_t family_matched_view = 0;
+                                    std::string family_match_desc{};
+                                    for (int ai = 0; ai < 4 && family_matched_view == 0; ++ai) {
+                                        const auto reg = arg_regs2[ai];
+                                        if (reg == 0) continue;
+                                        if (is_view(reg)) {
+                                            family_matched_view = reg;
+                                            family_match_desc = fmt::format("{} direct", arg_names2[ai]);
+                                        } else if (!IsBadReadPtr((void*)reg, sizeof(uintptr_t))) {
+                                            const auto deref = *(uintptr_t*)reg;
+                                            if (is_view(deref)) {
+                                                family_matched_view = deref;
+                                                family_match_desc = fmt::format("{} indirect(*->{:x})", arg_names2[ai], deref);
+                                            }
+                                        }
+                                    }
+
+                                    if (family_matched_view != 0) {
+                                        arg_dump2 += fmt::format("[FAMILY-MATCH view={:x} via {}] ", family_matched_view, family_match_desc);
+                                        resolved_view_ptr2 = family_matched_view; // decisive - overrides byte-match pick
+                                    } else {
+                                        arg_dump2 += "[FAMILY-MATCH none] ";
+                                        resolved_view_ptr2 = 0; // byte-match pick proven unreliable; don't dump garbage
+                                    }
+                                }
+                            }
+
+                            // Correlation probe: the read-only sceneview_xref::scan_scene_capture_bool_candidates()
+                            // diagnostic found two FSceneView byte offsets, +0x1136 and +0x113b, that each toggle
+                            // in isolation (unlike a wider +0x1002..+0x113e cluster that looks like an unrelated
+                            // bitfield/array). Log their values here, at the same CSM-adjacent call site used for
+                            // eye identity, to see whether either one correlates with which eye's view reaches this
+                            // caller - a cheap way to test the Days Gone-style scene-capture-flag hypothesis without
+                            // writing any memory yet.
+                            static constexpr uintptr_t kSceneCaptureCandidateOffsets[] = {0x1136, 0x113b};
+                            std::string scene_capture_probe{};
+                            for (int ai = 0; ai < 4; ++ai) {
+                                const auto reg = arg_regs2[ai];
+                                if (reg == 0) {
+                                    continue;
+                                }
+                                for (const auto off : kSceneCaptureCandidateOffsets) {
+                                    const auto addr = (void*)(reg + off);
+                                    if (!IsBadReadPtr(addr, sizeof(uint8_t))) {
+                                        const auto val = *(uint8_t*)addr;
+                                        if (val <= 1) {
+                                            scene_capture_probe += fmt::format("[{} direct +{:x}={}] ", arg_names2[ai], off, val);
+                                        }
+                                    }
+                                    if (!IsBadReadPtr((void*)reg, sizeof(uintptr_t))) {
+                                        const auto deref = *(uintptr_t*)reg;
+                                        if (deref != 0) {
+                                            const auto iaddr = (void*)(deref + off);
+                                            if (!IsBadReadPtr(iaddr, sizeof(uint8_t))) {
+                                                const auto ival = *(uint8_t*)iaddr;
+                                                if (ival <= 1) {
+                                                    scene_capture_probe += fmt::format("[{} *->{:x} indirect +{:x}={}] ", arg_names2[ai], deref, off, ival);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            SPDLOG_INFO("[VR][WATCHPOINT][caller2-bp] slot {} hit #{} at {:x}, args: {} eye_guess={} eyes_seen_mask={:02b} scene_capture_probe: {}",
+                                slot, s_caller2_hit_count[slot], hit_rip, arg_dump2, eye_guess2, s_caller2_eyes_seen[slot], scene_capture_probe);
+
+                            // DIAG: NSF-CSM-EYE-MATCH. eye_guess is unreliable (see comment on
+                            // g_last_known_pass1_view/pass2_view above) because we deliberately
+                            // overwrite Pass2's StereoPass byte to PRIMARY. Compare the actually
+                            // resolved view pointer for this call against the real, independently
+                            // tracked pass1/pass2 view pointers for this frame instead, to find out
+                            // whether this CSM/cascade call site is genuinely invoked once per eye.
+                            if (resolved_view_ptr2 != 0) {
+                                const auto known_p1 = g_last_known_pass1_view.load(std::memory_order_relaxed);
+                                const auto known_p2 = g_last_known_pass2_view.load(std::memory_order_relaxed);
+                                const char* match = "neither";
+                                if ((void*)resolved_view_ptr2 == known_p1) match = "pass1_left";
+                                else if ((void*)resolved_view_ptr2 == known_p2) match = "pass2_right";
+
+                                SPDLOG_INFO("[VR][DIAG][NSF-CSM-EYE-MATCH] slot {} hit #{} frame={} resolved_view={:x} known_pass1={:x} known_pass2={:x} match={}",
+                                        slot, s_caller2_hit_count[slot], g_frame_count, resolved_view_ptr2,
+                                        (uintptr_t)known_p1, (uintptr_t)known_p2, match);
+                                }
+
+                                // DIAG: NSF-CSM-RCX-IDENTITY. resolved_view (RDX) turned out to be a
+                                // transient per-call object, not either eye's FSceneView (see
+                                // NSF-CSM-EYE-MATCH: always "neither"). RCX stays constant across many
+                                // consecutive hits within a frame and carries a plausible StereoPass-like
+                                // byte at +0x164 - track it across frames to see whether it is the real
+                                // per-eye identity signal (changes between the two eyes' shadow setups)
+                                // or is itself stuck on one value/object (e.g. a persistent light-proxy
+                                // that never distinguishes eyes either).
+                                {
+                                    static std::unordered_map<uintptr_t, std::pair<uint8_t, uint32_t>> s_last_rcx_state; // addr -> (last +0x164 byte, last frame)
+                                    const auto rcx = arg_regs2[0];
+                                    if (rcx != 0 && !IsBadReadPtr((void*)(rcx + 0x164), sizeof(uint8_t))) {
+                                        const auto cur_byte = *(uint8_t*)(rcx + 0x164);
+                                        auto it = s_last_rcx_state.find(rcx);
+                                        if (it == s_last_rcx_state.end()) {
+                                            SPDLOG_INFO("[VR][DIAG][NSF-CSM-RCX-IDENTITY] slot {} frame={} rcx={:x} NEW object +0x164={} ",
+                                                slot, g_frame_count, rcx, cur_byte);
+                                            s_last_rcx_state[rcx] = {cur_byte, g_frame_count};
+                                        } else if (it->second.first != cur_byte) {
+                                            SPDLOG_INFO("[VR][DIAG][NSF-CSM-RCX-IDENTITY] slot {} frame={} rcx={:x} +0x164 CHANGED {} -> {} (last_frame={})",
+                                                slot, g_frame_count, rcx, it->second.first, cur_byte, it->second.second);
+                                            it->second = {cur_byte, g_frame_count};
+                                        } else {
+                                            it->second.second = g_frame_count;
+                                        }
+
+                                        if (s_last_rcx_state.size() > 4096) {
+                                            s_last_rcx_state.clear();
+                                        }
+                                    }
+                                }
+
+                            // From-inside-the-call family/Views snapshot - only need a handful of samples
+                            // per eye to answer "is the other eye even in this array at this call site".
+                            if (resolved_view_ptr2 != 0 && s_caller2_hit_count[slot] <= 20) {
+                                sceneview_xref::dump_family_views_from_view((sdk::FSceneView*)resolved_view_ptr2,
+                                    "caller2-bp", (uint32_t)g_frame_count);
+                            }
+                        } else if (s_caller2_hit_count[slot] == kCaller2LogCap + 1) {
+                            SPDLOG_INFO("[VR][WATCHPOINT][caller2-bp] slot {} reached log cap ({}), will keep counting silently", slot, kCaller2LogCap);
+                        }
+
+                        // SEH-guarded (see seh_guarded_restore_byte): see note above on the entry-bp
+                        // restore write regarding the external-agent protection race.
+                        seh_guarded_restore_byte(hit_rip, s_caller2_orig_byte[slot]);
+
+                        bctx->EFlags |= 0x100; // TF: trap after the next (real) instruction executes
+                        s_caller2_awaiting_restep[slot] = true;
+                        return EXCEPTION_CONTINUE_EXECUTION;
+                    }
+
                     return EXCEPTION_CONTINUE_SEARCH;
                 }
 
                 if (exception->ExceptionRecord->ExceptionCode != EXCEPTION_SINGLE_STEP) {
                     return EXCEPTION_CONTINUE_SEARCH;
+                }
+
+                // Re-plant any caller2 persistent breakpoints that stepped over their real instruction.
+                for (int slot = 0; slot < 4; ++slot) {
+                    if (!s_caller2_awaiting_restep[slot]) {
+                        continue;
+                    }
+
+                    s_caller2_awaiting_restep[slot] = false;
+
+                    if (s_caller2_armed[slot] && s_caller2_addr[slot] != 0) {
+                        // NOTE: re-planting this breakpoint byte is self-modifying code performed from
+                        // inside an exception handler. An external agent (e.g. anti-cheat) can race us
+                        // and revert/re-protect the page between the VirtualProtect call succeeding and
+                        // this write actually executing, turning an ordinarily-safe write into an AV.
+                        // Guarded via seh_guarded_plant_breakpoint so a transient protection race just
+                        // disarms this slot instead of crashing the process.
+                        if (!seh_guarded_plant_breakpoint(s_caller2_addr[slot])) {
+                            s_caller2_armed[slot] = false;
+                            s_caller2_addr[slot] = 0;
+                        }
+                    }
+
+                    return EXCEPTION_CONTINUE_EXECUTION;
                 }
 
                 auto* ctx = exception->ContextRecord;
@@ -8665,6 +9475,34 @@ private:
                     handled_any = true;
 
                     const auto rip = ctx->Rip;
+
+                    // Exclude hits inside our own module. The watchpoint is meant to find the
+                    // ENGINE/game consumer of this field, not our own code that reads/writes it
+                    // as part of the Native Stereo Fix itself (e.g. the stereo-pass check right
+                    // after we write it). Self-hits add no diagnostic value and the heavy
+                    // deep-diag work below (unwind walk, breakpoint arming) that they trigger is
+                    // extra unnecessary risk around the anti-cheat's hooked exception/unwind
+                    // path, so skip them as cheaply as possible and keep executing.
+                    // NOTE: g_framework->get_module() returns the GAME's module (m_game_module), not
+                    // ours - using it here would make this check a no-op against our own DLL (and
+                    // happened to be silently wrong in an earlier revision of this check). Resolve our
+                    // own module (UEVRBackend.dll) via GetModuleHandleExA against an address known to be
+                    // inside this translation unit's code.
+                    static const auto s_self_module = []() -> uintptr_t {
+                        HMODULE mod = nullptr;
+                        GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            (LPCSTR)&watchpoint_is_safe_to_read, &mod);
+                        return (uintptr_t)mod;
+                    }();
+                    static const auto s_self_module_size = utility::get_module_size((HMODULE)s_self_module).value_or(0);
+                    if (s_self_module != 0 && rip >= s_self_module && rip < s_self_module + s_self_module_size) {
+                        // Still clear the trigger bit for this slot (mirrors the normal end-of-loop
+                        // handling below) so we don't leave Dr6 set and risk re-reporting/mishandling
+                        // this same trap, even though we're bailing out early.
+                        ctx->Dr6 &= ~(1ull << slot);
+                        continue;
+                    }
+
                     std::string site_desc;
                     const auto mod = utility::get_module_within((void*)rip);
                     if (mod.has_value()) {
@@ -8708,7 +9546,7 @@ private:
                             }
 
                             const auto candidate_addr = (void*)(reg + FSCENEVIEW_STEREO_PASS_OFFSET_DIAG);
-                            if (IsBadReadPtr(candidate_addr, sizeof(uint8_t))) {
+                            if (!watchpoint_is_safe_to_read(candidate_addr, sizeof(uint8_t))) {
                                 continue;
                             }
 
@@ -8730,7 +9568,7 @@ private:
                     // to identify the immediate caller by scanning the stack for the first qword that
                     // points into a known module (a cheap, unwind-free approximation of a return address -
                     // good enough since we only need a module+RVA, not exact frame info).
-                    if (do_deep_diag && !IsBadReadPtr((void*)rip, 16)) {
+                    if (do_deep_diag && watchpoint_is_safe_to_read((void*)rip, 16)) {
                         INSTRUX ix{};
                         const auto status = NdDecodeEx(&ix, (ND_UINT8*)rip, 16, ND_CODE_64, ND_DATA_64);
                         if (ND_SUCCESS(status) && ix.Length > 0) {
@@ -8745,7 +9583,7 @@ private:
                             std::string window_str{};
                             uintptr_t cursor = rip;
                             for (int wi = 0; wi < 6; ++wi) {
-                                if (IsBadReadPtr((void*)cursor, 16)) {
+                                if (!watchpoint_is_safe_to_read((void*)cursor, 16)) {
                                     break;
                                 }
 
@@ -8769,6 +9607,7 @@ private:
                             // address chain regardless of what garbage static disassembly shows.
                             std::string caller_chain{};
                             uintptr_t first_caller_entry_point = 0; // function BeginAddress of the nearest resolved non-leaf caller
+                            uintptr_t second_caller_entry_point = 0; // function BeginAddress of the caller's caller (grandparent)
                             {
                                 CONTEXT unwind_ctx = *ctx;
                                 constexpr int kMaxUnwindFrames = 4;
@@ -8777,7 +9616,7 @@ private:
                                     const auto func_entry = RtlLookupFunctionEntry(unwind_ctx.Rip, &image_base, nullptr);
                                     if (func_entry == nullptr) {
                                         // Leaf function (no unwind info) - return address is at [RSP].
-                                        if (IsBadReadPtr((void*)unwind_ctx.Rsp, sizeof(uintptr_t))) {
+                                        if (!watchpoint_is_safe_to_read((void*)unwind_ctx.Rsp, sizeof(uintptr_t))) {
                                             break;
                                         }
 
@@ -8795,6 +9634,8 @@ private:
                                         // live at the mid-function call-return point.
                                         if (first_caller_entry_point == 0) {
                                             first_caller_entry_point = (uintptr_t)image_base + func_entry->BeginAddress;
+                                        } else if (second_caller_entry_point == 0) {
+                                            second_caller_entry_point = (uintptr_t)image_base + func_entry->BeginAddress;
                                         }
                                     }
 
@@ -8821,9 +9662,22 @@ private:
                             // Arm a one-shot entry breakpoint at the nearest resolved caller's function
                             // start, so the NEXT time this caller runs, we capture genuine incoming
                             // RCX/RDX/R8/R9 args (per x64 ABI) instead of inferring context from whatever
-                            // is left in registers deep inside this optimized leaf.
+                            // is left in registers deep inside this optimized leaf. Cache the resolved
+                            // address so later hits (outside do_deep_diag) can cheaply re-arm it without
+                            // re-running the unwind.
                             if (first_caller_entry_point != 0) {
+                                s_cached_caller_entry_point[slot] = first_caller_entry_point;
                                 arm_entry_breakpoint(slot, first_caller_entry_point);
+                            }
+
+                            // Arm the PERSISTENT grandparent breakpoint once - it stays active (self
+                            // re-planting) for the whole diagnostic session, so we can observe every
+                            // invocation of the function that DECIDES whether to call the cascade-setup
+                            // leaf at all, for both eyes, across the entire toggle-on duration.
+                            if (second_caller_entry_point != 0 && s_caller2_entry_point[slot] == 0) {
+                                s_caller2_entry_point[slot] = second_caller_entry_point;
+                                arm_caller2_breakpoint(slot, second_caller_entry_point);
+                                SPDLOG_INFO("[VR][WATCHPOINT][caller2-bp] resolved grandparent caller for slot {} at {:x}", slot, second_caller_entry_point);
                             }
 
                             if (caller_chain.empty()) {
@@ -8836,6 +9690,15 @@ private:
                             SPDLOG_WARN("[VR][WATCHPOINT][{}] call site {} instruction decode failed at rip={:x}",
                                 s_active_tag[slot], site_desc, rip);
                         }
+                    } else if (s_cached_caller_entry_point[slot] != 0
+                        && s_entry_bp_eyes_seen[slot] != 0b11 // haven't seen both left (bit0) and right (bit1) yet
+                        && s_entry_bp_rearm_count[slot] < kEntryBpRearmCap) {
+                        // Outside the expensive deep-diag window: still cheaply re-arm the entry
+                        // breakpoint (a single byte write) on the already-resolved caller address, so we
+                        // keep trying until we've captured BOTH eyes at least once, not just whichever
+                        // eye happened to run first within the deep-diag hit cap.
+                        s_entry_bp_rearm_count[slot]++;
+                        arm_entry_breakpoint(slot, s_cached_caller_entry_point[slot]);
                     }
 
                     // Clear the trigger bit for this slot so we don't double-report; leave others.
@@ -9288,6 +10151,117 @@ inline std::vector<std::pair<uint32_t*, uint32_t>> apply_precise_shadow_fix(sdk:
     return restore;
 }
 
+// DIAG (2026-10, approach #3): wider alternative to apply_precise_shadow_fix(). Instead of copying
+// only +0xC90/+0x1A0, copies a whole contiguous byte range from the left (known-good, cache-stable)
+// eye's view directly into the right eye's view, on the theory that the engine's shadow-cache/
+// identity key may span more than the 2 confirmed dwords - a partial copy would still satisfy the
+// primary-view predicate (0xC90 ends up correct) while leaving some neighboring field disagreeing,
+// which could explain a cache rejecting/dropping the shadow on the very next lookup (flicker).
+// Scoped/restorable exactly like the normal fix: returns the list of (address, original byte-group)
+// writes performed so the caller can restore them after the render call. Defensive: only copies if
+// BOTH views' entire [range_offset, range_offset+range_size) spans are readable/writable, and still
+// requires the normal +0xC90==3 / +0x1A0==3 precondition on the right eye before touching anything.
+//
+// RANGE NOTE (2026-10, confirmed via DIAG: Log Per-Eye Frustum/Matrix Diff): the ORIGINAL default
+// range [0x160, 0x2f0) was too wide - EYE-FRUSTUM-DIFF confirmed offsets 0x160/0x170/0x180 and
+// 0x2c0/0x2d0/0x2e0 are "lateral_offset_like" (small, consistent per-float deltas - i.e. genuine
+// IPD-driven per-eye view-origin/frustum components), not shadow-cache identity data. Copying them
+// from the left eye overwrote the right eye's own camera frustum, forcing it to depth-test against
+// shadow data computed for the LEFT eye's position - exactly the mechanism that made wide-copy stable
+// (both eyes share one frustum) but produce no correct right-eye shadows. The range below is narrowed
+// to [0x190, 0x2c0) to keep known identity fields (0x1a0) while excluding both frustum-bearing edges.
+inline std::vector<std::pair<uint32_t*, uint32_t>> apply_precise_shadow_fix_wide_copy(
+    sdk::FSceneView* left_view, sdk::FSceneView* right_view,
+    uint32_t range_offset = 0x190, uint32_t range_size = 0x130) {
+    std::vector<std::pair<uint32_t*, uint32_t>> restore{};
+
+    if (left_view == nullptr || right_view == nullptr || !validate_precise_shadow_fix_predicate_bytes()) {
+        return restore;
+    }
+
+    constexpr uint32_t stereo_pass_offset = 0xC90;
+    constexpr uint32_t stereo_pass_cache_offset = 0x1A0;
+
+    auto* p_pass = (uint32_t*)((uintptr_t)right_view + stereo_pass_offset);
+    auto* p_cache = (uint32_t*)((uintptr_t)right_view + stereo_pass_cache_offset);
+
+    if (IsBadReadPtr(p_pass, sizeof(uint32_t)) || IsBadWritePtr(p_pass, sizeof(uint32_t)) ||
+        IsBadReadPtr(p_cache, sizeof(uint32_t)) || IsBadWritePtr(p_cache, sizeof(uint32_t))) {
+        return restore;
+    }
+
+    if (*p_pass != 3 || *p_cache != 3) {
+        static uint64_t s_mismatch_samples = 0;
+        const auto sample = s_mismatch_samples++;
+        if (sample < 10 || sample % 300 == 0) {
+            SPDLOG_WARN("[VR][NSF-C90-WIDE-COPY] skipped this call: fields not both ==3 (pass={} cache={}); "
+                "right eye will render with its UNMODIFIED StereoPass this frame (sample={})",
+                *p_pass, *p_cache, sample);
+        }
+        return restore;
+    }
+
+    const auto* src_base = (const uint8_t*)left_view + range_offset;
+    auto* dst_base = (uint8_t*)right_view + range_offset;
+
+    if (IsBadReadPtr(src_base, range_size) || IsBadWritePtr(dst_base, range_size)) {
+        SPDLOG_WARN("[VR][NSF-C90-WIDE-COPY] skipped: identity range [+{:x},+{:x}) not fully readable/writable "
+            "on left/right views", range_offset, range_offset + range_size);
+        return restore;
+    }
+
+    const uint32_t dword_count = range_size / sizeof(uint32_t);
+    restore.reserve(dword_count);
+    for (uint32_t i = 0; i < dword_count; ++i) {
+        auto* dst = (uint32_t*)dst_base + i;
+        const auto* src = (const uint32_t*)src_base + i;
+        restore.emplace_back(dst, *dst);
+        *dst = *src;
+    }
+
+    return restore;
+}
+
+// DIAG/FIX (2026-10, cache-key hunt result): NSF-CACHE-KEY-HUNT diffs between a "flickering, has
+// shadows" capture (normal 2-dword fix) and a "stable, no shadows" capture (wide-copy fix) found 3
+// dwords - OUTSIDE the wide-copy's [0x160,0x2f0) range, so these are genuine downstream engine
+// reactions, not directly-copied bytes - that behave like shadow-cache state rather than ordinary
+// per-frame camera data:
+//   +0xFE0/+0xFE4: 0xFFFFFFFF/0xFFFFFFFF ("dirty"/invalid sentinel) in the flickering-but-has-
+//                  shadows capture, vs small positive integers (e.g. 0x6f7/0x4ea - cache slot
+//                  index/frame-stamp-like) in the stable-but-no-shadows capture.
+//   +0xC18:        a tiny flag-like value (1) in the flickering-but-has-shadows capture, vs a
+//                  large hash/handle-like value (0x5b729b01) in the stable-but-no-shadows capture.
+// Theory: once the right eye's identity fully matches the left eye's (wide copy), the engine finds
+// a "valid" cached shadow-map entry for it (populated +0xC18/+0xFE0/+0xFE4) and REUSES the left
+// eye's cached shadow result instead of building one for the right eye's own frustum - stable, but
+// wrong/invisible shadow. Forcing these 3 fields back to the "dirty" sentinel values AFTER the wide
+// copy should make the engine treat the view as needing a fresh shadow build every frame (like the
+// normal fix does), while the rest of the wide copy keeps the fuller identity match stable - testing
+// whether that combination yields real shadows without flicker.
+inline void invalidate_shadow_cache_sentinel_fields(sdk::FSceneView* right_view, std::vector<std::pair<uint32_t*, uint32_t>>& restore) {
+    if (right_view == nullptr) {
+        return;
+    }
+
+    constexpr uint32_t offsets[] = { 0xFE0, 0xFE4 };
+    for (const auto offset : offsets) {
+        auto* p = (uint32_t*)((uintptr_t)right_view + offset);
+        if (IsBadReadPtr(p, sizeof(uint32_t)) || IsBadWritePtr(p, sizeof(uint32_t))) {
+            continue;
+        }
+        restore.emplace_back(p, *p);
+        *p = 0xFFFFFFFF;
+    }
+
+    constexpr uint32_t hash_offset = 0xC18;
+    auto* p_hash = (uint32_t*)((uintptr_t)right_view + hash_offset);
+    if (!IsBadReadPtr(p_hash, sizeof(uint32_t)) && !IsBadWritePtr(p_hash, sizeof(uint32_t))) {
+        restore.emplace_back(p_hash, *p_hash);
+        *p_hash = 1;
+    }
+}
+
 // DECISIVE DIAGNOSTIC: confirms or refutes the "array adjacency" hypothesis for why the shadow
 // fix produces direct/local shadows but not cascaded whole-scene shadows. Per UE4's
 // FSceneRenderer::AddViewDependentWholeSceneShadowsForView (ShadowSetup.cpp): CSM cascades are
@@ -9409,14 +10383,8 @@ bool FFakeStereoRenderingHook::is_in_viewport_client_draw() const {
     return m_in_viewport_client_draw && GameThreadWorker::get().is_same_thread();
 }
 
-// Tracks the FSceneViewFamily that begin_render_viewfamily_real most recently confirmed to be the
-// real HMD stereo family (i.e. it had >=2 views, a valid scene interface, and a valid render
-// target). sceneview_constructor() cannot tell an unrelated single-view scene capture (menu
-// portrait captures, UI thumbnail captures, etc.) apart from the real stereo family just from
-// stereo-pass value alone, and forcing those unrelated families into the same-pass path corrupts
-// their render (black menu characters, black screens). Gate the same-pass branch on this pointer
-// so it only ever touches the real HMD family.
-static std::atomic<sdk::FSceneViewFamily*> g_last_real_stereo_view_family{nullptr};
+// NOTE: g_last_real_stereo_view_family was moved above the sceneview_xref namespace (near
+// INIT_OPTIONS_OFFSET) so the CSM-site family diagnostics can use it for identity validation.
 
 // DIAG: correlates the raw view_index passed into calculate_stereo_view_offset() with the real
 // FSceneView metadata later observed for that same view inside sceneview_constructor(). These are
@@ -9525,10 +10493,6 @@ sdk::FSceneView* FFakeStereoRenderingHook::sceneview_constructor(sdk::FSceneView
         }
     }
 
-    if (view_family_plausible) {
-        sdk::FSceneViewFamily::update_offsets(early_view_family, nullptr);
-    }
-
     // SOLUTION 2: BYPASS STEREO MODIFICATIONS DURING LOADING SCREENS
     // =================================================================
     sdk::FSceneInterface* early_scene_interface = nullptr;
@@ -9542,6 +10506,19 @@ sdk::FSceneView* FFakeStereoRenderingHook::sceneview_constructor(sdk::FSceneView
             early_scene_interface = nullptr;
         }
     }
+
+    // NOTE: FSceneViewFamily::update_offsets() permanently latches its static offsets on the FIRST
+    // call regardless of success (s_attempted_update is set unconditionally). This constructor hook
+    // fires too early in the frame for Views discovery: at FSceneView construction time the engine
+    // has not yet appended the view into ViewFamily->Views, so the TArray-shaped-field scan here
+    // always finds count==0 and falls through to the "no vtable" default of offset 0x0 - even when
+    // view_family/scene_interface are both completely valid (observed: "Has vtable? false",
+    // "Found views offset at 0x0", immediately followed by valid render target/scene interface
+    // discovery on the SAME call, proving the family itself was fine). Because the latch is
+    // permanent, this poisoned result then blocks begin_render_viewfamily()'s later, correctly-timed
+    // call (which passes the real viewport render target and runs once Views is populated) from ever
+    // running its own discovery. Do not call update_offsets() from here; let begin_render_viewfamily
+    // be the sole first caller.
 
     if (!view_family_plausible || early_scene_interface == nullptr) {
         // Either this caller's init options don't carry a usable view family (non-game view), or the
@@ -9938,11 +10915,13 @@ sdk::FSceneView* FFakeStereoRenderingHook::sceneview_constructor(sdk::FSceneView
                 init_options->set_stereo_pass((uint32_t)EStereoscopicPass::eSSP_PRIMARY);
                 restore_init_options_after_constructor = true;
 
-                // PART 3: Clear View Count for 4-Indexed View Compatibility
-                views_original_count = views->count;
-                views->count = 0;
+                // PART 3 (REMOVED): Previously cleared FSceneViewFamily::Views.count to 0 here for
+                // "4-indexed view compatibility". Confirmed via CSM-site diagnostics that this blanks
+                // the Views array on the real stereo family while cascade/environmental shadow setup
+                // for the right eye reads that same family, causing the missing right-eye CSM/cascade
+                // shadow bug. Do not reintroduce without a narrower, verified justification.
 
-                SPDLOG_INFO_ONCE("[NativeStereoFix] Relabeled SECONDARY pass to PRIMARY and cleared view count");
+                SPDLOG_INFO_ONCE("[NativeStereoFix] Relabeled SECONDARY pass to PRIMARY");
             }
         }
     }
@@ -10104,6 +11083,46 @@ sdk::FSceneView* FFakeStereoRenderingHook::sceneview_constructor(sdk::FSceneView
         }
     }
 
+    // DIAG (2026-10, approach #2): early precise shadow fix write. See
+    // is_native_stereo_fix_right_eye_shadows_precise_early_write_enabled() for full rationale.
+    // Mirrors the structure of the Mirror FOV/LOD early-write block above: snapshot the left eye's
+    // +0xC90/+0x1A0 the instant IT is constructed, then immediately force the right eye's fields
+    // the instant IT is constructed this same frame - before InitViews/shadow setup can run for
+    // either view. No restore: pooled views are re-stamped fresh by the engine's own constructor
+    // every frame regardless, same precedent as the FOV/LOD early mirror.
+    if (!is_confirmed_non_eye_pass && result != nullptr && vr->is_native_stereo_fix_right_eye_shadows_precise_early_write_enabled() &&
+        sceneview_xref::validate_precise_shadow_fix_predicate_bytes()) {
+        constexpr uint32_t stereo_pass_offset = 0xC90;
+        constexpr uint32_t stereo_pass_cache_offset = 0x1A0;
+
+        static bool s_early_c90_left_captured = false;
+        static uint64_t s_early_c90_left_frame = ~0ull;
+
+        if (true_index == 0) {
+            s_early_c90_left_captured = true;
+            s_early_c90_left_frame = g_frame_count;
+        } else if (true_index == 1 && s_early_c90_left_captured && s_early_c90_left_frame == g_frame_count) {
+            auto* p_pass = (uint32_t*)((uintptr_t)result + stereo_pass_offset);
+            auto* p_cache = (uint32_t*)((uintptr_t)result + stereo_pass_cache_offset);
+
+            if (!IsBadReadPtr(p_pass, sizeof(uint32_t)) && !IsBadWritePtr(p_pass, sizeof(uint32_t)) &&
+                !IsBadReadPtr(p_cache, sizeof(uint32_t)) && !IsBadWritePtr(p_cache, sizeof(uint32_t)) &&
+                *p_pass == 3 && *p_cache == 3) {
+                const uint32_t target_value = vr->is_native_stereo_fix_right_eye_shadows_precise_mirror_left_enabled() ? 2 : 0;
+                *p_pass = target_value;
+                *p_cache = target_value;
+
+                static uint64_t s_early_write_samples = 0;
+                const auto sample = s_early_write_samples++;
+                if (sample < 10 || sample % 300 == 0) {
+                    SPDLOG_INFO("[VR][NSF-C90-EARLY-WRITE] frame={} right_view={:x} wrote target_value={} to +0xC90/+0x1A0 "
+                        "immediately after construction (before shadow setup can run)",
+                        g_frame_count, (uintptr_t)result, target_value);
+                }
+            }
+        }
+    }
+
     if (vr->is_native_stereo_fix_same_pass_force_primary_enabled()) {
         SPDLOG_INFO(
             "[VR][SAME-PASS-FORCE] sceneview_constructor EXIT: init_options={:x} result_view={:x} "
@@ -10118,7 +11137,8 @@ sdk::FSceneView* FFakeStereoRenderingHook::sceneview_constructor(sdk::FSceneView
         // Revert pass back to SECONDARY for compositor submission
         init_options->set_stereo_pass((uint32_t)init_options_stereo_pass);
 
-        // Restore original view count array size
+        // NOTE: Views.count is no longer cleared/restored here - see PART 3 removal above.
+        // views_original_count is kept around only for the unrelated reentrancy-guard restore below.
         if (views_original_count.has_value()) {
             auto view_family = init_options->get_view_family();
             auto views = view_family != nullptr ? view_family->get_views() : nullptr;
@@ -10357,17 +11377,46 @@ void FFakeStereoRenderingHook::begin_render_viewfamily_real(
             SPDLOG_INFO("[VR][FAR-LIGHTING-FIX] World settled after transition, arming one-frame CLV refill pulse");
         }
 
-        if (should_suspend != vr->is_native_stereo_fix_suspended()) {
-            if (vr->is_diag_verbose_logging_enabled()) {
-                SPDLOG_INFO("[VR] begin_render_viewfamily_real: {} Native Stereo Fix (tick_stalled={} no_player_controller={} no_local_pawn={} boot_phase={} world_stale={})",
-                    should_suspend ? "suspending" : "resuming", tick_stalled, no_player_controller, no_local_pawn, boot_phase, world_stale);
-            }
-            vr->set_native_stereo_fix_suspended(should_suspend);
+        // DIAG/FIX: resuming Native Stereo Fix the instant should_suspend flips false can still land
+        // mid-world-load - the individual flags (tick_stalled/no_player_controller/no_local_pawn/
+        // boot_phase/world_stale) can each clear a frame or two before the world has actually finished
+        // settling (e.g. the pawn exists but its owning level is still streaming in dependent actors/
+        // textures), which is exactly the kind of window that let create_scene_capture()'s async
+        // offset-lookup race a concurrent teardown and dereference freed memory. Suspending stays
+        // instantaneous (safety first - we'd rather drop a frame of NSF than risk a UAF), but resuming
+        // now requires the clear condition to hold continuously for a grace period first, mirroring
+        // the debounce pattern already used by create_scene_capture()'s own tick-stabilization check.
+        static auto s_suspend_clear_since = std::chrono::steady_clock::time_point{};
+        static bool s_was_suspended_last_check = false;
 
-            if (should_suspend) {
+        if (should_suspend) {
+            s_suspend_clear_since = std::chrono::steady_clock::time_point{};
+        } else if (s_suspend_clear_since.time_since_epoch().count() == 0) {
+            s_suspend_clear_since = std::chrono::steady_clock::now();
+        }
+
+        static constexpr auto resume_grace_period = std::chrono::milliseconds(1000);
+        const bool clear_long_enough = !should_suspend &&
+            s_suspend_clear_since.time_since_epoch().count() != 0 &&
+            (std::chrono::steady_clock::now() - s_suspend_clear_since) >= resume_grace_period;
+
+        // Effective suspended state: immediate when something wants to suspend, debounced when
+        // everything wants to resume.
+        const bool effective_suspend = should_suspend || !clear_long_enough;
+
+        if (effective_suspend != vr->is_native_stereo_fix_suspended()) {
+            if (vr->is_diag_verbose_logging_enabled() || effective_suspend != s_was_suspended_last_check) {
+                SPDLOG_INFO("[VR] begin_render_viewfamily_real: {} Native Stereo Fix (should_suspend={} clear_long_enough={} tick_stalled={} no_player_controller={} no_local_pawn={} boot_phase={} world_stale={})",
+                    effective_suspend ? "suspending" : "resuming", should_suspend, clear_long_enough, tick_stalled, no_player_controller, no_local_pawn, boot_phase, world_stale);
+            }
+            vr->set_native_stereo_fix_suspended(effective_suspend);
+
+            if (effective_suspend) {
                 rtm->destroy_scene_capture();
             }
         }
+
+        s_was_suspended_last_check = effective_suspend;
     }
 
     // WuWa far-lighting eye mismatch fix: consume a pending pulse (armed above on transition
@@ -10430,7 +11479,7 @@ void FFakeStereoRenderingHook::begin_render_viewfamily_real(
         }
     }
 
-    if (!vr->is_hmd_active() || !vr->is_native_stereo_fix_enabled() || vr->should_mirror_right_eye_this_frame()) {
+    if (!vr->is_hmd_active() || !vr->is_native_stereo_fix_enabled()) {
         // sceneview_xref::resolve_live()/feed() are what correct FSceneViewInitOptionsBase's global
         // family/state/stereo_pass offsets away from the (wrong, for this game) static heuristic -
         // every other consumer of init_options->get_stereo_pass() (sceneview_constructor's eye
@@ -10482,11 +11531,6 @@ void FFakeStereoRenderingHook::begin_render_viewfamily_real(
             }
         }
 
-        // Mirror mode intentionally takes the same no-scene-capture path as native stereo fix
-        // being disabled: no actor is spawned, and the right eye falls back to the existing
-        // "mirror the left/game texture" compositing already present in D3D11Component/D3D12Component.
-        // should_mirror_right_eye_this_frame() covers both the manual mirror toggle and the
-        // auto-mirror-on-cinematic fallback (bCinematicMode).
         rtm->destroy_scene_capture();
 
         g_hook->m_render_module_begin_render_viewfamily_hook.unsafe_call<void>(render_module, canvas, view_family_candidate);
@@ -10715,6 +11759,10 @@ void FFakeStereoRenderingHook::begin_render_viewfamily_real(
             sceneview_xref::scan_culling_region_raw(view_0, view_1, (uint32_t)g_frame_count);
         }
 
+        if (vr->is_diag_scan_scene_capture_bools_enabled()) {
+            sceneview_xref::scan_scene_capture_bool_candidates(view_0, view_1, view_family, (uint32_t)g_frame_count);
+        }
+
         if (vr->diag_nsf_eye_view_dump()) {
             constexpr size_t VIEW_DUMP_SIZE = 0x1000;
             constexpr size_t VIEW_DUMP_DWORDS = VIEW_DUMP_SIZE / sizeof(uint32_t);
@@ -10897,7 +11945,40 @@ void FFakeStereoRenderingHook::begin_render_viewfamily_real(
         sceneview_xref::log_shadow_pathway_identity("before-pass1-submit", views.data[0], views.data[1]);
         sceneview_xref::log_kuro_shadow_subsystem_state("before-pass1-submit");
     }
+
+    // EXPERIMENTAL (HIGH RISK): see is_native_stereo_fix_experimental_dual_view_csm_enabled() for
+    // rationale. Temporarily present both eyes (pass1 at slot 0, pass2 at slot 1, matching the
+    // engine's expected primary-then-secondary order) in the Views array for this single nested
+    // Pass1 render call ONLY, instead of NSF's normal views.count=1 serialization, so the engine's
+    // own InitViews()/CSM cascade propagation (AddViewDependentWholeSceneShadowsForView) can walk
+    // forward from the primary view's index and find the secondary view immediately after it in
+    // the SAME array - which log_cascade_adjacency_diagnostic() proved is otherwise never possible
+    // under the normal one-view-per-call serialization. views.count is restored to 1 immediately
+    // after this call returns, before any of the existing wants_swap/std::swap(views[0], views[1])
+    // logic below runs, so that logic's single-view assumption stays valid for the rest of the frame.
+    bool nsf_dual_view_csm_applied_this_call = false;
+    if (vr->is_native_stereo_fix_experimental_dual_view_csm_enabled() && wants_swap &&
+        views.count == 1 && views.data[0] != nullptr && views.data[1] != nullptr) {
+        nsf_dual_view_csm_applied_this_call = true;
+        static uint64_t s_dual_view_csm_samples = 0;
+        const auto dual_view_csm_sample = s_dual_view_csm_samples++;
+        if (dual_view_csm_sample < 20 || dual_view_csm_sample % 300 == 0) {
+            SPDLOG_WARN("[VR][NSF-DUAL-VIEW-CSM] frame={} sample={} applying views.count=2 for Pass1 submit "
+                "(pass1/slot0={:x} pass2/slot1={:x})",
+                g_frame_count, dual_view_csm_sample, (uintptr_t)views.data[0], (uintptr_t)views.data[1]);
+        }
+        views.count = 2;
+    }
+
     g_hook->m_render_module_begin_render_viewfamily_hook.unsafe_call<void>(render_module, canvas, view_family_candidate);
+
+    if (nsf_dual_view_csm_applied_this_call) {
+        views.count = 1;
+        if (vr->is_diag_log_shadow_pathway_identity_enabled()) {
+            sceneview_xref::log_cascade_adjacency_diagnostic("after-dual-view-csm-pass1-submit", views.data[0], views.data[1]);
+        }
+    }
+
     if (vr->is_diag_log_shadow_pathway_identity_enabled() && views.data[0] != nullptr && views.data[1] != nullptr) {
         sceneview_xref::log_shadow_pathway_identity("after-pass1-submit", views.data[0], views.data[1]);
         sceneview_xref::log_kuro_shadow_subsystem_state("after-pass1-submit");
@@ -11001,8 +12082,119 @@ void FFakeStereoRenderingHook::begin_render_viewfamily_real(
             }
         }
 
+        // DIAG: NSF-SCENE-CAPTURE-LIVE-STATE. All of CaptureSource, the DynamicShadows show-flag,
+        // the capture's own PostProcessSettings override/blend-weight, bCaptureEveryFrame, and
+        // bAlwaysPersistRenderingState are currently only verified/applied ONCE, inside
+        // create_scene_capture(), at component-creation time. If the engine (or any other system)
+        // resets any of these after creation - e.g. a show-flag refresh, a PP volume re-blend, or
+        // a capture-component re-validation on a menu/level transition - that would silently
+        // reintroduce the exact dark-filter/flicker symptom and the one-shot creation log would
+        // never see it. Re-read (NOT re-apply - this is observational only) the LIVE values off
+        // the actual scene_capture_component every frame, throttled, to get a time-series that can
+        // be correlated against exactly when the user observes the artifact, instead of a single
+        // creation-time snapshot. Gated by its own toggle so it's zero-cost unless explicitly armed.
+        // DIAG A/B LIVE-ENFORCE: bAlwaysPersistRenderingState is otherwise only written once,
+        // inside create_scene_capture(), based on the diag toggle's value AT THAT TIME. Flipping
+        // the "DIAG: NSF disable bAlwaysPersistRenderingState on scene capture" checkbox afterward
+        // has no effect on an already-live component until the next recreation (map load / NSF
+        // off-on cycle), which makes A/B testing misleading - the live trace can keep reporting
+        // the stale value even though the checkbox was just unchecked. Re-apply the desired value
+        // here every frame so the toggle takes effect immediately on the live component.
+        // DIAG A/B LIVE-ENFORCE (RESULT: bAlwaysPersistRenderingState=false tested, flicker/dark
+        // overlay still present -> this flag is NOT the cause, reverted back to true/normal).
+        if (vr != nullptr) {
+            if (auto* capture_component_enforce = rtm->get_scene_capture_component_diag(); capture_component_enforce != nullptr) {
+                static auto scene_capture_class_enforce = sdk::find_uobject<sdk::UClass>(L"Class /Script/Engine.SceneCaptureComponent2D");
+
+                if (scene_capture_class_enforce != nullptr) {
+                    if (auto always_persist_prop_enforce = scene_capture_class_enforce->find_property(L"bAlwaysPersistRenderingState");
+                        always_persist_prop_enforce != nullptr) {
+                        if (auto* data = always_persist_prop_enforce->get_data<bool>(capture_component_enforce); data != nullptr) {
+                            *data = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        if (vr->is_diag_nsf_scene_capture_live_state_trace_enabled()) {
+            static uint64_t s_last_live_state_log_us = 0;
+            const auto now_us =
+                std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+            constexpr uint64_t live_state_log_interval_us = 250'000; // 4x/sec
+
+            if ((uint64_t)now_us - s_last_live_state_log_us >= live_state_log_interval_us) {
+                s_last_live_state_log_us = (uint64_t)now_us;
+
+                auto* capture_component = rtm->get_scene_capture_component_diag();
+
+                if (capture_component != nullptr) {
+                    uint8_t capture_source_value = 0xFF;
+                    bool capture_source_found = false;
+                    bool dynamic_shadows_on = false;
+                    bool show_flags_found = false;
+                    float pp_blend_weight = -1.0f;
+                    bool pp_settings_found = false;
+                    bool capture_every_frame_value = false;
+                    bool capture_every_frame_found = false;
+                    bool always_persist_value = false;
+                    bool always_persist_found = false;
+
+                    static auto scene_capture_class = sdk::find_uobject<sdk::UClass>(L"Class /Script/Engine.SceneCaptureComponent2D");
+
+                    if (scene_capture_class != nullptr) {
+                        if (auto capture_source_prop = scene_capture_class->find_property(L"CaptureSource"); capture_source_prop != nullptr) {
+                            if (auto* data = capture_source_prop->get_data<uint8_t>(capture_component); data != nullptr) {
+                                capture_source_value = *data;
+                                capture_source_found = true;
+                            }
+                        }
+
+                        if (auto capture_every_frame_prop = scene_capture_class->find_property(L"bCaptureEveryFrame"); capture_every_frame_prop != nullptr) {
+                            if (auto* data = capture_every_frame_prop->get_data<bool>(capture_component); data != nullptr) {
+                                capture_every_frame_value = *data;
+                                capture_every_frame_found = true;
+                            }
+                        }
+
+                        if (auto always_persist_prop = scene_capture_class->find_property(L"bAlwaysPersistRenderingState"); always_persist_prop != nullptr) {
+                            if (auto* data = always_persist_prop->get_data<bool>(capture_component); data != nullptr) {
+                                always_persist_value = *data;
+                                always_persist_found = true;
+                            }
+                        }
+                    }
+
+                    if (auto* show_flags = capture_component->get_engine_show_flags(); show_flags != nullptr) {
+                        constexpr uint64_t SF_DynamicShadows_Bit = 23;
+                        constexpr uint64_t SF_DynamicShadows_Mask = 1ull << SF_DynamicShadows_Bit;
+                        dynamic_shadows_on = (*show_flags & SF_DynamicShadows_Mask) != 0;
+                        show_flags_found = true;
+                    }
+
+                    if (auto* pp_weight = capture_component->get_post_process_blend_weight(); pp_weight != nullptr) {
+                        pp_blend_weight = *pp_weight;
+                        pp_settings_found = true;
+                    }
+
+                    SPDLOG_INFO(
+                        "[VR][DIAG][NSF-SCENE-CAPTURE-LIVE-STATE] frame={} component={:x} CaptureSource={}(found={}, expected=2/FinalColorLDR) "
+                        "DynamicShadows={}(found={}) PPBlendWeight={:.3f}(found={}) bCaptureEveryFrame={}(found={}, expected=false) "
+                        "bAlwaysPersistRenderingState={}(found={}, expected=true)",
+                        g_frame_count, (uintptr_t)capture_component,
+                        capture_source_value, capture_source_found,
+                        dynamic_shadows_on, show_flags_found,
+                        pp_blend_weight, pp_settings_found,
+                        capture_every_frame_value, capture_every_frame_found,
+                        always_persist_value, always_persist_found);
+                } else {
+                    SPDLOG_WARN("[VR][DIAG][NSF-SCENE-CAPTURE-LIVE-STATE] frame={} scene_capture_component is null - cannot trace live state", g_frame_count);
+                }
+            }
+        }
+
         // DIAG: NSF-FOV-TRANSITION. +0x2d0 is 90.0 for BOTH eyes immediately after construction
-        // (confirmed via NSF-FOV-ORIGIN), yet later observed as 75.0/90.0 split by frame-diff
+        // (confirmed via NSF-FOV-ORIGIN), yet later ob
         // sampling. Since nothing in this codebase currently writes +0x2d0/+0xca4 (that attempt was
         // reverted), the 75.0 must come from an ENGINE call that updates one eye's view post-
         // construction but not the other's - most likely the per-frame camera/FMinimalViewInfo FOV
@@ -11051,7 +12243,10 @@ void FFakeStereoRenderingHook::begin_render_viewfamily_real(
         auto pass2_view = views.data[0];
         auto pass1_view = views.data[1];
 
-        // DIAG: NSF-ADDR-REUSE. FSceneView objects are transient and reallocated by the engine's own
+        g_last_known_pass1_view.store((void*)pass1_view, std::memory_order_relaxed);
+        g_last_known_pass2_view.store((void*)pass2_view, std::memory_order_relaxed);
+
+        // DIAG: NSF-ADDR-REUSE.
         // allocator; if a freed FSceneView's address gets reused for the OPPOSITE eye role within a
         // small number of frames, a late/deferred restore write targeting the old role could land on
         // the new view instead - a candidate mechanism for the reported left/right alternating
@@ -11116,7 +12311,115 @@ void FFakeStereoRenderingHook::begin_render_viewfamily_real(
                         (uintptr_t)pass2_view, (uintptr_t)pass2_state, pass1_state == pass2_state);
                     s_last_viewstate_pair = current_pair;
                 }
+
+                // DIAG (NSF-VIEWSTATE-DUMP, one-shot): snapshot a window around both eyes' live
+                // FSceneViewState objects and log differing dwords. Intended to be triggered once
+                // while in "write-once" mode (stable, no flicker, no shadows) and once in normal
+                // mode (flicker, shadows) so the two dumps can be diffed by hand to find which
+                // ViewState field tracks/reacts to the forced StereoPass value.
+                if (vr->diag_nsf_viewstate_dump() && pass1_state != nullptr && pass2_state != nullptr) {
+                    constexpr size_t VS_DUMP_SIZE = 0x400;
+                    constexpr size_t VS_DUMP_DWORDS = VS_DUMP_SIZE / sizeof(uint32_t);
+                    auto* p1 = (const uint8_t*)pass1_state;
+                    auto* p2 = (const uint8_t*)pass2_state;
+
+                    if (IsBadReadPtr(p1, VS_DUMP_SIZE) || IsBadReadPtr(p2, VS_DUMP_SIZE)) {
+                        SPDLOG_WARN("[VR][NSF-VIEWSTATE-DUMP] cannot capture unreadable range: pass1_state={:x} pass2_state={:x} size={:x}",
+                            (uintptr_t)p1, (uintptr_t)p2, VS_DUMP_SIZE);
+                    } else {
+                        SPDLOG_INFO("[VR][NSF-VIEWSTATE-DUMP] begin frame={} pass1_state={:x} pass2_state={:x} span={:x}; differing dwords only (P1/P2 raw and f32)",
+                            g_frame_count, (uintptr_t)p1, (uintptr_t)p2, VS_DUMP_SIZE);
+
+                        size_t dumped_fields = 0;
+                        constexpr size_t MAX_DUMPED_FIELDS = 256;
+                        for (size_t i = 0; i < VS_DUMP_DWORDS; ++i) {
+                            uint32_t v1 = 0, v2 = 0;
+                            std::memcpy(&v1, p1 + i * sizeof(uint32_t), sizeof(v1));
+                            std::memcpy(&v2, p2 + i * sizeof(uint32_t), sizeof(v2));
+                            if (v1 == v2) continue;
+                            if (dumped_fields >= MAX_DUMPED_FIELDS) break;
+
+                            float f1 = 0.0f, f2 = 0.0f;
+                            std::memcpy(&f1, &v1, sizeof(f1));
+                            std::memcpy(&f2, &v2, sizeof(f2));
+                            SPDLOG_INFO("[VR][NSF-VIEWSTATE-DUMP] +{:04x} P1={:08x} ({:.6g}) P2={:08x} ({:.6g})",
+                                i * sizeof(uint32_t), v1, f1, v2, f2);
+                            ++dumped_fields;
+                        }
+
+                        SPDLOG_INFO("[VR][NSF-VIEWSTATE-DUMP] end differing_dwords_logged={} write_once_mode={}",
+                            dumped_fields, vr->is_native_stereo_fix_right_eye_shadows_precise_write_once_enabled());
+                    }
+
+                    vr->diag_nsf_viewstate_dump() = false;
+                }
             }
+        }
+
+        // DIAG (NSF-PASS2-SNAPSHOT, one-shot, cross-mode diff): captures pass2_view's own memory
+        // (not ViewState, which was already proven IDENTICAL between eyes regardless of mode - see
+        // NSF-VIEWSTATE-DUMP/NSF-VIEWSTATE-IDENTITY) and diffs it against whatever was captured the
+        // PREVIOUS time this button was pressed, even if that was in a different mode (normal vs
+        // write-once). This isolates per-frame FSceneView fields (not the shared persistent state)
+        // that differ between a flickering continuous-write frame and a stable write-once frame.
+        if (vr->diag_nsf_pass2_cross_mode_snapshot() && pass2_view != nullptr) {
+            constexpr size_t SNAP_SIZE = 0x1000;
+            constexpr size_t SNAP_DWORDS = SNAP_SIZE / sizeof(uint32_t);
+
+            static std::unique_ptr<std::array<uint32_t, SNAP_DWORDS>> s_prev_snapshot{};
+            static bool s_prev_write_once_mode = false;
+            static uint64_t s_snapshot_count = 0;
+
+            auto* src = (const uint8_t*)pass2_view;
+            if (IsBadReadPtr(src, SNAP_SIZE)) {
+                SPDLOG_WARN("[VR][NSF-PASS2-SNAPSHOT] cannot capture unreadable pass2_view={:x} size={:x}", (uintptr_t)src, SNAP_SIZE);
+            } else {
+                auto current = std::make_unique<std::array<uint32_t, SNAP_DWORDS>>();
+                std::memcpy(current->data(), src, SNAP_SIZE);
+
+                const bool current_write_once_mode = vr->is_native_stereo_fix_right_eye_shadows_precise_write_once_enabled();
+                ++s_snapshot_count;
+
+                if (!s_prev_snapshot) {
+                    SPDLOG_INFO("[VR][NSF-PASS2-SNAPSHOT] snapshot #{} captured (write_once_mode={}); no previous snapshot to diff against - "
+                        "trigger this button again after switching modes to see the diff", s_snapshot_count, current_write_once_mode);
+                } else {
+                    SPDLOG_INFO("[VR][NSF-PASS2-SNAPSHOT] snapshot #{} captured (write_once_mode={}); diffing against previous snapshot "
+                        "(write_once_mode={}); differing dwords only (PREV/CURR raw and f32)",
+                        s_snapshot_count, current_write_once_mode, s_prev_write_once_mode);
+
+                    size_t dumped_fields = 0;
+                    constexpr size_t MAX_DUMPED_FIELDS = 512;
+                    for (size_t i = 0; i < SNAP_DWORDS; ++i) {
+                        const uint32_t prev_v = (*s_prev_snapshot)[i];
+                        const uint32_t curr_v = (*current)[i];
+                        if (prev_v == curr_v) continue;
+                        if (dumped_fields >= MAX_DUMPED_FIELDS) {
+                            SPDLOG_WARN("[VR][NSF-PASS2-SNAPSHOT] field limit reached ({}); remaining diffs omitted", MAX_DUMPED_FIELDS);
+                            break;
+                        }
+
+                        float prev_f = 0.0f, curr_f = 0.0f;
+                        std::memcpy(&prev_f, &prev_v, sizeof(prev_f));
+                        std::memcpy(&curr_f, &curr_v, sizeof(curr_f));
+                        const auto offset = i * sizeof(uint32_t);
+                        const bool is_stereo_pass_neighborhood = offset >= 0xC80 && offset <= 0xCA8;
+                        const bool is_cache_neighborhood = offset >= 0x190 && offset <= 0x1B0;
+                        SPDLOG_INFO("[VR][NSF-PASS2-SNAPSHOT] +{:04x} PREV={:08x} ({:.6g}) CURR={:08x} ({:.6g}){}{}",
+                            offset, prev_v, prev_f, curr_v, curr_f,
+                            is_stereo_pass_neighborhood ? " [near +0xC90]" : "",
+                            is_cache_neighborhood ? " [near +0x1A0]" : "");
+                        ++dumped_fields;
+                    }
+
+                    SPDLOG_INFO("[VR][NSF-PASS2-SNAPSHOT] end differing_dwords_logged={}", dumped_fields);
+                }
+
+                s_prev_snapshot = std::move(current);
+                s_prev_write_once_mode = current_write_once_mode;
+            }
+
+            vr->diag_nsf_pass2_cross_mode_snapshot() = false;
         }
 
         std::vector<std::pair<uint32_t*, uint32_t>> pass2_restore{};
@@ -11376,7 +12679,34 @@ void FFakeStereoRenderingHook::begin_render_viewfamily_real(
                 (uintptr_t)pass1_state, (uintptr_t)*pass2_state_slot, pass1_state == *pass2_state_slot,
                 g_hook->m_sceneview_data.known_scene_states.size());
 
-            if ((vr->is_native_stereo_fix_null_pass2_view_state_enabled() && nsf_pass2_hacks_safe_this_frame) ||
+            // FIX: pass1 and pass2 were found (NSF-VIEWSTATE-IDENTITY) to share the SAME
+            // FSceneViewState, which is what the engine keys per-view shadow/occlusion/TAA
+            // history off of - this is why cascade/environmental shadow setup only ever runs for
+            // one eye (caller2-bp CSM watchpoint: eye_guess stuck at 1 across every hit).
+            // known_scene_states already tracks >=2 distinct FSceneViewState objects the engine
+            // itself constructed this session (observed known_states=2 in logs), so give Pass2 a
+            // genuinely distinct state instead of sharing Pass1's or nulling it out (nulling
+            // disables history entirely rather than giving Pass2 its own persistent history).
+            void* distinct_state_for_pass2 = nullptr;
+            if (!vr->is_native_stereo_fix_null_pass2_view_state_enabled()) {
+                for (auto scene_state : g_hook->m_sceneview_data.known_scene_states) {
+                    if ((void*)scene_state != pass1_state) {
+                        distinct_state_for_pass2 = (void*)scene_state;
+                        break;
+                    }
+                }
+            }
+
+            if (distinct_state_for_pass2 != nullptr && distinct_state_for_pass2 != *pass2_state_slot &&
+                nsf_pass2_hacks_safe_this_frame) {
+                pass2_state_saved = *pass2_state_slot;
+                *pass2_state_slot = distinct_state_for_pass2;
+
+                if (vr->is_diag_nsf_pass2_pipeline_trace_enabled()) {
+                    SPDLOG_INFO("[VR][DIAG][NSF-PIPELINE] frame={} pass2 view_state reassigned to distinct state: slot={:x} saved={:x} new={:x}",
+                        g_frame_count, (uintptr_t)pass2_state_slot, (uintptr_t)pass2_state_saved, (uintptr_t)distinct_state_for_pass2);
+                }
+            } else if ((vr->is_native_stereo_fix_null_pass2_view_state_enabled() && nsf_pass2_hacks_safe_this_frame) ||
                 nsf_force_reset_pass2_state_this_frame) {
                 pass2_state_saved = *pass2_state_slot;
                 *pass2_state_slot = nullptr;
@@ -11558,22 +12888,110 @@ void FFakeStereoRenderingHook::begin_render_viewfamily_real(
         // primary") and our forced value every time the write is skipped - which matches the
         // described symptom exactly.
         static uint64_t s_precise_fix_attempted = 0, s_precise_fix_applied = 0, s_precise_fix_gated = 0;
+        static bool s_write_once_done = false;
+        // DIAG: see is_native_stereo_fix_right_eye_shadows_precise_per_view_write_once_enabled().
+        // Tracks the last pooled FSceneView* the precise fix was actually applied to, so the write
+        // is skipped entirely (no read-modify-write at all) when pass2's view pointer is unchanged
+        // from the previous frame, but still re-applied (once) whenever a genuinely different
+        // pooled view object shows up.
+        static sdk::FSceneView* s_per_view_write_once_last_fixed_view = nullptr;
+        // DIAG (edge-trigger hypothesis): counts how many times +0xC90 actually CHANGES value
+        // across consecutive samples (any mode), independent of attempted/applied/gated counts
+        // above, so the per-second transition rate can be directly correlated against perceived
+        // flicker intensity when comparing normal write+restore vs no-restore vs write-once.
+        static uint32_t s_last_c90_value = 0xFFFFFFFF;
+        static uint64_t s_c90_transitions = 0;
+        static auto s_transition_window_start = std::chrono::steady_clock::now();
         std::vector<std::pair<uint32_t*, uint32_t>> precise_shadow_fix_restore{};
-        if (vr->is_native_stereo_fix_right_eye_shadows_precise_enabled() && pass2_view != nullptr) {
-            if (!nsf_pass2_hacks_safe_this_frame) {
+        const bool early_write_mode = vr->is_native_stereo_fix_right_eye_shadows_precise_early_write_enabled();
+        const bool wide_copy_mode = vr->is_native_stereo_fix_right_eye_shadows_precise_wide_copy_enabled();
+        if (early_write_mode) {
+            // Approach #2: the write already happened inside the FSceneView constructor hook for
+            // this frame (see sceneview_constructor's NSF-C90-EARLY-WRITE block) - skip the
+            // late/submit-time write entirely to avoid double-writing the same frame.
+        } else if (vr->is_native_stereo_fix_right_eye_shadows_precise_enabled() && pass2_view != nullptr) {
+            const bool write_once_mode = vr->is_native_stereo_fix_right_eye_shadows_precise_write_once_enabled();
+            const bool per_view_write_once_mode = vr->is_native_stereo_fix_right_eye_shadows_precise_per_view_write_once_enabled();
+
+            if (per_view_write_once_mode && pass2_view == s_per_view_write_once_last_fixed_view) {
+                // Same pooled view object as last time we wrote - skip entirely, not even a
+                // same-value rewrite, to isolate whether the rewrite ITSELF causes the flicker.
+            } else if (write_once_mode && s_write_once_done) {
+                // Already performed the single lifetime write - never touch +0xC90/+0x1A0 again.
+            } else if (!nsf_pass2_hacks_safe_this_frame) {
                 ++s_precise_fix_gated;
             } else {
                 ++s_precise_fix_attempted;
                 const uint32_t target_value = vr->is_native_stereo_fix_right_eye_shadows_precise_mirror_left_enabled() ? 2 : 0;
-                precise_shadow_fix_restore = sceneview_xref::apply_precise_shadow_fix(pass2_view, target_value);
-                if (precise_shadow_fix_restore.size() == 2) {
+                precise_shadow_fix_restore = wide_copy_mode
+                    ? sceneview_xref::apply_precise_shadow_fix_wide_copy(pass1_view, pass2_view)
+                    : sceneview_xref::apply_precise_shadow_fix(pass2_view, target_value);
+                if (precise_shadow_fix_restore.size() >= 2) {
                     ++s_precise_fix_applied;
+                    if (wide_copy_mode) {
+                        static uint64_t s_wide_copy_samples = 0;
+                        const auto sample = s_wide_copy_samples++;
+                        if (sample < 10 || sample % 300 == 0) {
+                            SPDLOG_INFO("[VR][NSF-C90-WIDE-COPY] applied wide identity copy ({} dwords) frame={} "
+                                "pass1_view={:x} pass2_view={:x}",
+                                precise_shadow_fix_restore.size(), g_frame_count, (uintptr_t)pass1_view, (uintptr_t)pass2_view);
+                        }
+                        if (vr->is_native_stereo_fix_right_eye_shadows_precise_wide_copy_invalidate_cache_enabled()) {
+                            const auto before_size = precise_shadow_fix_restore.size();
+                            sceneview_xref::invalidate_shadow_cache_sentinel_fields(pass2_view, precise_shadow_fix_restore);
+                            if (sample < 10 || sample % 300 == 0) {
+                                SPDLOG_INFO("[VR][NSF-C90-WIDE-COPY-INVALIDATE] forced {} shadow-cache sentinel field(s) "
+                                    "back to dirty frame={} pass2_view={:x}",
+                                    precise_shadow_fix_restore.size() - before_size, g_frame_count, (uintptr_t)pass2_view);
+                            }
+                        }
+                    }
+                    if (per_view_write_once_mode) {
+                        s_per_view_write_once_last_fixed_view = pass2_view;
+                        SPDLOG_INFO("[VR][NSF-C90-PER-VIEW-WRITE-ONCE] applied fix to NEW pooled view pass2_view={:x} on frame={} "
+                            "target_value={}; will be skipped on subsequent frames until a different pooled view appears",
+                            (uintptr_t)pass2_view, g_frame_count, target_value);
+                    }
+                    if (write_once_mode) {
+                        s_write_once_done = true;
+                        SPDLOG_WARN("[VR][NSF-C90-WRITE-ONCE] performed the single lifetime write on frame={} pass2_view={:x} "
+                            "target_value={}; +0xC90/+0x1A0 will NOT be touched again for the rest of this session",
+                            g_frame_count, (uintptr_t)pass2_view, target_value);
+                    }
                 }
             }
 
             SPDLOG_INFO_EVERY_N_SEC(5, "[VR][NSF-C90-PRECISE] frame accounting: attempted={} applied={} gated_unsafe={} "
-                "(applied-rate={:.1f}% of attempted)", s_precise_fix_attempted, s_precise_fix_applied, s_precise_fix_gated,
-                s_precise_fix_attempted > 0 ? (100.0 * s_precise_fix_applied / s_precise_fix_attempted) : 0.0);
+                "(applied-rate={:.1f}% of attempted) write_once_mode={} write_once_done={}", s_precise_fix_attempted,
+                s_precise_fix_applied, s_precise_fix_gated,
+                s_precise_fix_attempted > 0 ? (100.0 * s_precise_fix_applied / s_precise_fix_attempted) : 0.0,
+                write_once_mode, s_write_once_done);
+
+            // DIAG: sample the live +0xC90 value (post-write, whatever this frame's mode left it at)
+            // and count transitions vs. the previous frame's sample, reporting a transitions/sec rate
+            // every 2 seconds. Correlate this rate against perceived flicker across the three modes
+            // (normal restore / no-restore / write-once) to test the edge-triggered-write hypothesis.
+            {
+                const auto* p_c90_sample = (const uint32_t*)((uintptr_t)pass2_view + 0xC90);
+                if (!IsBadReadPtr(p_c90_sample, sizeof(uint32_t))) {
+                    const uint32_t sample_value = *p_c90_sample;
+                    if (s_last_c90_value != 0xFFFFFFFF && sample_value != s_last_c90_value) {
+                        ++s_c90_transitions;
+                    }
+                    s_last_c90_value = sample_value;
+                }
+
+                const auto now_tp = std::chrono::steady_clock::now();
+                const auto elapsed_s = std::chrono::duration<double>(now_tp - s_transition_window_start).count();
+                if (elapsed_s >= 2.0) {
+                    SPDLOG_INFO("[VR][NSF-C90-TRANSITION-RATE] +0xC90 transitions_per_sec={:.1f} (total={} over {:.1f}s) "
+                        "write_once_mode={} no_restore_mode={}",
+                        s_c90_transitions / elapsed_s, s_c90_transitions, elapsed_s, write_once_mode,
+                        vr->is_native_stereo_fix_right_eye_shadows_precise_no_restore_enabled());
+                    s_c90_transitions = 0;
+                    s_transition_window_start = now_tp;
+                }
+            }
 
             // Decisive structural check: is pass2_view even in the same FSceneViewFamily::Views
             // array as pass1_view, and if so, is it forward-adjacent? This directly answers whether
@@ -11634,6 +13052,16 @@ void FFakeStereoRenderingHook::begin_render_viewfamily_real(
             }
         }
 
+        if (vr->is_diag_log_shadow_cache_key_hunt_enabled()) {
+            const char* active_mode = early_write_mode ? "early-write"
+                : wide_copy_mode ? "wide-copy"
+                : vr->is_native_stereo_fix_right_eye_shadows_precise_per_view_write_once_enabled() ? "per-view-write-once"
+                : vr->is_native_stereo_fix_right_eye_shadows_precise_write_once_enabled() ? "write-once"
+                : vr->is_native_stereo_fix_right_eye_shadows_precise_enabled() ? "normal"
+                : "none";
+            sceneview_xref::log_shadow_cache_key_hunt(pass2_view, active_mode);
+        }
+
         g_hook->m_render_module_begin_render_viewfamily_hook.unsafe_call<void>(render_module, canvas, view_family_candidate);
         const auto pass2_render_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - pass2_render_start).count();
 
@@ -11665,8 +13093,29 @@ void FFakeStereoRenderingHook::begin_render_viewfamily_real(
         // collapse (which stereo4.txt showed can take 7-10+ seconds to fully settle) can be seen.
         if (vr->diag_nsf_flicker_burst_capture()) {
             static uint32_t s_burst_frames_remaining = 0;
+            // DIAG (neighborhood/cache-key hypothesis): in addition to the known +0xC90/+0x1A0
+            // dwords, snapshot a wider window around +0x1A0 (the "cached copy" field - see
+            // apply_precise_shadow_fix comment) every burst frame and diff it against the previous
+            // frame's window. If any nearby dword (a ViewUniqueID/generation counter/shadow-cache
+            // key the engine keeps beside its cached StereoPass copy) is flipping in lockstep with
+            // our write/restore, this will show it rising/falling exactly once per frame instead of
+            // drifting with camera motion like the matrix/pose fields do.
+            constexpr uint32_t neighborhood_lo = 0x1A0 >= 0x40 ? 0x1A0 - 0x40 : 0;
+            constexpr uint32_t neighborhood_hi = 0x1A0 + 0x40;
+            static uint32_t s_prev_neighborhood[(neighborhood_hi - neighborhood_lo) / sizeof(uint32_t)]{};
+            static bool s_have_prev_neighborhood = false;
+            // DIAG: explicit per-frame write/restore/mode bookkeeping for this burst, so the exact
+            // moment restore does/doesn't run (no-restore / write-once / normal) is visible on the
+            // same timeline as the raw c90/1a0/neighborhood values, instead of relying on the
+            // separate counters logged elsewhere.
+            const bool burst_write_once_mode = vr->is_native_stereo_fix_right_eye_shadows_precise_write_once_enabled();
+            const bool burst_no_restore_mode = vr->is_native_stereo_fix_right_eye_shadows_precise_no_restore_enabled();
+            const bool burst_write_applied_this_frame = precise_shadow_fix_restore.size() == 2;
+            const bool burst_restore_will_run_this_frame = burst_write_applied_this_frame && !burst_no_restore_mode;
+
             if (s_burst_frames_remaining == 0) {
                 s_burst_frames_remaining = 900;
+                s_have_prev_neighborhood = false;
             }
 
             if (pass1_view != nullptr && pass2_view != nullptr &&
@@ -11683,12 +13132,34 @@ void FFakeStereoRenderingHook::begin_render_viewfamily_real(
                     fields_str += fmt::format("F{}={:x}:{}->{} ", f.id, f.offset, live_left, live_right);
                 }
 
-                SPDLOG_INFO("[VR][DIAG][NSF-FLICKER-BURST] frame={} c90 before={} after={} | 1a0 before={} after={} | live_fields: {}",
-                    g_frame_count, pass2_c90_before, pass2_c90_after, pass2_1a0_before, pass2_1a0_after, fields_str);
+                SPDLOG_INFO("[VR][DIAG][NSF-FLICKER-BURST] frame={} write_once_mode={} no_restore_mode={} write_applied={} restore_will_run={} | "
+                    "c90 before={} after={} | 1a0 before={} after={} | live_fields: {}",
+                    g_frame_count, burst_write_once_mode, burst_no_restore_mode, burst_write_applied_this_frame, burst_restore_will_run_this_frame,
+                    pass2_c90_before, pass2_c90_after, pass2_1a0_before, pass2_1a0_after, fields_str);
+
+                auto* p_neighborhood = (const uint8_t*)pass2_view + neighborhood_lo;
+                if (!IsBadReadPtr(p_neighborhood, neighborhood_hi - neighborhood_lo)) {
+                    uint32_t current_neighborhood[(neighborhood_hi - neighborhood_lo) / sizeof(uint32_t)];
+                    std::memcpy(current_neighborhood, p_neighborhood, sizeof(current_neighborhood));
+
+                    if (s_have_prev_neighborhood) {
+                        for (size_t i = 0; i < std::size(current_neighborhood); ++i) {
+                            if (current_neighborhood[i] == s_prev_neighborhood[i]) continue;
+                            const auto offset = neighborhood_lo + i * sizeof(uint32_t);
+                            SPDLOG_INFO("[VR][DIAG][NSF-FLICKER-BURST-NEIGHBORHOOD] frame={} +{:04x} prev={:08x} curr={:08x}{}",
+                                g_frame_count, offset, s_prev_neighborhood[i], current_neighborhood[i],
+                                (offset == 0xC90 || offset == 0x1A0) ? " [known field]" : "");
+                        }
+                    }
+
+                    std::memcpy(s_prev_neighborhood, current_neighborhood, sizeof(s_prev_neighborhood));
+                    s_have_prev_neighborhood = true;
+                }
             }
 
             if (--s_burst_frames_remaining == 0) {
                 vr->diag_nsf_flicker_burst_capture() = false;
+                s_have_prev_neighborhood = false;
                 SPDLOG_INFO("[VR][DIAG] NSF flicker burst capture complete");
             }
         }
@@ -12423,6 +13894,58 @@ bool FFakeStereoRenderingHook::setup_view_extensions() try {
         if (exception->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
             const auto exception_address = exception->ContextRecord->Rip;
 
+            // DIAG: unconditional, always-on trace of every access violation this handler ever sees,
+            // logged before any gating (module checks, IsBadReadPtr, ignored_addresses, etc.) below.
+            // Added after a fatal crash (EXCEPTION_ACCESS_VIOLATION reading 0x400000031, RHIThread)
+            // produced ZERO [Exception Handler] log lines anywhere near it, despite the same handler
+            // successfully recovering several unrelated faults earlier in the same session. That means
+            // either this handler never saw the fault at all (e.g. another, earlier-registered VEH
+            // returned EXCEPTION_CONTINUE_EXECUTION/stopped the search first, or the fault occurred on
+            // a thread/in a context where this handler was not reached), or it saw it but every
+            // existing log statement sits behind a gate (is_game_exe, decode success, etc.) that this
+            // particular fault didn't pass. This line has no gate at all, so its presence/absence in the
+            // next repro is itself the diagnostic: if it's still missing, the fault is bypassing this
+            // VEH entirely and the problem is elsewhere (e.g. a crash inside a thread this VEH isn't
+            // installed for, or SetUnhandledExceptionFilter/crash-reporter beating us to it).
+            {
+                const auto diag_mod = utility::get_module_within((void*)exception_address);
+                const auto diag_mod_path = diag_mod.has_value() ? utility::get_module_path(*diag_mod).value_or("<unknown>") : std::string{"<no module>"};
+                const auto& diag_info = *exception->ExceptionRecord;
+                const auto diag_fault_addr = diag_info.NumberParameters >= 2 ? diag_info.ExceptionInformation[1] : 0;
+                const bool diag_is_write = diag_info.NumberParameters >= 1 && diag_info.ExceptionInformation[0] == 1;
+                const bool diag_is_game_exe = diag_mod_path.find("-Win64-Shipping") != std::string::npos;
+
+                SPDLOG_ERROR("[Exception Handler] [DIAG] [VEH-ENTRY] AV seen: rip={:x} module='{}' fault_addr={:x} is_write={} tid={}",
+                    exception_address, diag_mod_path, diag_fault_addr, diag_is_write, GetCurrentThreadId());
+
+                // CRASH-SAFETY: spdlog's flush_on(info)/flush_every only calls the CRT's fflush(), which
+                // pushes buffered bytes into the OS file cache but does NOT guarantee they survive an
+                // abrupt process kill before the OS has actually committed them to disk. We observed a
+                // session where the log file was truncated mid-line at the exact moment of a fatal crash,
+                // meaning the single most important log line (the one for the actual fatal fault) can be
+                // lost even though this handler ran and attempted to log it. For faults in the game's own
+                // exe specifically (the ones most likely to be the fatal, unrecoverable one), also write a
+                // minimal line through a raw Win32 file handle with FlushFileBuffers() to force a true
+                // disk-level flush, bypassing spdlog's buffering entirely. Kept separate from the main
+                // spdlog call (not a replacement) and gated to game-exe-only so the very frequent, benign
+                // KERNEL32 IsBadReadPtr-style probe faults seen in every session don't thrash the disk.
+                if (diag_is_game_exe) {
+                    const auto durable_path = Framework::get_persistent_dir("veh_durable.txt").string();
+                    const auto handle = CreateFileA(durable_path.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                        nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+
+                    if (handle != INVALID_HANDLE_VALUE) {
+                        const auto durable_line = fmt::format("[VEH-ENTRY-DURABLE] rip={:x} module='{}' fault_addr={:x} is_write={} tid={}\r\n",
+                            exception_address, diag_mod_path, diag_fault_addr, diag_is_write, GetCurrentThreadId());
+
+                        DWORD written{};
+                        WriteFile(handle, durable_line.data(), (DWORD)durable_line.size(), &written, nullptr);
+                        FlushFileBuffers(handle);
+                        CloseHandle(handle);
+                    }
+                }
+            }
+
             // TARGETED DIAGNOSTIC: dump a disassembly/context window around the known crash rva family
             // (0x23e1f889 and its observed derivatives 0x23e1f90e / 0x23e1f91a / 0x23e2aa86, ...) the very
             // first time each such rva is hit. This runs BEFORE the generalized recovery below (which just
@@ -13153,6 +14676,35 @@ bool FFakeStereoRenderingHook::setup_view_extensions() try {
 
                                 ctx->Rip = resume_addr;
                                 return EXCEPTION_CONTINUE_EXECUTION;
+                            }
+                        }
+
+                        // DIAG FALLBACK: none of the known recovery shapes above (load-MOV, CMP/TEST,
+                        // store-MOV) matched this instruction, so the fault is about to fall through
+                        // completely unhandled with zero trace of why - exactly the "instant silent
+                        // crash with no [Exception Handler] log lines at all" failure mode reported
+                        // alongside e.g. rva 375e51d (a WRITE access violation one base-size off the
+                        // precheck's expectations). Log the raw decode/operand shape once per rva so a
+                        // future recovery branch can be added for it with real evidence instead of
+                        // guessing blind from a minidump alone.
+                        if (decoded_precheck) {
+                            static std::unordered_set<uintptr_t> warned_unhandled_rvas{};
+                            const auto ex_rva = exception_address - (uintptr_t)*ex_mod_precheck;
+
+                            if (warned_unhandled_rvas.insert(ex_rva).second) {
+                                char txt[256]{};
+                                NdToText(&*decoded_precheck, exception_address, sizeof(txt), txt);
+
+                                const auto& info = *exception->ExceptionRecord;
+                                const bool is_write = info.ExceptionCode == EXCEPTION_ACCESS_VIOLATION &&
+                                    info.NumberParameters >= 1 && info.ExceptionInformation[0] == 1;
+
+                                SPDLOG_ERROR("[Exception Handler] [DIAG] [UNHANDLED] game-exe fault at rva {:x} did not match any known "
+                                            "recovery shape (mnemonic='{}' operands={} op0_type={} op1_type={} is_write={})",
+                                    ex_rva, txt, (int)decoded_precheck->OperandsCount,
+                                    (int)decoded_precheck->Operands[0].Type,
+                                    decoded_precheck->OperandsCount >= 2 ? (int)decoded_precheck->Operands[1].Type : -1,
+                                    is_write);
                             }
                         }
                     }
@@ -15348,11 +16900,12 @@ void FFakeStereoRenderingHook::init_canvas(FFakeStereoRendering* stereo, sdk::FS
                 return;
             }
         }
-    }
 
-    //*(Matrix4x4f*)((uintptr_t)view + fsceneview_viewproj_offset) = VR::get()->get_projection_matrix(VRRuntime::Eye::LEFT);
-    *(Matrix4x4f*)((uintptr_t)canvas + ucanvas_viewproj_offset) = *(Matrix4x4f*)((uintptr_t)view + fsceneview_viewproj_offset);
-}
+            }
+
+            //*(Matrix4x4f*)((uintptr_t)view + fsceneview_viewproj_offset) = VR::get()->get_projection_matrix(VRRuntime::Eye::LEFT);
+            *(Matrix4x4f*)((uintptr_t)canvas + ucanvas_viewproj_offset) = *(Matrix4x4f*)((uintptr_t)view + fsceneview_viewproj_offset);
+        }
 
 uint32_t FFakeStereoRenderingHook::get_desired_number_of_views_hook(FFakeStereoRendering* stereo, bool is_stereo_enabled) {
 #ifdef FFAKE_STEREO_RENDERING_LOG_ALL_CALLS
@@ -15381,7 +16934,7 @@ uint32_t FFakeStereoRenderingHook::get_desired_number_of_views_hook(FFakeStereoR
         return 1;
     }
 
-    if (vr->is_native_stereo_fix_enabled() && !vr->should_mirror_right_eye_this_frame()) {
+    if (vr->is_native_stereo_fix_enabled()) {
         auto rtm = g_hook->get_render_target_manager();
 
         // This vfunc runs every frame even when begin_render_viewfamily_real is not reached (e.g. the
@@ -17305,19 +18858,17 @@ bool VRRenderTargetManager_Base::is_scene_capture_world_stale() const {
 }
 
 void VRRenderTargetManager_Base::destroy_scene_capture() try {
-    // Only bump the generation counter if there is actually something to tear down. destroy_scene_capture()
-    // is also called routinely as a no-op "is there anything to clean up" check (observed firing every
-    // few milliseconds even with nothing allocated), and unconditionally bumping on every call there would
-    // invalidate a newly-enqueued creation job's captured generation before its async render/RHI/game-thread
-    // handoff chain can ever complete, permanently preventing the scene capture from ever finishing.
-    const bool has_something_to_tear_down = this->scene_capture_actor != nullptr || this->in_flight_target != nullptr ||
-        this->scene_capture_target.valid() || this->scene_capture_target_rhi_thread.valid();
-
-    if (has_something_to_tear_down) {
-        // Invalidate any in-flight async scene-capture creation jobs (render/RHI/game-thread) BEFORE doing
-        // anything else, so they can bail out on their next generation check instead of racing this
-        // teardown and dereferencing a target we are about to drop our reference to.
-        this->scene_capture_generation.fetch_add(1, std::memory_order_relaxed);
+    // Fast no-op path: callers like begin_render_viewfamily_real's "NSF off"/suspended early-exit
+    // call this unconditionally on EVERY frame regardless of whether there's anything to tear down.
+    // Once the actor/component/target have already been cleared (the common steady-state case while
+    // NSF is suspended across a level transition), skip the logging/field-clearing work entirely
+    // instead of repeating it dozens of times per second - this was observed spamming identical
+    // "scene_capture_actor=0" log lines continuously during a menu->game transition. Purely a
+    // cleanliness/perf fix - a null scene_capture_actor here was already fully inert.
+    if (this->scene_capture_actor == nullptr && this->scene_capture_component == nullptr &&
+        this->scene_capture_target == nullptr && this->scene_capture_world == nullptr &&
+        this->in_flight_target == nullptr) {
+        return;
     }
 
     const auto current_generation = g_hook != nullptr ? g_hook->get_view_target_generation() : 0;
@@ -17326,50 +18877,21 @@ void VRRenderTargetManager_Base::destroy_scene_capture() try {
 
     if (this->scene_capture_actor != nullptr && this->in_flight_target == nullptr) {
         // IMPORTANT: destroy_actor() forces an IMMEDIATE, synchronous teardown of the scene capture
-        // actor/render-target resource. wait_for_scene_capture_copies() below only flushes OUR OWN
+        // actor/render-target resource. wait_for_scene_capture_copies() only flushes OUR OWN
         // compositor copy commands against that resource - it has no visibility into the game
         // engine's own in-flight RHI/RenderThread command lists that may still be referencing the
         // exact same render target during a real level transition (e.g. menu -> game world at ~31%
         // load). Forcing destroy_actor() in that window has been confirmed (in-headset testing) to
         // race the engine's own ResourceBarrier calls and crash purely inside
         // nvwgf2umx.dll/D3D12Core.dll with no UEVR frames in the stack, even with the GPU-copy wait
-        // in place. That forced teardown is only actually necessary very early at startup, to unblock
-        // the very first scene-capture creation before any real engine rendering has had a chance to
-        // begin (i.e. before the game has ever reached its running state). Once the game has run
-        // normally at least once, prefer the safe path: drop our references and let the actor/
-        // component be collected naturally by their owning world's own GC pass (they are
-        // intentionally never rooted - see create_scene_capture()), instead of forcing a synchronous
-        // destroy that can race the engine's teardown of the same world.
-        const bool game_has_run_before = g_framework != nullptr && g_framework->is_game_data_intialized();
-
-        if (!game_has_run_before) {
-            SPDLOG_INFO("Destroying scene capture! (pre-startup hard path)");
-
-            // SAFETY: the GPU can still have in-flight command lists referencing this scene capture's
-            // render target resource (e.g. a queued but not-yet-retired ResourceBarrier/copy from the
-            // compositor) at the exact moment the engine tears this actor/component down underneath us.
-            // Destroying the actor releases the engine's owning reference to the render target
-            // resource, and if the GPU is still mid-flight against it when that happens, the resource's
-            // underlying D3D12 object can be freed while still enqueued for use. Flush outstanding
-            // scene-capture-related GPU work first so the resource is not released while the GPU might
-            // still be using it.
-            if (g_framework != nullptr && !g_framework->is_dx11()) {
-                try {
-                    VR::get()->d3d12().wait_for_scene_capture_copies();
-                } catch (...) {
-                    SPDLOG_WARN("[VRRenderTargetManager] Exception while waiting for scene capture GPU copies before actor destruction, proceeding anyway");
-                }
-            }
-
-            if (this->scene_capture_actor.valid()) {
-                // Actor/component are intentionally never rooted (see create_scene_capture()), so no
-                // remove_from_root() call is needed here - they're free to be collected normally by
-                // their owning world's GC pass if we don't get here first.
-                this->scene_capture_actor->destroy_actor();
-            }
-        } else {
-            SPDLOG_INFO("Destroying scene capture! (post-startup soft path, deferring to engine GC - not forcing destroy_actor())");
-        }
+        // in place. create_scene_capture() always spawns a brand new actor unconditionally and never
+        // depends on the previous actor having actually been destroyed yet, so there is no need to
+        // force a synchronous destroy even on the very first creation. Always prefer the safe path:
+        // drop our references and let the actor/component be collected naturally by their owning
+        // world's own GC pass (they are intentionally never rooted - see create_scene_capture()),
+        // instead of forcing a synchronous destroy that can race the engine's own RHI/RenderThread
+        // work against the same resource.
+        SPDLOG_INFO("Destroying scene capture! (soft path, deferring to engine GC - not forcing destroy_actor())");
     }
 
     if (this->in_flight_target == nullptr) {
@@ -17701,6 +19223,35 @@ bool VRRenderTargetManager_Base::create_scene_capture() try {
                     "right eye may render in the wrong (pre-tonemap HDR) color space");
     }
 
+    // DIAG/FIX: FEngineShowFlags is a flat bitfield (each show flag = one specific bit index,
+    // consistent across this engine's build) that independently gates whole rendering features
+    // PER VIEW/CAPTURE - including dynamic shadows and shadow cascades. The scene capture used for
+    // the right eye has its OWN FEngineShowFlags, separate from the main view's, and if it was
+    // never explicitly synced it may differ from the main view's defaults. This is a direct,
+    // authoritative read of the actual gating condition - not an inference from byte-offset
+    // probing - so if DynamicShadows (bit 23 in FEngineShowFlags as of this engine's layout, same
+    // as stock UE4/5) is clear here, that alone fully explains why the cascade-setup call chain we
+    // traced never executes for the right eye at all.
+    if (auto* show_flags = this->scene_capture_component->get_engine_show_flags(); show_flags != nullptr) {
+        constexpr uint64_t SF_DynamicShadows_Bit = 23;
+        constexpr uint64_t SF_DynamicShadows_Mask = 1ull << SF_DynamicShadows_Bit;
+
+        const auto before = *show_flags;
+        const bool dynamic_shadows_was_on = (before & SF_DynamicShadows_Mask) != 0;
+
+        SPDLOG_INFO("[VRRenderTargetManager][DIAG] Scene capture EngineShowFlags raw={:#018x} DynamicShadows_bit{}={}",
+            before, SF_DynamicShadows_Bit, dynamic_shadows_was_on);
+
+        if (!dynamic_shadows_was_on) {
+            *show_flags = before | SF_DynamicShadows_Mask;
+            SPDLOG_INFO("[VRRenderTargetManager][FIX] Scene capture DynamicShadows was OFF - forced on. raw={:#018x} -> {:#018x}",
+                before, *show_flags);
+        }
+    } else {
+        SPDLOG_WARN("[VRRenderTargetManager] get_engine_show_flags() returned null - cannot verify/fix "
+                    "scene capture DynamicShadows flag");
+    }
+
     // DIAG: dump the capture component's OWN PostProcessSettings/blend-weight at creation time.
     // Even with CaptureSource now forcing a tonemapped/exposed LDR output, the capture component
     // has its own independent PostProcessSettings struct/BlendWeight (separate from the main
@@ -17798,14 +19349,10 @@ bool VRRenderTargetManager_Base::create_scene_capture() try {
     // DIAG A/B: see VR::is_diag_nsf_persist_rendering_state_disabled(). Lets us test whether forcing
     // this persisted-state flag (vs. leaving the engine default) is itself contributing to the
     // NSF-only bilateral dark overlay/flicker, without touching the rest of the capture setup.
-    const bool diag_disable_persist = VR::get() != nullptr && VR::get()->is_diag_nsf_persist_rendering_state_disabled();
-
+    // DIAG A/B RESULT: forcing bAlwaysPersistRenderingState=false did NOT fix the dark overlay/
+    // flicker (confirmed via live log), so this flag is restored to true (normal/required behavior).
     if (auto always_persist = scene_capture_c->find_property(L"bAlwaysPersistRenderingState"); always_persist != nullptr) {
-        *always_persist->get_data<bool>(this->scene_capture_component) = !diag_disable_persist;
-
-        if (diag_disable_persist) {
-            SPDLOG_INFO("[DIAG] bAlwaysPersistRenderingState forced to false on scene capture (diag_nsf_disable_persist_rendering_state=true)");
-        }
+        *always_persist->get_data<bool>(this->scene_capture_component) = true;
     } else {
         SPDLOG_WARN("[VRRenderTargetManager] bAlwaysPersistRenderingState property not found on USceneCaptureComponent2D - "
                     "wind/shadow/LOD desync between eyes may persist");
@@ -17868,19 +19415,10 @@ bool VRRenderTargetManager_Base::create_scene_capture() try {
     // Enqueue offset lookup on the render thread because that's when the resource is actually created.
     if (!already_updated) {
         this->in_flight_target = tgt;
-        const auto captured_generation = this->scene_capture_generation.load(std::memory_order_relaxed);
 
         // Repeats every render loop for 5 seconds, times out if the texture is not created.
-        RenderThreadWorker::ConditionalJobFunc render_thread_conditional_task = [this, tgt, captured_generation]() -> bool {
+        RenderThreadWorker::ConditionalJobFunc render_thread_conditional_task = [this, tgt]() -> bool {
             try {
-                // Bail out immediately if destroy_scene_capture() ran since this job was enqueued, even
-                // if tgt.valid() hasn't caught up yet - see scene_capture_generation's declaration for why
-                // this is necessary on top of the tgt.valid() check below.
-                if (this->scene_capture_generation.load(std::memory_order_relaxed) != captured_generation) {
-                    SPDLOG_WARN("Scene capture generation changed, aborting stale offset-lookup job!");
-                    return true;
-                }
-
                 if (!tgt.valid()) {
                     SPDLOG_ERROR("Scene capture target was destroyed between threads!");
                     GameThreadWorker::get().enqueue([this]() -> void {
@@ -17907,8 +19445,8 @@ bool VRRenderTargetManager_Base::create_scene_capture() try {
     
                             hook_frt(frt);
 
-                            RHIThreadWorker::get().enqueue([this, tgt, captured_generation]() -> void {
-                                if (this->scene_capture_generation.load(std::memory_order_relaxed) != captured_generation || !tgt.valid()) {
+                            RHIThreadWorker::get().enqueue([this, tgt]() -> void {
+                                if (!tgt.valid()) {
                                     SPDLOG_ERROR("Scene capture target was destroyed between threads!");
                                     this->scene_capture_target_rhi_thread = nullptr;
                                     return;
@@ -17917,8 +19455,8 @@ bool VRRenderTargetManager_Base::create_scene_capture() try {
                                 this->scene_capture_target_rhi_thread = tgt;
                             });
 
-                            GameThreadWorker::get().enqueue([this, tgt, captured_generation]() -> void {
-                                if (this->scene_capture_generation.load(std::memory_order_relaxed) != captured_generation || !tgt.valid()) {
+                            GameThreadWorker::get().enqueue([this, tgt]() -> void {
+                                if (!tgt.valid()) {
                                     SPDLOG_ERROR("Scene capture target was destroyed between threads!");
                                     this->in_flight_target = nullptr;
                                     destroy_scene_capture();
@@ -17982,18 +19520,9 @@ bool VRRenderTargetManager_Base::create_scene_capture() try {
         SPDLOG_INFO("Waiting for scene capture texture to be created...");
     } else {
         this->in_flight_target = tgt;
-        const auto captured_generation = this->scene_capture_generation.load(std::memory_order_relaxed);
 
-        RenderThreadWorker::ConditionalJobFunc render_thread_conditional_task = [this, tgt, captured_generation]() -> bool {
+        RenderThreadWorker::ConditionalJobFunc render_thread_conditional_task = [this, tgt]() -> bool {
             try {
-                // Bail out immediately if destroy_scene_capture() ran since this job was enqueued, even
-                // if tgt.valid() hasn't caught up yet - critical here because this branch runs when the
-                // offset is already cached and therefore skips FTexture/UTexture's own SEH-guarded scan.
-                if (this->scene_capture_generation.load(std::memory_order_relaxed) != captured_generation) {
-                    SPDLOG_WARN("Scene capture generation changed, aborting stale offset-lookup job!");
-                    return true;
-                }
-
                 if (!tgt.valid()) {
                     SPDLOG_ERROR("Scene capture target was destroyed between threads!");
                     GameThreadWorker::get().enqueue([this]() -> void {
@@ -18016,8 +19545,8 @@ bool VRRenderTargetManager_Base::create_scene_capture() try {
 
                 hook_frt(frt);
 
-                RHIThreadWorker::get().enqueue([this, tgt, captured_generation]() -> void {
-                    if (this->scene_capture_generation.load(std::memory_order_relaxed) != captured_generation || !tgt.valid()) {
+                RHIThreadWorker::get().enqueue([this, tgt]() -> void {
+                    if (!tgt.valid()) {
                         SPDLOG_ERROR("Scene capture target was destroyed between threads!");
                         this->scene_capture_target_rhi_thread = nullptr;
                         return;
@@ -18026,8 +19555,8 @@ bool VRRenderTargetManager_Base::create_scene_capture() try {
                     this->scene_capture_target_rhi_thread = tgt;
                 });
 
-                GameThreadWorker::get().enqueue([this, tgt, captured_generation]() -> void {
-                    if (this->scene_capture_generation.load(std::memory_order_relaxed) != captured_generation || !tgt.valid()) {
+                GameThreadWorker::get().enqueue([this, tgt]() -> void {
+                    if (!tgt.valid()) {
                         SPDLOG_ERROR("Scene capture target was destroyed between threads!");
                         this->in_flight_target = nullptr;
                         destroy_scene_capture();

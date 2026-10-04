@@ -983,11 +983,46 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
             // refcount regardless of the engine discarding its own handle to it. So keep presenting
             // the last-known-good scene capture texture (stale stereo, not mirrored/duplicated) until
             // the new one is bound below, instead of forcing a same-image-both-eyes frame.
-            SPDLOG_INFO("[VR][DIAG] Scene capture RT went null while m_scene_capture_tex was bound (was={:x}, generation={}) - "
-                "keeping last-known-good scene capture texture until a new one is bound (avoids right-eye mirror/diplopia). "
-                "NOTE: if a composite/submit log below shows this same generation while a reallocation has already bumped the "
-                "generation counter further, that is a candidate stale-texture-across-reallocation race for single-image ghosting.",
-                (uintptr_t)m_scene_capture_tex.texture.Get(), view_target_generation);
+            //
+            // SAFETY: during a pathological level-transition storm (observed: create_scene_capture()
+            // retried every ~10ms while refused by its 3s cooldown, with scene_capture_rt flapping
+            // null/valid every frame at the SAME generation for 100+ consecutive frames) holding onto
+            // this ComPtr indefinitely is no longer safe. Our ComPtr only keeps OUR reference alive -
+            // it cannot stop the engine itself from having already torn down/invalidated its own
+            // FTextureRenderTargetResource and released the underlying D3D12 object through its own
+            // ref-counting, independent of ours. Continuing to composite (copy/UAV) against that
+            // texture, or leaving the engine to later recreate GPU views against a resource in that
+            // state, has been observed to crash purely inside nvwgf2umx.dll/D3D12Core.dll (e.g.
+            // CreateUnorderedAccessView) on the RHIThread. Cap how long we tolerate a continuously
+            // null scene_capture_rt before giving up on the stale texture and forcing a full reset,
+            // falling back to mirror/black compositing until a new, stable generation is bound.
+            static constexpr uint32_t max_consecutive_null_frames = 30;
+
+            if (view_target_generation != m_scene_capture_stale_generation) {
+                m_scene_capture_stale_generation = view_target_generation;
+                m_scene_capture_consecutive_null_frames = 0;
+            }
+
+            ++m_scene_capture_consecutive_null_frames;
+
+            if (m_scene_capture_consecutive_null_frames > max_consecutive_null_frames) {
+                SPDLOG_WARN("[VR][DIAG] Scene capture RT has been continuously null for {} frames at generation={} (bound_tex={:x}) - "
+                    "giving up on stale texture and forcing a full reset to avoid compositing/GPU-view creation against a "
+                    "resource the engine may have already torn down.",
+                    m_scene_capture_consecutive_null_frames, view_target_generation, (uintptr_t)m_scene_capture_tex.texture.Get());
+                wait_for_scene_capture_copies();
+                m_scene_capture_tex.reset();
+                m_scene_capture_consecutive_null_frames = 0;
+            } else {
+                SPDLOG_INFO("[VR][DIAG] Scene capture RT went null while m_scene_capture_tex was bound (was={:x}, generation={}, "
+                    "consecutive_null_frames={}) - keeping last-known-good scene capture texture until a new one is bound "
+                    "(avoids right-eye mirror/diplopia). NOTE: if a composite/submit log below shows this same generation while "
+                    "a reallocation has already bumped the generation counter further, that is a candidate stale-texture-across-"
+                    "reallocation race for single-image ghosting.",
+                    (uintptr_t)m_scene_capture_tex.texture.Get(), view_target_generation, m_scene_capture_consecutive_null_frames);
+            }
+        } else {
+            m_scene_capture_consecutive_null_frames = 0;
         }
 
         // DIAG: feed the stall tracker so on_pre_engine_tick's manual marker key and the in-headset
@@ -1268,6 +1303,61 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
                     } else {
                         SPDLOG_WARN("[VR][DIAG][MENU-RIGHT-EYE-PIXELS] DEST render_target RIGHT-EYE CENTER pixel sample (#{}): FAILED to sample.", s_diag_menu_pixel_sample_count);
                     }
+                }
+
+                // DIAG NSF-RIGHT-EYE-FLICKER-TRACE: gated behind the same toggle as the other NSF
+                // scene-capture diagnostics (is_diag_nsf_scene_capture_live_state_trace_enabled()).
+                // Unlike the throttled MENU-RIGHT-EYE-PIXELS sampling above (10/sec max, meant for
+                // settings verification), this runs EVERY frame the right-eye copy executes, because
+                // the reported artifact is a flicker/ghosting that can change multiple times per
+                // second - a throttled sampler can easily straddle/miss the actual transition. It
+                // tracks three independent signals so the three leading hypotheses (brightness
+                // flicker vs. stale/ghosted frame reuse vs. copy-path-introduced darkness) can be
+                // distinguished directly from the log instead of inferred:
+                //   1) frame-over-frame luminance delta of the SOURCE scene_capture_tex - a large
+                //      swing between consecutive samples is a direct signature of visible flicker.
+                //   2) whether the underlying scene_capture_tex resource pointer is identical to the
+                //      previous frame's - if the same resource is composited for several consecutive
+                //      frames while the game is presumably rendering new content, that is a stale/
+                //      ghosted-frame bug rather than a lighting/exposure bug.
+                //   3) SOURCE vs DEST luminance delta on frames where both samples are taken - if the
+                //      source is bright but the destination (post copy_region) is dark, the darkening
+                //      is introduced by our own composite step, not upstream in the scene capture.
+                if (vr->is_diag_nsf_scene_capture_live_state_trace_enabled()) {
+                    static ID3D12Resource* s_last_flicker_resource = nullptr;
+                    static float s_last_flicker_luminance = -1.0f;
+                    static uint32_t s_flicker_same_resource_streak = 0;
+                    static uint32_t s_flicker_sample_count = 0;
+
+                    ID3D12Resource* const current_resource = m_scene_capture_tex.texture.Get();
+                    const bool same_resource_as_last_frame = (current_resource == s_last_flicker_resource);
+                    s_flicker_same_resource_streak = same_resource_as_last_frame ? (s_flicker_same_resource_streak + 1) : 0;
+
+                    const auto flicker_center_x = scene_capture_desc.Width > 32 ? (uint32_t)scene_capture_desc.Width / 2 - 16 : 0;
+                    const auto flicker_center_y = scene_capture_desc.Height > 32 ? (uint32_t)scene_capture_desc.Height / 2 - 16 : 0;
+                    const auto flicker_src_sample = diag_sample_texture(device, command_queue, current_resource, D3D12_RESOURCE_STATE_RENDER_TARGET, flicker_center_x, flicker_center_y);
+
+                    if (flicker_src_sample.succeeded) {
+                        const float luminance_delta = (s_last_flicker_luminance >= 0.0f) ? (flicker_src_sample.avg_luminance - s_last_flicker_luminance) : 0.0f;
+
+                        const auto flicker_dst_center_x = dst_eye_width + (dst_eye_width > 32 ? dst_eye_width / 2 - 16 : 0);
+                        const auto flicker_dst_center_y = dst_eye_height > 32 ? dst_eye_height / 2 - 16 : 0;
+                        const auto flicker_dst_sample = diag_sample_texture(device, command_queue, render_target, D3D12_RESOURCE_STATE_RENDER_TARGET, flicker_dst_center_x, flicker_dst_center_y);
+                        const float src_dst_delta = flicker_dst_sample.succeeded ? (flicker_dst_sample.avg_luminance - flicker_src_sample.avg_luminance) : 0.0f;
+
+                        SPDLOG_INFO("[VR][DIAG][NSF-RIGHT-EYE-FLICKER-TRACE] #{} frame={} resource={:x} same_resource_as_last_frame={} same_resource_streak={} "
+                            "src_luminance={:.2f} luminance_delta_vs_prev={:+.2f} dst_luminance={} src_dst_delta={:+.2f}",
+                            s_flicker_sample_count, vr->m_render_frame_count, (uintptr_t)current_resource,
+                            same_resource_as_last_frame, s_flicker_same_resource_streak,
+                            flicker_src_sample.avg_luminance, luminance_delta,
+                            flicker_dst_sample.succeeded ? fmt::format("{:.2f}", flicker_dst_sample.avg_luminance) : std::string("N/A"),
+                            src_dst_delta);
+
+                        s_last_flicker_luminance = flicker_src_sample.avg_luminance;
+                    }
+
+                    s_last_flicker_resource = current_resource;
+                    ++s_flicker_sample_count;
                 }
             } else {
                 // Wrap the destination render target so render_srv_to_rtv can target it directly.
@@ -2069,16 +2159,12 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
                 constexpr uint64_t kSceneCaptureStallMirrorFallbackMs = 100;
                 const bool stall_too_long = ffsr->get_scene_capture_stall_duration_ms() >= kSceneCaptureStallMirrorFallbackMs;
                 // using_mirror is true whenever there is no scene capture texture to source the right
-                // eye from (this happens both when NSF's own mirror fallback / auto-mirror-on-cinematic
-                // is engaged, and transiently on boot/level-transition before a scene capture is bound),
-                // or when the scene capture has been stale for too long (see stall_too_long above).
+                // eye from (transiently on boot/level-transition before a scene capture is bound), or
+                // when the scene capture has been stale for too long (see stall_too_long above).
                 const bool using_mirror = m_scene_capture_tex.texture.Get() == nullptr || stall_too_long;
-                // Distinguish between "no scene capture yet" (transient/startup) and an explicit
-                // mirror request (manual toggle or cinematic auto-mirror), for clearer diagnostics.
-                const bool mirror_requested = vr->should_mirror_right_eye_this_frame();
                 if (using_mirror != s_diag_last_used_mirror) {
-                    SPDLOG_INFO("[VR][DIAG] NSF right-eye source changed: using_mirror={} -> {} (mirror_requested={}, stall_too_long={}, stall_ms={}, scene_capture_tex={:x}, frame_count={})",
-                        s_diag_last_used_mirror, using_mirror, mirror_requested, stall_too_long, ffsr->get_scene_capture_stall_duration_ms(),
+                    SPDLOG_INFO("[VR][DIAG] NSF right-eye source changed: using_mirror={} -> {} (stall_too_long={}, stall_ms={}, scene_capture_tex={:x}, frame_count={})",
+                        s_diag_last_used_mirror, using_mirror, stall_too_long, ffsr->get_scene_capture_stall_duration_ms(),
                         (uintptr_t)m_scene_capture_tex.texture.Get(), vr->m_render_frame_count);
                     s_diag_last_used_mirror = using_mirror;
                 }
@@ -2093,8 +2179,8 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
                     // AFR path below already does for its own mirror case.
                     static uint32_t s_diag_mirror_copy_count = 0;
                     if (vr->is_diag_verbose_logging_enabled() && (++s_diag_mirror_copy_count <= 10 || s_diag_mirror_copy_count % 300 == 1)) {
-                        SPDLOG_INFO("[VR][DIAG] NSF mirror-right-eye copy (#{}): mirror_requested={} backbuffer={}x{} frame_count={}",
-                            s_diag_mirror_copy_count, mirror_requested, m_backbuffer_size[0], m_backbuffer_size[1], vr->m_render_frame_count);
+                        SPDLOG_INFO("[VR][DIAG] NSF mirror-right-eye copy (#{}): backbuffer={}x{} frame_count={}",
+                            s_diag_mirror_copy_count, m_backbuffer_size[0], m_backbuffer_size[1], vr->m_render_frame_count);
                     }
                     m_openvr.copy_left_to_right(backbuffer.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET);
                 } else {
@@ -2535,6 +2621,10 @@ void D3D12Component::on_post_present(VR* vr) {
     if (vr->is_hmd_active()) {
         clear_backbuffer();
     }
+
+    // Age out and release any D3D12 resources that were torn down during a resize/reallocation.
+    // See DeferredResourceReleaser's declaration in D3D12Component.hpp for the full rationale.
+    m_deferred_resource_releaser.drain();
 }
 
 void D3D12Component::on_reset(VR* vr) {
@@ -2546,12 +2636,20 @@ void D3D12Component::on_reset(VR* vr) {
         wait_for_scene_capture_copies();
     }
 
-    for (auto& ctx : m_openvr.left_eye_tex) {
+    // Defer the actual release of a texture context's underlying ID3D12Resource instead of
+    // dropping it immediately: the engine's own RHIThread can still have commands recorded
+    // against it (see DeferredResourceReleaser's declaration in D3D12Component.hpp).
+    const auto defer_texture_ctx = [this](d3d12::TextureContext& ctx) {
+        m_deferred_resource_releaser.defer(ctx.texture);
         ctx.reset();
+    };
+
+    for (auto& ctx : m_openvr.left_eye_tex) {
+        defer_texture_ctx(ctx);
     }
 
     for (auto& ctx : m_openvr.right_eye_tex) {
-        ctx.reset();
+        defer_texture_ctx(ctx);
     }
 
     for (auto& commands : m_generic_commands) {
@@ -2563,17 +2661,19 @@ void D3D12Component::on_reset(VR* vr) {
     }
 
     for (auto& backbuffer : m_backbuffer_textures) {
-        backbuffer.reset();
+        if (backbuffer != nullptr) {
+            defer_texture_ctx(*backbuffer);
+        }
     }
 
     for (auto & screen : m_2d_screen_tex) {
-        screen.reset();
+        defer_texture_ctx(screen);
     }
 
-    m_openvr.ui_tex.reset();
-    m_game_ui_tex.reset();
-    m_game_tex.reset();
-    m_scene_capture_tex.reset();
+    defer_texture_ctx(m_openvr.ui_tex);
+    defer_texture_ctx(m_game_ui_tex);
+    defer_texture_ctx(m_game_tex);
+    defer_texture_ctx(m_scene_capture_tex);
 
     // m_stereo_dst_tex wraps a raw swapchain backbuffer pointer (see composite_afr_eye), so if we
     // don't release it here, it keeps an outstanding reference to the OLD swapchain buffer alive
@@ -3155,6 +3255,10 @@ void D3D12Component::OpenXR::destroy_swapchains() {
         //ctx.texture_contexts.clear();
         for (auto& texture_context : ctx.texture_contexts) {
             if (texture_context != nullptr) {
+                if (this->parent != nullptr) {
+                    this->parent->m_deferred_resource_releaser.defer(texture_context->texture);
+                }
+
                 texture_context->reset();
             }
         }

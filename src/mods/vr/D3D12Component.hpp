@@ -1,6 +1,9 @@
 #pragma once
 
+#include <array>
+#include <chrono>
 #include <span>
+#include <vector>
 
 #include <d3d12.h>
 #include <dxgi.h>
@@ -27,6 +30,7 @@ class D3D12Component {
 public:
     D3D12Component() 
         : m_openvr{this}
+        , m_openxr{this}
     {
 
     }
@@ -44,10 +48,65 @@ public:
     auto& openxr() { return m_openxr; }
     auto& get_openvr_ui_tex() { return m_openvr.ui_tex; }
 
+    template <typename T> using ComPtr = Microsoft::WRL::ComPtr<T>;
+
     // Exposed so callers tearing down a scene-capture actor/resource (e.g.
     // VRRenderTargetManager_Base::destroy_scene_capture) can flush outstanding GPU work against it
     // first, avoiding a release-while-in-flight race with the game's own D3D12 command lists.
     void wait_for_scene_capture_copies();
+
+    // A resize/reallocation (e.g. NSF turning off at a menu, which changes the view-target size)
+    // tears down and recreates our own D3D12 textures and OpenXR swapchains. wait_for_all_copies()/
+    // wait_for_scene_capture_copies() only fence UEVR's own D3D12 copy queue - they have no
+    // visibility into the game engine's own RHIThread, which pipelines several frames ahead of the
+    // game thread in Unreal. If RHIThread still has commands recorded against a resource we just
+    // released in place, it can later issue a ResourceBarrier/etc. against freed memory, causing an
+    // access violation deep in the driver/D3D12Core (observed: ResourceBarrier reading offset 0x88).
+    // Since there is no public hook to fence the engine's own queue, defer actual release of these
+    // resources instead, giving any in-flight RHIThread work recorded against them time to retire
+    // naturally before we drop the last reference.
+    //
+    // NOTE: A fixed small frame-count delay (e.g. "wait 5 presents") is NOT sufficient. During
+    // menu/level-load transitions RHIThread/the game thread can stall for multiple seconds (observed
+    // present stalls of 5+ seconds in crash logs) while our own present-driven drain() keeps ticking
+    // the ring forward, which can free a resource well before the engine's backlogged commands against
+    // it actually execute. Retention is therefore time-based (wall clock), not frame-count-based.
+    struct DeferredResourceReleaser {
+        // Conservative minimum retention: long enough to cover multi-second RHIThread/game-thread
+        // stalls observed during level/menu transitions, not just a handful of normal frames.
+        static constexpr std::chrono::milliseconds min_retention{3000};
+
+        struct Entry {
+            ComPtr<ID3D12Resource> resource{};
+            std::chrono::steady_clock::time_point queued_at{};
+        };
+
+        std::vector<Entry> entries{};
+        std::mutex mtx{};
+
+        // Queue a resource for release no sooner than min_retention from now.
+        void defer(ComPtr<ID3D12Resource> resource) {
+            if (resource == nullptr) {
+                return;
+            }
+
+            std::scoped_lock _{this->mtx};
+            this->entries.push_back(Entry{std::move(resource), std::chrono::steady_clock::now()});
+        }
+
+        // Call once per present/frame. Releases only entries that have aged past min_retention.
+        void drain() {
+            std::scoped_lock _{this->mtx};
+
+            const auto now = std::chrono::steady_clock::now();
+
+            std::erase_if(this->entries, [&](const Entry& entry) {
+                return (now - entry.queued_at) >= min_retention;
+            });
+        }
+    };
+
+    DeferredResourceReleaser m_deferred_resource_releaser{};
 
 private:
     bool setup();
@@ -59,8 +118,6 @@ private:
 
     void draw_spectator_view(ID3D12GraphicsCommandList* command_list, bool is_right_eye_frame);
     void clear_backbuffer();
-
-    template <typename T> using ComPtr = Microsoft::WRL::ComPtr<T>;
 
     ComPtr<ID3D12Resource> m_prev_backbuffer{};
     std::array<d3d12::CommandContext, 3> m_generic_commands{};
@@ -75,6 +132,14 @@ private:
     d3d12::TextureContext m_game_ui_tex{};
     d3d12::TextureContext m_game_tex{};
     d3d12::TextureContext m_scene_capture_tex{};
+
+    // Tracks how many consecutive frames (at the same view-target generation) the scene capture
+    // render target has been observed as null while m_scene_capture_tex was still bound, so we can
+    // cap how long we keep compositing against the stale texture before forcing a reset. See the
+    // usage site in draw_scene_capture_overlay (D3D12Component.cpp) for the full rationale.
+    uint64_t m_scene_capture_stale_generation{};
+    uint32_t m_scene_capture_consecutive_null_frames{};
+
     std::array<d3d12::CommandContext, 3> m_game_tex_commands{};
     std::array<d3d12::TextureContext, 2> m_2d_screen_tex{};
     std::vector<std::unique_ptr<d3d12::TextureContext>> m_backbuffer_textures{};
@@ -172,6 +237,8 @@ private:
     } m_openvr;
 
     struct OpenXR {
+        OpenXR(D3D12Component* p) : parent{p} {}
+
         void initialize(XrSessionCreateInfo& session_info);
         std::optional<std::string> create_swapchains();
         void destroy_swapchains();
@@ -220,6 +287,8 @@ private:
         std::recursive_mutex mtx{};
         std::array<uint32_t, 2> last_resolution{};
         bool made_depth_with_null_defaults{false};
+
+        D3D12Component* parent{};
 
         friend class D3D12Component;
     } m_openxr;

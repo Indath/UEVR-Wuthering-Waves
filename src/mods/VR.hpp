@@ -318,6 +318,24 @@ public:
         return m_diag_nsf_eye_c90_read_scan;
     }
 
+    // DIAG: one-shot capture of a 0x200-byte window around both eyes' FSceneViewState pointers
+    // (dereferenced), logging dwords that differ between pass1's state and pass2's state. Used to
+    // compare a stable write-once frame (no flicker, no shadows) against a normally-written frame
+    // (flicker, shadows) to find which ViewState field correlates with the forced StereoPass value.
+    bool& diag_nsf_viewstate_dump() {
+        return m_diag_nsf_viewstate_dump;
+    }
+
+    // DIAG: one-shot capture of the live pass2_view (FSceneView) itself, automatically diffed
+    // against the PREVIOUS capture taken (across trigger presses, even across mode changes).
+    // Intended usage: trigger once in normal continuous-write mode (flicker+shadows), then trigger
+    // again in write-once mode (stable, no flicker, no shadows) - the second trigger logs only the
+    // dwords that changed between the two captures, isolating the field(s) responsible for the
+    // behavioral difference instead of requiring a manual diff of two full dumps.
+    bool& diag_nsf_pass2_cross_mode_snapshot() {
+        return m_diag_nsf_pass2_cross_mode_snapshot;
+    }
+
     bool is_hmd_active() const {
         if (m_disable_vr) {
             return false;
@@ -749,6 +767,19 @@ public:
     bool is_native_stereo_fix_right_eye_shadows_precise_mirror_left_enabled() const {
         return m_native_stereo_fix_right_eye_shadows_precise_mirror_left->value();
     }
+    // EXPERIMENTAL: temporarily presents views.count=2 (pass1 at slot 0, pass2 at slot 1) to the
+    // engine's single Pass1 render call, instead of NSF's normal views.count=1 per-eye
+    // serialization, so Unreal's native CSM cascade propagation
+    // (AddViewDependentWholeSceneShadowsForView, which walks forward through the SAME
+    // FSceneViewFamily::Views array from the primary view's index) can see BOTH eyes in one pass
+    // and share cascades to the right eye. Restored to 1 immediately after Pass1's call returns.
+    // HIGH RISK: presenting 2 views to a render call the engine/NSF otherwise always treats as
+    // single-view may corrupt visibility/culling, occlusion queries, or render target binding -
+    // similar in spirit to the earlier same-StereoPass experiment that caused black
+    // geometry/menu failures. Default OFF - deliberate A/B testing only.
+    bool is_native_stereo_fix_experimental_dual_view_csm_enabled() const {
+        return m_native_stereo_fix_experimental_dual_view_csm->value();
+    }
     // DIAG: tests the render-thread race hypothesis - BeginRenderingViewFamily enqueues work to the
     // render thread and can return before (or long after) that thread actually reads StereoPass, so
     // restoring the original value the instant the game-thread call returns may let the render
@@ -758,6 +789,79 @@ public:
     // reset it next frame. Default OFF - only for deliberate A/B testing.
     bool is_native_stereo_fix_right_eye_shadows_precise_no_restore_enabled() const {
         return m_native_stereo_fix_right_eye_shadows_precise_no_restore->value();
+    }
+    // DIAG: user observation (2026-10-04) - enabling the no-restore toggle above measurably slowed
+    // the flicker versus the normal write->restore-every-frame cycle, suggesting the flicker is
+    // edge-triggered by the WRITE ITSELF (e.g. a change-detection/cache-invalidation path keyed on
+    // +0xC90/+0x1A0 being touched), not purely by which value the field holds at read time. This
+    // goes one step further than no-restore: write the forced value to pass2 ONCE ever (first
+    // opportunity only) and never touch +0xC90/+0x1A0 again for the rest of the session - no
+    // per-frame re-apply, no restore. If flicker drops further (or stops) relative to no-restore,
+    // that confirms per-frame re-writes (even without a restore) are still a source of edges, since
+    // no-restore alone still re-applies the (identical) value every frame it is safe to do so.
+    // Mutually exclusive in effect with no-restore (this supersedes it when enabled). Default OFF.
+    bool is_native_stereo_fix_right_eye_shadows_precise_write_once_enabled() const {
+        return m_native_stereo_fix_right_eye_shadows_precise_write_once->value();
+    }
+    // DIAG (2026-10): alternative to the global write-once above. Global write-once fixes the
+    // FIRST pooled view object it ever sees and then never writes again - including to later,
+    // DIFFERENT pooled view objects that reuse the same memory/slot, which still need the fix
+    // applied at least once. This mode instead tracks the last FSceneView* pointer the precise fix
+    // was actually applied to; it re-applies (once) whenever pass2's view pointer differs from that
+    // last-fixed pointer, and skips the write entirely (no read-modify-write at all, not even a
+    // same-value rewrite) when the pointer is unchanged from the previous frame. This tests whether
+    // flicker is caused by the REDUNDANT PER-FRAME REWRITE itself (e.g. a change-detection/cache
+    // path that fires on any write, even a no-op one) rather than by which value is held or by
+    // restoring. Mutually exclusive with (and takes priority over) the global write-once toggle.
+    // Default OFF - deliberate A/B testing only.
+    bool is_native_stereo_fix_right_eye_shadows_precise_per_view_write_once_enabled() const {
+        return m_native_stereo_fix_right_eye_shadows_precise_per_view_write_once->value();
+    }
+    // DIAG (2026-10, approach #2): the normal precise fix writes +0xC90/+0x1A0 scoped around
+    // pass2's BeginRenderingViewFamily submit call, which is AFTER the right eye's FSceneView was
+    // constructed and already visible to anything that ran InitViews/shadow setup earlier in the
+    // same frame for that view. If whole-scene shadow setup reads/caches StereoPass-derived
+    // identity before our write ever runs, our fix is closing the barn door too late - shadow setup
+    // already made its primary/secondary decision (and cached accordingly) against the OLD value.
+    // This mode moves the write to the earliest possible point: immediately inside the FSceneView
+    // constructor hook, the instant the right eye's view is constructed, before InitViews/shadow
+    // setup for that view can run at all this frame. No restore is performed (mirrors the existing
+    // Mirror FOV/LOD early-write precedent) since each pooled view is freshly re-stamped by the
+    // engine's own constructor every frame anyway. Mutually exclusive with (and takes priority
+    // over) the late/submit-time precise fix when enabled. Default OFF.
+    bool is_native_stereo_fix_right_eye_shadows_precise_early_write_enabled() const {
+        return m_native_stereo_fix_right_eye_shadows_precise_early_write->value();
+    }
+    // DIAG (2026-10, approach #3): the normal precise fix only copies 2 dwords (+0xC90 StereoPass
+    // and its cached copy +0x1A0) from the known-good left eye into the right eye. If the engine's
+    // actual shadow-cache/identity key spans a WIDER region of FSceneView than just those 2 fields,
+    // a partial copy would explain exactly the observed symptom (predicate passes, shadow renders
+    // once, but some neighboring field still disagrees and the cache drops/re-rejects it next
+    // lookup, causing flicker). This mode copies a wider configurable byte range from the left
+    // eye's view into the right eye's view (instead of just the 2 known dwords), scoped around the
+    // same submit call and restored afterward exactly like the existing precise fix. Mutually
+    // exclusive with (and takes priority over) the normal 2-dword precise fix when enabled.
+    // Default OFF - deliberate A/B testing only.
+    bool is_native_stereo_fix_right_eye_shadows_precise_wide_copy_enabled() const {
+        return m_native_stereo_fix_right_eye_shadows_precise_wide_copy->value();
+    }
+    // DIAG (2026-10, cache-key hunt): see sceneview_xref::log_shadow_cache_key_hunt() for rationale.
+    // Dumps a wide raw dword window of the right eye's FSceneView once per second, tagged with the
+    // currently active precise-fix mode, so two captures (one "stable, no flicker, no shadows" run
+    // and one "flickering, has shadows" run) can be diffed to find the actual shadow-cache/identity
+    // key field(s) the engine uses, rather than just the 2 known StereoPass dwords. Default OFF.
+    bool is_diag_log_shadow_cache_key_hunt_enabled() const {
+        return m_diag_log_shadow_cache_key_hunt->value();
+    }
+    // FIX/DIAG (2026-10): see sceneview_xref::invalidate_shadow_cache_sentinel_fields() for full
+    // rationale. Only takes effect when Wide Copy is also enabled: after the wide identity copy,
+    // forces +0xFE0/+0xFE4 back to their "dirty"/invalid sentinel (0xFFFFFFFF) and +0xC18 back to a
+    // small flag-like value (1), matching what the flickering-but-has-shadows normal fix capture
+    // showed, instead of the "valid cached shadow entry" values the wide copy alone produces - on
+    // the theory this forces the engine to build a fresh shadow for the right eye's own frustum
+    // every frame instead of reusing the left eye's cached result. Default OFF.
+    bool is_native_stereo_fix_right_eye_shadows_precise_wide_copy_invalidate_cache_enabled() const {
+        return m_native_stereo_fix_right_eye_shadows_precise_wide_copy_invalidate_cache->value();
     }
     // DIAG: the broader heuristic eye_fields write loop (separate from the "precise" c90/1a0 fix
     // above) ALWAYS restores pass2's original field values at the end of the frame, every single
@@ -796,6 +900,7 @@ public:
     // only the 6 known offsets left the flicker completely unchanged, so this instruments the other
     // parts of the Pass2 pipeline that are candidates instead.
     bool is_diag_nsf_pass2_pipeline_trace_enabled() const { return m_diag_nsf_pass2_pipeline_trace->value(); }
+    bool is_diag_nsf_scene_capture_live_state_trace_enabled() const { return m_diag_nsf_scene_capture_live_state_trace->value(); }
     bool is_eye_field_offset_130_enabled() const { return m_eye_field_offset_130_enabled->value(); }
     bool is_eye_field_offset_154_enabled() const { return m_eye_field_offset_154_enabled->value(); }
     bool is_eye_field_offset_164_enabled() const { return m_eye_field_offset_164_enabled->value(); }
@@ -1202,6 +1307,17 @@ public:
         return m_diag_log_eye_frustum_diff->value();
     }
 
+    // DIAG: enables sceneview_xref::scan_scene_capture_bool_candidates(), a byte-granularity (not
+    // dword) scan modeled on the Days Gone FSceneView::IsSceneCapture / FSceneViewFamily::
+    // UseSeparateRenderTarget / ResolveScene offscreen-view contract. The existing eye_fields scan
+    // only covers FSceneView +0x0..+0x1000 at dword granularity, so this extends coverage further
+    // out (into the range where Days Gone's IsSceneCapture sits at +0x1276) and at byte granularity,
+    // looking for stable 0/1 values that differ between the left/right FSceneView and near the top
+    // of FSceneViewFamily. READ-ONLY - does not write any memory. See scan_scene_capture_bool_candidates().
+    bool is_diag_scan_scene_capture_bools_enabled() const {
+        return m_diag_scan_scene_capture_bools->value();
+    }
+
     // WuWa far-lighting eye mismatch fix. The game's Cascade Lighting Volume (CLV) keeps a
     // per-eye copy in each eye's FSceneViewState; on first build (boot/teleport/loading screen)
     // only whichever eye renders first gets its far region filled, leaving the other eye's far CLV
@@ -1292,92 +1408,6 @@ public:
     void set_diag_nsf_persist_rendering_state_disabled(bool value) {
         m_diag_nsf_disable_persist_rendering_state = value;
     }
-
-    // When enabled, Native Stereo Fix never spawns/creates the scene-capture actor/component.
-    // The right eye is instead just a mirror of the left (game) texture, via the existing
-    // fallback compositing path in D3D11Component/D3D12Component that already runs when the
-    // scene capture texture is null. No actor lifetime, no depth, and no level-transition
-    // conflicts, at the cost of a flat (non-stereoscopic) right eye.
-    bool is_native_stereo_fix_mirror_enabled() const {
-        return m_native_stereo_fix_mirror->value();
-    }
-
-    // Auto-mirror-on-cinematic: when enabled, the right eye automatically falls back to mirroring
-    // the left eye (same mechanism as the manual "Mirror Right Eye" toggle above) whenever the game's
-    // own APlayerController::bCinematicMode flag is set, which UE sets true during Sequencer/Matinee
-    // cutscenes. This targets the GPU-double-buffered VFX/foliage-wind desync (frozen/laggy right eye
-    // during camera transitions) that CPU-side frame-counter fixes could not touch - see
-    // is_in_cinematic_mode() for the underlying detection. Independent of the manual mirror toggle so
-    // either can be used/tested on its own.
-    bool is_native_stereo_fix_auto_mirror_on_cinematic_enabled() const {
-        return m_native_stereo_fix_auto_mirror_on_cinematic->value();
-    }
-
-    // Auto-mirror-on-UI-blank: when enabled, the right eye automatically falls back to mirroring the
-    // left eye whenever LGUI's draw hook has gone silent for at least m_lgui_draw_silence_threshold_ms -
-    // i.e. the game's own UI/quad has gone blank. NOTE: in testing this only fired on world load/menu
-    // transitions, NOT during the actual skill/VFX animations - kept as an optional secondary trigger
-    // (off by default) but superseded by auto-mirror-on-motion below for the animation-blur symptom.
-    bool is_native_stereo_fix_auto_mirror_on_ui_blank_enabled() const {
-        return m_native_stereo_fix_auto_mirror_on_ui_blank->value();
-    }
-
-    // Returns true if LGUI's draw hook has been silent long enough to be treated as "UI blanked" for
-    // the auto-mirror trigger. Returns false if the hook has never drawn yet (startup) since that is
-    // not a meaningful "blanked" state.
-    bool is_ui_blanked_for_mirror_trigger() const;
-
-    // Auto-mirror-on-motion: when enabled, the right eye automatically falls back to mirroring the left
-    // eye for a short window after NSF's sync-pose logic (calculate_stereo_view_offset) measures a
-    // meaningful Pass1/Pass2 rotation or position delta - i.e. the live animated camera pose itself is
-    // changing between the two eyes' render calls this frame. This directly targets "camera motion
-    // vectors changing due to animations/VFX", which is the actual condition behind the disorienting
-    // right-eye lag (bCinematicMode and UI-blank do not correlate with it). Defaults on.
-    bool is_native_stereo_fix_auto_mirror_on_motion_enabled() const {
-        return m_native_stereo_fix_auto_mirror_on_motion->value();
-    }
-
-    // Returns true if a pose-divergence event happened recently enough (within
-    // m_pose_divergence_mirror_window_ms) to be treated as "the camera is currently in an
-    // animation/VFX motion window" for the auto-mirror trigger.
-    bool is_camera_in_motion_for_mirror_trigger() const {
-        if (m_fake_stereo_hook == nullptr) {
-            return false;
-        }
-
-        return m_fake_stereo_hook->get_ms_since_last_pose_divergence() <= m_pose_divergence_mirror_window_ms;
-    }
-
-    // Combined decision for "should the right eye be a mirror of the left eye THIS frame" - true if
-    // the manual mirror toggle is on, auto-mirror-on-cinematic is enabled AND bCinematicMode==true,
-    // auto-mirror-on-UI-blank is enabled AND LGUI's UI draw has gone silent, or auto-mirror-on-motion is
-    // enabled AND the camera pose has recently diverged between eyes (animation/VFX motion).
-    bool should_mirror_right_eye_this_frame() {
-        if (is_native_stereo_fix_mirror_enabled()) {
-            return true;
-        }
-
-        if (is_native_stereo_fix_auto_mirror_on_cinematic_enabled() && is_in_cinematic_mode()) {
-            return true;
-        }
-
-        if (is_native_stereo_fix_auto_mirror_on_ui_blank_enabled() && is_ui_blanked_for_mirror_trigger()) {
-            return true;
-        }
-
-        if (is_native_stereo_fix_auto_mirror_on_motion_enabled() && is_camera_in_motion_for_mirror_trigger()) {
-            return true;
-        }
-
-        return false;
-    }
-
-    // Polls the local player controller's bCinematicMode bool property (set true by UE's Sequencer/
-    // Matinee cutscene system) via the same find_property/FBoolProperty pattern already used elsewhere
-    // in this codebase (e.g. bUsePawnControlRotation). Cheap: one controller lookup plus one cached
-    // property/bitmask read. Returns false (safe default - no auto-mirror) if the controller, its
-    // class, or the property itself cannot be resolved.
-    bool is_in_cinematic_mode();
 
     // Only report the tall-UI target fix as active when Native Stereo Fix itself is active AND the toggle is on.
     // In AFR / NSF OFF the LGUI canvas is not per-eye-tall, so growing the UI target would distort the UI.
@@ -1961,6 +1991,10 @@ private:
     // a likely culprit for single-eye-only culling/frustum/lighting artifacts since both eyes would
     // be reading the same view/projection data). Off by default - spams a line per candidate region.
     const ModToggle::Ptr m_diag_log_eye_frustum_diff{ ModToggle::create(generate_name("DiagLogEyeFrustumDiff"), false) };
+    // DIAG: enables sceneview_xref::scan_scene_capture_bool_candidates() - a read-only, byte-level
+    // scan for a Wuthering Waves equivalent of Days Gone's offscreen-view contract (IsSceneCapture /
+    // UseSeparateRenderTarget / ResolveScene). Off by default - spams a line per stable candidate.
+    const ModToggle::Ptr m_diag_scan_scene_capture_bools{ ModToggle::create(generate_name("DiagScanSceneCaptureBools"), false) };
     // WuWa far-lighting fix: pulses r.GPUScene.UploadEveryFrame on for exactly one frame right after
     // a detected boot/loading-screen/teleport transition, then back off, so the Cascade Lighting
     // Volume's far region gets filled for BOTH eyes in that same frame instead of only whichever eye
@@ -2136,8 +2170,23 @@ private:
     // the left eye within the same frame (observed as flicker/darkening). Using 0 keeps the view
     // classified as primary while remaining distinct from the left eye's value. Default false = use 0.
     const ModToggle::Ptr m_native_stereo_fix_right_eye_shadows_precise_mirror_left{ ModToggle::create(generate_name("NativeStereoFixRightEyeShadowsPreciseMirrorLeft"), false) };
+    // EXPERIMENTAL: see is_native_stereo_fix_experimental_dual_view_csm_enabled() for rationale.
+    // Default OFF, NOT part of the confirmed-fix persisted list - deliberate A/B testing only.
+    const ModToggle::Ptr m_native_stereo_fix_experimental_dual_view_csm{ ModToggle::create(generate_name("NativeStereoFixExperimentalDualViewCSM"), false) };
     // DIAG: see is_native_stereo_fix_right_eye_shadows_precise_no_restore_enabled() for rationale.
     const ModToggle::Ptr m_native_stereo_fix_right_eye_shadows_precise_no_restore{ ModToggle::create(generate_name("NativeStereoFixRightEyeShadowsPreciseNoRestore"), false) };
+    // DIAG: see is_native_stereo_fix_right_eye_shadows_precise_write_once_enabled() for rationale.
+    const ModToggle::Ptr m_native_stereo_fix_right_eye_shadows_precise_write_once{ ModToggle::create(generate_name("NativeStereoFixRightEyeShadowsPreciseWriteOnce"), false) };
+    // DIAG: see is_native_stereo_fix_right_eye_shadows_precise_per_view_write_once_enabled() for rationale.
+    const ModToggle::Ptr m_native_stereo_fix_right_eye_shadows_precise_per_view_write_once{ ModToggle::create(generate_name("NativeStereoFixRightEyeShadowsPrecisePerViewWriteOnce"), false) };
+    // DIAG: see is_native_stereo_fix_right_eye_shadows_precise_early_write_enabled() for rationale.
+    const ModToggle::Ptr m_native_stereo_fix_right_eye_shadows_precise_early_write{ ModToggle::create(generate_name("NativeStereoFixRightEyeShadowsPreciseEarlyWrite"), false) };
+    // DIAG: see is_native_stereo_fix_right_eye_shadows_precise_wide_copy_enabled() for rationale.
+    const ModToggle::Ptr m_native_stereo_fix_right_eye_shadows_precise_wide_copy{ ModToggle::create(generate_name("NativeStereoFixRightEyeShadowsPreciseWideCopy"), false) };
+    // DIAG: see is_diag_log_shadow_cache_key_hunt_enabled() for rationale.
+    const ModToggle::Ptr m_diag_log_shadow_cache_key_hunt{ ModToggle::create(generate_name("DiagLogShadowCacheKeyHunt"), false) };
+    // FIX/DIAG: see is_native_stereo_fix_right_eye_shadows_precise_wide_copy_invalidate_cache_enabled().
+    const ModToggle::Ptr m_native_stereo_fix_right_eye_shadows_precise_wide_copy_invalidate_cache{ ModToggle::create(generate_name("NativeStereoFixRightEyeShadowsPreciseWideCopyInvalidateCache"), false) };
     // DIAG: see is_native_stereo_fix_right_eye_eye_fields_no_restore_enabled() for rationale.
     const ModToggle::Ptr m_native_stereo_fix_right_eye_eye_fields_no_restore{ ModToggle::create(generate_name("NativeStereoFixRightEyeEyeFieldsNoRestore"), false) };
     // DIAG: see is_eye_field_offset_enabled() for rationale. Checkbox-per-offset replaces the
@@ -2185,6 +2234,13 @@ private:
     const ModToggle::Ptr m_native_stereo_fix_null_pass2_view_state{ ModToggle::create(generate_name("NativeStereoFixNullPass2ViewState"), false) };
     // DIAG: see is_diag_nsf_pass2_pipeline_trace_enabled().
     const ModToggle::Ptr m_diag_nsf_pass2_pipeline_trace{ ModToggle::create(generate_name("DiagNSFPass2PipelineTrace"), false) };
+    // DIAG: see is_diag_nsf_scene_capture_live_state_trace_enabled(). Re-reads (does not re-apply)
+    // CaptureSource, DynamicShadows show-flag, PostProcessSettings override/blend-weight,
+    // bCaptureEveryFrame, and bAlwaysPersistRenderingState directly off the LIVE scene capture
+    // component every frame (throttled), instead of only once at create_scene_capture() time, to
+    // catch any of these silently drifting/resetting after creation (e.g. an engine show-flag
+    // refresh or PP volume re-blend) without repeating the one-shot creation-time diagnostics.
+    const ModToggle::Ptr m_diag_nsf_scene_capture_live_state_trace{ ModToggle::create(generate_name("DiagNSFSceneCaptureLiveStateTrace"), false) };
     // FALLBACK: this game's CalculateStereoProjectionMatrix is only ever called ONCE per frame
     // (confirmed via runtime STEREO-SETUP logs: proj_calls=0 for the left eye on every frame in the
     // reported double-vision window), the signature of Instanced Stereo Rendering (ISR). The primary
@@ -2281,34 +2337,6 @@ private:
     // DIAG: virtual-key code for the manual glitch marker (default: NumPad0). Not exposed as a
     // persistent user-facing setting yet, just a fixed diagnostic keybind.
     static constexpr int m_glitch_marker_vkey = VK_NUMPAD0;
-    const ModToggle::Ptr m_native_stereo_fix_mirror{ ModToggle::create(generate_name("NativeStereoFixMirror"), false) };
-    // Automatically enables the same mirror-right-eye fallback above whenever the game reports
-    // APlayerController::bCinematicMode==true (see is_in_cinematic_mode()). Defaults on since the
-    // mirror path is cheaper than full NSF stereo (a straight GPU copy, no second scene render) and
-    // targets a GPU-double-buffered VFX/foliage desync class that cannot be fixed via CPU-side state.
-    const ModToggle::Ptr m_native_stereo_fix_auto_mirror_on_cinematic{ ModToggle::create(generate_name("NativeStereoFixAutoMirrorOnCinematic"), true) };
-    // Automatically enables the mirror-right-eye fallback whenever LGUI's per-frame draw hook has not
-    // fired for m_lgui_draw_silence_threshold_ms - i.e. the game's own UI has gone fully blank/redirected
-    // away. NOTE: testing showed this only fires on world load/menu transitions, NOT during the actual
-    // skill/VFX animations that cause the reported blur, so this is now OFF by default. Kept as an
-    // optional secondary trigger; see m_native_stereo_fix_auto_mirror_on_motion below for the trigger
-    // that actually correlates with skill/VFX animation camera motion.
-    const ModToggle::Ptr m_native_stereo_fix_auto_mirror_on_ui_blank{ ModToggle::create(generate_name("NativeStereoFixAutoMirrorOnUiBlank"), false) };
-    // How long LGUI must go without drawing (ms) before we consider the UI "blanked" for the purposes of
-    // the auto-mirror-on-UI-blank trigger above. Kept fairly low since normal UI redraw cadence is every
-    // frame; a genuine skill/VFX UI-hide window should exceed this quickly.
-    static constexpr uint64_t m_lgui_draw_silence_threshold_ms = 150;
-    // Automatically enables the mirror-right-eye fallback for a short window after NSF's sync-pose
-    // logic (calculate_stereo_view_offset) measures a meaningful Pass1/Pass2 rotation or position delta,
-    // i.e. the live camera pose is actually changing between the two eyes' render calls this frame -
-    // exactly the "camera motion vectors changing due to animations/VFX" condition. Defaults on: this
-    // targets the real symptom window, unlike bCinematicMode/UI-blank above.
-    const ModToggle::Ptr m_native_stereo_fix_auto_mirror_on_motion{ ModToggle::create(generate_name("NativeStereoFixAutoMirrorOnMotion"), true) };
-    // How long (ms) after the last detected pose-divergence event the auto-mirror-on-motion trigger
-    // should keep considering the camera "in motion". A single spike would otherwise only cover one
-    // frame; this window smooths that out across a short burst of animation frames without flip-
-    // flopping the right-eye source every other frame.
-    static constexpr uint64_t m_pose_divergence_mirror_window_ms = 250;
     // When Native Stereo Fix is on, LGUI lays its UI canvas out at the per-eye view rect height (which is taller
     // than the scene RT), so the bottom of the UI is clipped by the normal (scene-sized) UI render target. This
     // grows the UEVR-owned UI target to the full per-eye canvas height so the whole UI is captured, then presents
@@ -2368,6 +2396,8 @@ private:
     bool m_diag_nsf_flicker_burst_capture{false}; // one-shot: logs c90/1a0 and eye_fields state EVERY frame for ~3s (trigger right as the user sees the flicker) instead of the normal every-N-hundred-frame sampling, which is too coarse to see fast rhythmic flicker; not persistent
     bool m_diag_nsf_eye_view_dump{false}; // one-shot: logs dwords that differ between the live left/right FSceneViews; not persistent
     bool m_diag_nsf_eye_c90_read_scan{false}; // one-shot: scans executable game-module sections for decoded +0xC90 read candidates; not persistent
+    bool m_diag_nsf_viewstate_dump{false}; // one-shot: logs dwords that differ between pass1/pass2 FSceneViewState; not persistent
+    bool m_diag_nsf_pass2_cross_mode_snapshot{false}; // one-shot: snapshots pass2_view (not ViewState) and diffs against the previous snapshot taken; not persistent
     // DIAG: when true, skips setting bAlwaysPersistRenderingState=true on the scene-capture component in
     // create_scene_capture(), reverting it to the engine default (false). Used to A/B whether manually
     // forcing persisted per-view rendering state on the capture-driven right eye (vs. the engine's normal
@@ -2501,7 +2531,9 @@ public:
             *m_native_stereo_fix_right_eye_shadows,
             *m_native_stereo_fix_right_eye_shadows_precise,
             *m_native_stereo_fix_right_eye_shadows_precise_mirror_left,
+            *m_native_stereo_fix_experimental_dual_view_csm,
             *m_native_stereo_fix_right_eye_shadows_precise_no_restore,
+            *m_native_stereo_fix_right_eye_shadows_precise_write_once,
             *m_native_stereo_fix_right_eye_eye_fields_no_restore,
             *m_eye_field_offset_130_enabled,
             *m_eye_field_offset_154_enabled,
@@ -2523,16 +2555,13 @@ public:
             *m_native_stereo_fix_auto_suspend,
             *m_native_stereo_fix_null_pass2_view_state,
             *m_diag_nsf_pass2_pipeline_trace,
+            *m_diag_nsf_scene_capture_live_state_trace,
             *m_native_stereo_fix_sync_pose,
             *m_native_stereo_fix_sync_pose_position,
             *m_native_stereo_fix_sync_pose_blend_alpha,
             *m_native_stereo_fix_sync_pose_force_full,
             *m_diag_double_vision_fix_master,
             *m_diag_sync_pose_verbose_logging,
-            *m_native_stereo_fix_mirror,
-            *m_native_stereo_fix_auto_mirror_on_cinematic,
-            *m_native_stereo_fix_auto_mirror_on_ui_blank,
-            *m_native_stereo_fix_auto_mirror_on_motion,
             *m_native_stereo_fix_tall_ui,
             *m_native_stereo_fix_allow_with_afr,
             *m_unify_afr_frame_parity,

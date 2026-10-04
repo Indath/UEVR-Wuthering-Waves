@@ -227,17 +227,6 @@ protected:
     sdk::UTexture* in_flight_target{nullptr}; // Not a reference because this is basically a barrier against creating a new scene capture target
     sdk::FViewport* last_viewport{nullptr};
 
-    // Bumped every time a new scene capture target is created or destroyed. Captured by value into
-    // the async render/RHI/game-thread jobs spawned by create_scene_capture() so they can detect, at
-    // every step before touching raw memory, that THIS specific capture attempt was invalidated (e.g.
-    // destroy_scene_capture() ran concurrently on another thread/level transition) even if `tgt` is
-    // still a non-null UObjectReference that merely hasn't flipped tgt.valid() to false yet (there is
-    // an unavoidable window between the engine freeing/GC\u2019ing the object and valid() reflecting that).
-    // This is a much cheaper and more precise guard than relying solely on tgt.valid() checks, since it
-    // is incremented synchronously and deterministically on the game thread rather than depending on
-    // UObject validity tracking that can lag behind the actual free.
-    std::atomic<uint64_t> scene_capture_generation{0};
-
     // Throttle for create_scene_capture(). During a level transition the engine tick can flicker
     // (resume for a frame or two, then stall again), which was previously enough to let the loading
     // guards open briefly and re-trigger a full actor-spawn + FRenderTarget rehook cascade. That

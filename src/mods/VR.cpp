@@ -1647,59 +1647,6 @@ void VR::on_pre_viewport_client_draw(void* viewport_client, void* viewport, void
     }
 }
 
-bool VR::is_in_cinematic_mode() {
-    const auto world = sdk::UEngine::get()->get_world();
-
-    if (world == nullptr) {
-        return false;
-    }
-
-    const auto controller = sdk::UGameplayStatics::get()->get_player_controller(world, 0);
-
-    if (controller == nullptr) {
-        return false;
-    }
-
-    if (controller->get_class() == nullptr) {
-        return false;
-    }
-
-    static const auto boolprop = (sdk::FBoolProperty*)controller->get_class()->find_property(L"bCinematicMode");
-
-    if (boolprop == nullptr) {
-        return false;
-    }
-
-    const auto in_cinematic = boolprop->get_value_from_object(controller);
-
-    static bool was_in_cinematic = false;
-
-    if (in_cinematic != was_in_cinematic) {
-        SPDLOG_INFO("[VR][CINEMATIC-MODE] bCinematicMode transitioned to {}", in_cinematic);
-        was_in_cinematic = in_cinematic;
-    }
-
-    return in_cinematic;
-}
-
-bool VR::is_ui_blanked_for_mirror_trigger() const {
-    if (m_fake_stereo_hook == nullptr) {
-        return false;
-    }
-
-    const auto silence_ms = m_fake_stereo_hook->get_lgui_draw_silence_duration_ms();
-    const auto blanked = silence_ms >= m_lgui_draw_silence_threshold_ms;
-
-    static bool was_blanked = false;
-
-    if (blanked != was_blanked) {
-        SPDLOG_INFO("[VR][UI-BLANK] LGUI draw-silence trigger transitioned to {} (silence_ms={})", blanked, silence_ms);
-        was_blanked = blanked;
-    }
-
-    return blanked;
-}
-
 void VR::update_hmd_state(bool from_view_extensions, uint32_t frame_count) {
     ZoneScopedN(__FUNCTION__);
 
@@ -2757,9 +2704,33 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
             if (ImGui::IsItemHovered()) {
                 ImGui::SetTooltip("Tests whether the flicker/darkening is caused by a render-thread race:\nBeginRenderingViewFamily enqueues work to the render thread and can return\nbefore (or after) that thread actually reads StereoPass, so restoring the\noriginal value the instant the game-thread call returns may let the render\nthread observe either value depending on scheduling jitter. When ON, the\nwrite is left in place instead of restored - pooled views are re-stamped by\ntheir constructor every frame regardless, so this should be safe to test.\nIf flicker/darkening disappears with this enabled, the race theory is confirmed.");
             }
+            m_native_stereo_fix_right_eye_shadows_precise_write_once->draw("[Diag] Precise Fix: Write Once, Never Re-Apply or Restore (edge test)");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("User observation: enabling 'Skip Restore' above already slowed the flicker\ncompared to the normal write->restore-every-frame cycle, suggesting the\nflicker is triggered by the WRITE ITSELF (e.g. a change-detection or cache-\ninvalidation path keyed on +0xC90/+0x1A0 being touched), not just by which\nvalue the field holds when read. This goes further than Skip Restore: writes\nthe forced value to the right eye's StereoPass/cache ONCE ever for the whole\nsession, then never touches those fields again (no per-frame re-apply, no\nrestore). If flicker drops further (or stops) versus Skip Restore alone, that\nconfirms repeated per-frame writes - even without a restore - are still a\nflicker source. Takes priority over Skip Restore when both are enabled.");
+            }
+            m_native_stereo_fix_right_eye_shadows_precise_per_view_write_once->draw("[Diag] Precise Fix: Write Once Per Pooled View Object (edge test)");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Alternative to the global Write Once above. Global write-once fixes only the\nFIRST pooled view object ever seen and never writes again, even once a later\nDIFFERENT pooled view object (new frame-pool slot) takes over and still needs\nthe fix applied at least once. This mode instead tracks the last FSceneView*\npointer the fix was applied to: it re-applies (once) whenever pass2's view\npointer differs from the last-fixed pointer, and performs NO read/write at all\n(not even a same-value rewrite) when the pointer is unchanged frame-to-frame.\nTests whether flicker is caused by the REDUNDANT PER-FRAME REWRITE itself\n(e.g. a change-detection path that fires on any write, even a no-op one)\nrather than by value/restore timing. Takes priority over both Skip Restore\nand global Write Once when enabled.");
+            }
+            m_native_stereo_fix_right_eye_shadows_precise_early_write->draw("[Diag] Precise Fix: Write Early, Inside Constructor (timing test)");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Moves the +0xC90/+0x1A0 write to the EARLIEST possible point: immediately\ninside the FSceneView constructor hook, the instant the right eye's view is\nconstructed - before InitViews/whole-scene shadow setup can run at all for\nthat view this frame. The normal fix instead writes later, scoped around\npass2's BeginRenderingViewFamily submit call, which is AFTER the view was\nconstructed and possibly already read/cached by earlier shadow setup. No\nrestore is performed (same precedent as the Mirror FOV/LOD early-write fix) -\neach pooled view is freshly re-stamped by the engine's own constructor every\nframe anyway. Takes priority over the normal late/submit-time precise fix\nwhen enabled.");
+            }
+            m_native_stereo_fix_right_eye_shadows_precise_wide_copy->draw("[Diag] Precise Fix: Copy Wider Identity Block (cache-key test)");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("The normal precise fix copies only 2 dwords (+0xC90 StereoPass and its cached\ncopy +0x1A0) from the left eye into the right eye. If the engine's actual\nshadow-cache/identity key spans a WIDER region of FSceneView than just those\n2 fields, a partial copy would explain the observed symptom exactly: predicate\npasses, shadow renders once, but some neighboring field still disagrees and\nthe cache drops/re-rejects it on the next lookup, causing flicker. This mode\ncopies a byte range (+0x190 to +0x2c0, narrowed from an earlier wider range\nafter EYE-FRUSTUM-DIFF confirmed +0x160/+0x170/+0x180 and +0x2c0/+0x2d0/+0x2e0\nare genuine IPD-driven per-eye frustum data, not cache identity) from the\nleft eye's view into the right eye's view, scoped around the same submit call\nand restored afterward exactly like the normal fix. Takes priority over the\nnormal 2-dword precise fix when enabled.");
+            }
+            m_native_stereo_fix_right_eye_shadows_precise_wide_copy_invalidate_cache->draw("[Diag] Wide Copy: Invalidate Shadow Cache Sentinel Fields (fix attempt)");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Only takes effect when Wide Copy above is also enabled. NSF-CACHE-KEY-HUNT\ndiffing found 3 dwords OUTSIDE the copied range that behave like shadow-cache\nstate: +0xFE0/+0xFE4 read 0xFFFFFFFF (dirty/invalid sentinel) in the\nflickering-but-has-shadows capture vs small positive integers in the\nstable-but-no-shadows (Wide Copy) capture, and +0xC18 reads a tiny flag (1)\nvs a large hash/handle value. Theory: Wide Copy makes the engine find a\n'valid' cached shadow entry for the right eye and REUSE the left eye's cached\nshadow (stable, but wrong eye's shadow) instead of building a fresh one.\nThis forces those 3 fields back to the 'dirty' values after the wide copy,\nso the engine should be forced to build a genuine fresh shadow for the right\neye's own frustum every frame - testing whether this yields real shadows\nwithout flicker.");
+            }
             m_native_stereo_fix_right_eye_shadows_predicate_hook->draw("Right Eye Shadow Fix (Predicate Hook, no memory writes)");
             if (ImGui::IsItemHovered()) {
                 ImGui::SetTooltip("Alternative to the memory-patch precise fix above: instead of writing/restoring\nStereoPass (+0xC90) and its cached copy around the right eye's render call,\ninline-hooks the primary-view predicate function itself at the same validated\nRVA and makes it answer true for the right eye's real StereoPass (3) directly.\nRuns on whatever thread calls the predicate, so there is no write/restore and\nno render-thread race window at all. Disable the memory-patch precise fix\nabove before enabling this to avoid both paths fighting each other.");
+            }
+            m_native_stereo_fix_experimental_dual_view_csm->draw("[EXPERIMENTAL] Dual-View CSM Sharing (RISK: may corrupt rendering)");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("EXPERIMENTAL - HIGH RISK. Temporarily presents BOTH eyes (pass1 then pass2) in\nthe SAME FSceneViewFamily::Views array during Pass1's single engine render call,\ninstead of NSF's normal one-view-at-a-time serialization, so Unreal's native CSM\ncascade propagation (which only ever walks forward through one shared Views array\nfrom the primary view's index) can see the right eye and share cascades to it.\nViews.count is restored to 1 immediately after Pass1's call returns.\nThis changes the shape of a render call NSF otherwise always treats as single-view,\nso it may corrupt visibility/culling, occlusion queries, or render target binding -\nsimilar in spirit to the earlier same-StereoPass experiment that caused black\ngeometry/menu failures. Default OFF. Test carefully and be ready to disable.");
             }
             m_diag_watchpoint_trace_c90->draw("[Diag] Trace StereoPass (+0xC90) consumers (1 frame)");
             if (ImGui::IsItemHovered()) {
@@ -2924,10 +2895,6 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
                                   "diverge during large screen-space motion (fast pans, skill/ability VFX, cutscene\\n"
                                   "blends), which reads as ghosting/double-vision. Disable this toggle to A/B test\\n"
                                   "whether motion blur is contributing to reported blur during skills/VFX.");
-            }
-            m_native_stereo_fix_mirror->draw("Mirror Right Eye (No Scene Capture)");
-            if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip("Skips spawning the scene-capture actor entirely. The right eye is\njust a flat mirror of the left/game view (no stereoscopic depth).\nUse this as a stable fallback if the scene capture is causing\nstuck loading screens during level transitions, or if an eye ever\nbreaks/goes black due to future code changes. See the Debug tab's\n'NS Double Vision Diagnostics' section for the auto-mirror triggers\n(cutscene/UI-blank/motion) and other double-vision investigation toggles.");
             }
             ImGui::SetNextItemOpen(true, ImGuiCond_::ImGuiCond_Once);
             if (ImGui::TreeNode("UI Fixes for Shadow LGUI")) {
@@ -3362,6 +3329,16 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
                                   "of the eye_fields write/restore loop. Use this to test whether flicker persists when\\n"
                                   "eye_fields is fully disabled, to isolate it from these other Pass2 mechanisms instead.");
             }
+            m_diag_nsf_scene_capture_live_state_trace->draw("[Diag] Trace NSF Scene Capture LIVE State (CaptureSource/ShowFlags/PP/persist, every frame)");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Re-reads (does not modify) CaptureSource, the DynamicShadows show-flag, the scene\\n"
+                                  "capture's own PostProcessSettings override/blend-weight, bCaptureEveryFrame, and\\n"
+                                  "bAlwaysPersistRenderingState directly off the LIVE scene capture component, throttled\\n"
+                                  "to a few times per second, instead of only once at creation time. Use this to catch\\n"
+                                  "any of these silently drifting/resetting mid-session (e.g. after a level/menu\\n"
+                                  "transition) as a time-series in the log, correlated against when the dark/flicker\\n"
+                                  "artifact is actually observed.");
+            }
             m_native_stereo_fix_dual_write_projection->draw("DIAG: Dual-Write Missing Eye Projection Matrix (double vision fallback)");
             if (ImGui::IsItemHovered()) {
                 ImGui::SetTooltip("This title only calls CalculateStereoProjectionMatrix ONCE per frame (Instanced Stereo\\n"
@@ -3381,6 +3358,10 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
                                   "identity fields (StereoPass, +0x164, +0x1a0, +0x2ec, +0xc90) for both views at:\\n"
                                   "before Pass1 submit, after Pass1 submit/before swap, before Pass2 submit, and\\n"
                                   "after Pass2 restore, to find exactly where/when the two passes disagree.");
+            }
+            m_diag_log_shadow_cache_key_hunt->draw("DIAG: Log Shadow Cache-Key Hunt (wide raw memory dump, diff across modes)");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Dumps every nonzero dword in a 0x1000-byte window of the right eye's live\nFSceneView once per second, tagged with the currently active precise-fix mode.\nWe've confirmed StereoPass (+0xC90) and its cache (+0x1A0) are stable in BOTH\na 'stable/no-flicker/no-shadows' mode (write-once, wide-copy) and a\n'flickering/has-shadows' mode (normal write+restore) - so those 2 fields are\nNOT the actual cache key. Capture one log while running a stable/no-shadows\nmode and another while running a flickering/has-shadows mode, then diff the\ntwo [VR][NSF-CACHE-KEY-HUNT] dumps: any dword that consistently differs\nbetween the two conditions (not just per-frame matrix noise) is a candidate\nfor the real shadow-cache/identity key the engine uses to decide reuse vs\nrebuild.");
             }
             m_native_stereo_fix_sync_pose_force_full->draw("DIAG: Force Full Sync Every Frame (bypass hard-cut gate)");
             if (ImGui::IsItemHovered()) {
@@ -3528,6 +3509,16 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
                                   "matrix fields empirically and confirm whether culling data is actually\n"
                                   "being computed per-eye.");
             }
+            m_diag_scan_scene_capture_bools->draw("DIAG: Scan for Scene-Capture Bool Candidates (Days Gone contract)");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("READ-ONLY. Byte-granularity scan (not dword) for 0/1 fields in the live\n"
+                                  "FSceneView pair and the top of FSceneViewFamily, modeled on Days Gone's\n"
+                                  "confirmed offscreen-view contract (IsSceneCapture @+0x1276 on FSceneView,\n"
+                                  "UseSeparateRenderTarget @+0x20 / ResolveScene @+0x4E on FSceneViewFamily).\n"
+                                  "Extends coverage beyond the existing eye_fields dword scan (+0x0..+0x1000)\n"
+                                  "and logs stable candidates that differ between left/right eyes and read as\n"
+                                  "a sane bool (<=1). Does not write any memory.");
+            }
             m_match_far_lighting_between_eyes->draw("Match Far Lighting Between Eyes");
             if (ImGui::IsItemHovered()) {
                 ImGui::SetTooltip("Fixes a far-distance lighting mismatch between eyes caused by the game's Cascade\n"
@@ -3643,19 +3634,6 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
                                   "sub-view pass rather than a renderable eye. Disable if culling/shadows get worse.");
             }
             ImGui::Separator();
-            ImGui::TextWrapped("Mirror-gated toggles (require Native Stereo Fix's manual Mirror Right Eye fallback behavior):");
-            m_native_stereo_fix_auto_mirror_on_cinematic->draw("Auto-Mirror Right Eye During Cutscenes (bCinematicMode)");
-            if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip("Automatically applies the same mirror fallback (no scene capture,\nflat right eye) whenever the game reports APlayerController::bCinematicMode\n== true (Sequencer/Matinee cutscenes). Targets GPU-side VFX/foliage blur\nand desync during cutscene camera transitions that CPU-side frame-counter\nfixes could not address, without disabling stereo depth during normal\ngameplay. Independent of the manual mirror toggle in Native Stereo Fix.");
-            }
-            m_native_stereo_fix_auto_mirror_on_ui_blank->draw("Auto-Mirror Right Eye When UI Blanks (Skill/VFX Animations)");
-            if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip("Automatically applies the same mirror fallback whenever LGUI's own\nUI/quad draw hook stops firing for a short window - this happens during\nmany characters' skill/VFX-heavy animations, where the UI goes blank and\nreturns to normal once the animation ends. Unlike the cutscene toggle\nabove (bCinematicMode never fires for this case), this directly detects\nthe UI-hidden window itself. Independent of the other mirror toggles.\nNOTE: testing showed this only fires on world load/menu transitions, not\nduring actual skill/VFX animations - off by default, prefer the motion\ntoggle below for that case.");
-            }
-            m_native_stereo_fix_auto_mirror_on_motion->draw("Auto-Mirror Right Eye On Camera Motion Divergence");
-            if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip("Automatically applies the same mirror fallback for a short window after\nNSF's sync-pose logic detects the live camera pose actually diverging between\nthe left/right eye render calls within the same frame (see the NSF-POSE-DIVERGE\nlog and the Sync Pose toggles above) - i.e. real camera motion caused by\nskill/VFX/dash animations. This is a direct measurement of the animation-driven\nmotion that causes the disorienting right-eye lag, unlike bCinematicMode or the\nUI-blank toggle above which do not correlate with it.");
-            }
             m_scene_capture_stall_indicator->draw("DIAG: Scene Capture Stall Visual Indicator");
             if (ImGui::IsItemHovered()) {
                 ImGui::SetTooltip("Tints the right eye red when the scene capture render target has been\ncontinuously null for a visually-meaningful duration and the compositor\nis presenting a stale last-known-good texture instead. Use this to see\nin real time whether a perceived blur/double-image moment lines up with\nthis specific freeze condition. Press NumPad0 the instant you see a\nglitch to also log a precise marker timestamp for later correlation.");
@@ -3704,6 +3682,25 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
         if (ImGui::IsItemHovered()) {
             ImGui::SetTooltip("Read-only bounded scan of executable sections in the game module. Logs decoded instructions whose memory operand "
                               "reads displacement +0xC90. These are static candidates, not proof the instruction executes or addresses FSceneView.");
+        }
+        if (ImGui::Button("DIAG: Dump Pass1/Pass2 FSceneViewState Differences (one sample)")) {
+            m_diag_nsf_viewstate_dump = true;
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Requires Native Stereo Fix + Right Eye Shadow Fix (Precise) ON. Captures one read-only snapshot of a window "
+                              "around both eyes' FSceneViewState objects, then logs differing dwords with raw offsets. Use this to compare a "
+                              "stable write-once frame (no flicker, no shadows) against a normal continuously-written frame (flicker, shadows) "
+                              "to find which ViewState field correlates with the forced StereoPass value. Look for [NSF-VIEWSTATE-DUMP].");
+        }
+        if (ImGui::Button("DIAG: Snapshot Pass2 FSceneView (cross-mode diff)")) {
+            m_diag_nsf_pass2_cross_mode_snapshot = true;
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Requires Native Stereo Fix + Right Eye Shadow Fix (Precise) ON. Captures the live pass2_view object itself "
+                              "(not ViewState) and automatically diffs it against the PREVIOUS snapshot taken with this same button - even "
+                              "across a mode change in between. Workflow: trigger once in normal mode while flicker is visible, switch to "
+                              "Write Once mode and let it settle, then trigger again - the second press logs ONLY the dwords that changed "
+                              "between the two captures. Look for [NSF-PASS2-SNAPSHOT].");
         }
         ImGui::Text("DIAG: NSF Pass2 eye-field bisect (Right Eye Shadow Fix)");
         for (int i = 0; i < 32; ++i) {
